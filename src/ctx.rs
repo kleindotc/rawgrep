@@ -114,7 +114,14 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
             std::thread::spawn(move || {
                 crate::util::pin_thread_to_core(worker_id % num_cores);
-                worker_thread_main(worker_id as _, ctx, &stealers, local, &pacer, slot_pool, print_line_numbers);
+
+                worker_thread_main(
+                    worker_id as _,
+                    stealers.len() as u16 + 1,
+                    ctx,
+                    &stealers, local,
+                    &pacer, slot_pool, print_line_numbers
+                );
             });
         }
     }
@@ -325,7 +332,8 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 }
 
 fn worker_thread_main<S: MatchSink + 'static>(
-    worker_id: u16,
+    worker_id:   u16,
+    num_workers: u16,
     ctx:       RawGrepCtx<S>,
     stealers:  &[Stealer<WorkItem>],
     local:     DequeWorker<WorkItem>,
@@ -430,6 +438,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     output_tx:        ctx.output_tx.clone(),
                     stats:            Default::default(),
                     print_line_numbers,
+                    num_workers,
                     pacer,
                     output,
                     parser,

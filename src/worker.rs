@@ -539,12 +539,14 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
 
     pub chunk_carry:               Option<Box<ChunkCarry>>,
 
+    pub matcher_cache:             Option<&'a mut MatcherCache>,
+
+    pub worker_id:                 u16,
+    pub num_workers:               u16,
+
     pub pending_file_keys:         Vec<FileKey>,
     pub pending_file_metas:        Vec<FileMeta>,
     pub pending_fragment_presence: FragmentPresenceBits,
-
-    pub matcher_cache:             Option<&'a mut MatcherCache>,
-    pub worker_id:                 u16,
 
     // ----- Cold / output plumbing ----
     pub sink: S,
@@ -858,14 +860,22 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         // Decide how many subdirs to keep local vs push for stealing
         #[inline]
-        fn work_distribution_strategy(depth: u16, subdir_count: usize) -> usize {
+        fn work_distribution_strategy(depth: u16, subdir_count: usize, num_workers: u16) -> usize {
             if subdir_count == 0 { return 0; }
-            match depth {
-                0..=1 => 1,
-                2..=3 => subdir_count.min(2),
-                4..=6 => subdir_count.min(4),
-                _     => subdir_count.min(8),
-            }
+
+            // Near the root, an idle thread wastes the most total time, so stay
+            // maximally aggressive about queueing regardless of thread count.
+            //
+            // Deeper in the tree, parallelism is normally already established,
+            // so favor keeping siblings together on one thread (which is what
+            // the inode-block cache actually benefits from) over further
+            // distribution. Cap that preference at roughly half the worker
+            // count, though, so there's always queueing headroom left to
+            // rebalance a tree that turns out lopsided.
+            let   max_cap = (num_workers / 2).max(1) as usize;
+            let depth_cap = (1 + depth as usize / 2).min(max_cap);
+
+            subdir_count.min(depth_cap)
         }
 
         //
@@ -876,7 +886,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         self.fs.sort_subdirs_by_offset(unsafe { self.subdirs_arena.get_unchecked_mut(subdir_mark..) });
 
         let n = self.subdirs_arena.len() - subdir_mark;
-        let keep_local = work_distribution_strategy(depth, n);
+        let keep_local = work_distribution_strategy(depth, n, self.num_workers);
         let queue_start = subdir_mark + keep_local;
         let queue_end = self.subdirs_arena.len();
 
