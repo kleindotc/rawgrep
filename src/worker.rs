@@ -508,6 +508,7 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
 
     pub selected_fragment_hash_len: FragmentLen,
 
+    pub ignore_case:                            bool,
     pub gitignore_enabled:                      bool,
     pub stdout_is_being_redirected_to_dev_null: bool,
     pub print_line_numbers:                     bool,
@@ -1245,7 +1246,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             &mut self.fragment_presence_scratch,
             self.fragment_index,
             self.selected_fragment_hash_len.as_usize(),
-            self.cli.ignore_case
+            self.ignore_case
         );
 
         self.stats.time_fragment_presence_checking_took_in_millis += t0.elapsed().as_millis() as u32;

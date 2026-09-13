@@ -10,12 +10,12 @@
 //! a wrong optimization costs correctness. Those are not the same severity
 //! of bug.
 
-use regex_syntax::hir::{Hir, HirKind};
+use regex_syntax::hir::{Class, Hir, HirKind};
 
 /// Extract byte strings that must appear verbatim, at least once, in any
 /// text the given Hir can match.
 ///
-/// Not attempting a fully general multi-string longest-common-substring
+/// @Incomplete: a fully general multi-string longest-common-substring
 /// search across every possible way branches could align (the fold in
 /// `alternation_literals` below is a sound but greedy approximation of
 /// that), and unrolling a `{min,max}` repetition of a *non-literal* unit
@@ -64,6 +64,231 @@ pub fn required_literals(hir: &Hir) -> Vec<Vec<u8>> {
         HirKind::Concat(subs) => concat_literals(subs),
         HirKind::Alternation(subs) => alternation_literals(subs),
     }
+}
+
+/// A literal segment required in every match, together with whether it
+/// needs case-folding to actually find it in raw file bytes.
+///
+/// When `case_insensitive` is `false`, `bytes` are the exact bytes any
+/// match must contain verbatim -- identical in meaning to a plain
+/// `Vec<u8>` from `required_literals`.
+///
+/// When `case_insensitive` is `true`, `bytes` is the ASCII-lowercased
+/// canonical form; the real matched text has *some* casing of these
+/// bytes, not necessarily this exact one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LiteralPart {
+    pub bytes: Vec<u8>,
+    pub case_insensitive: bool,
+}
+
+/// Case-aware counterpart to `required_literals`. Same soundness
+/// guarantee (every returned part is a substring of every match, up to
+/// the case-folding caveat on `LiteralPart` above), same conservative
+/// philosophy: a class that isn't recognizably a plain ASCII case-fold
+/// pair contributes nothing rather than guessing.
+///
+/// @Incomplete: comparing a case-sensitive candidate against a
+/// case-insensitive one during alternation intersection (folding one
+/// side just for that comparison is possible but adds real complexity
+/// for what should be a rare pattern shape, so for now the two kinds
+/// simply don't intersect with each other -- sound, just misses that
+/// case); and any Unicode case-fold orbit wider than the simple ASCII
+/// upper/lower pair (Kelvin sign folding to 'k' being the canonical
+/// example -- deliberately narrow, since real-world case-insensitive
+/// grep is overwhelmingly ASCII).
+pub fn required_literal_parts(hir: &Hir) -> Vec<LiteralPart> {
+    match hir.kind() {
+        HirKind::Empty => Vec::new(),
+
+        HirKind::Literal(lit) => vec![LiteralPart {
+            bytes: lit.0.to_vec(),
+            case_insensitive: false,
+        }],
+
+        HirKind::Class(class) => match ascii_case_fold_byte(class) {
+            Some(b) => vec![LiteralPart { bytes: vec![b], case_insensitive: true }],
+            None => Vec::new(),
+        },
+
+        HirKind::Look(_) => Vec::new(),
+
+        HirKind::Repetition(rep) => {
+            if rep.min == 0 {
+                Vec::new()
+            } else if let Some(unit) = literal_part_bytes(&rep.sub) {
+                vec![LiteralPart {
+                    bytes: repeat_bytes(&unit.bytes, rep.min),
+                    case_insensitive: unit.case_insensitive,
+                }]
+            } else {
+                required_literal_parts(&rep.sub)
+            }
+        }
+
+        HirKind::Capture(cap) => required_literal_parts(&cap.sub),
+        HirKind::Concat(subs) => concat_literal_parts(subs),
+        HirKind::Alternation(subs) => alternation_literal_parts(subs),
+    }
+}
+
+/// If `class` is exactly the ASCII case-fold pair of one letter -- two
+/// single-codepoint ranges, one uppercase ASCII letter and its lowercase
+/// counterpart, nothing else -- returns that letter's lowercase ASCII
+/// byte. Rejects anything wider (like the 3-way Kelvin-sign fold for
+/// 'k'), which falls back to contributing nothing: always sound.
+fn ascii_case_fold_byte(class: &Class) -> Option<u8> {
+    fn fold_pair(a_lo: u32, a_hi: u32, b_lo: u32, b_hi: u32) -> Option<u8> {
+        if a_lo != a_hi || b_lo != b_hi || a_lo > 0x7f || b_lo > 0x7f {
+            return None;
+        }
+
+        let a = a_lo as u8;
+        let b = b_lo as u8;
+
+        if !a.is_ascii_alphabetic() || !b.is_ascii_alphabetic() || a == b {
+            return None;
+        }
+
+        if a.to_ascii_lowercase() != b.to_ascii_lowercase() {
+            return None;
+        }
+
+        Some(a.to_ascii_lowercase())
+    }
+
+    match class {
+        Class::Unicode(u) => {
+            let ranges = u.ranges();
+            if ranges.len() != 2 { return None; }
+
+            fold_pair(
+                ranges[0].start() as u32, ranges[0].end() as u32,
+                ranges[1].start() as u32, ranges[1].end() as u32,
+            )
+        }
+
+        Class::Bytes(b) => {
+            let ranges = b.ranges();
+            if ranges.len() != 2 { return None; }
+
+            fold_pair(
+                ranges[0].start() as u32, ranges[0].end() as u32,
+                ranges[1].start() as u32, ranges[1].end() as u32,
+            )
+        }
+    }
+}
+
+/// Case-aware counterpart to `literal_bytes`: unwraps a Hir that reduces
+/// to exactly one literal run (through Capture and all-literal Concat,
+/// same as before), now also allowing ASCII case-fold classes to
+/// participate in the run. If any component of the run was
+/// case-insensitive, the whole merged run is marked case-insensitive --
+/// once merged we no longer track case-sensitivity per byte, so this is
+/// the conservative direction: the caller folds a little more than
+/// strictly necessary rather than a little less (which would be
+/// unsound).
+fn literal_part_bytes(hir: &Hir) -> Option<LiteralPart> {
+    match hir.kind() {
+        HirKind::Literal(lit) => Some(LiteralPart { bytes: lit.0.to_vec(), case_insensitive: false }),
+
+        HirKind::Class(class) => ascii_case_fold_byte(class)
+            .map(|b| LiteralPart { bytes: vec![b], case_insensitive: true }),
+
+        HirKind::Capture(cap) => literal_part_bytes(&cap.sub),
+
+        HirKind::Concat(subs) => {
+            let mut bytes = Vec::new();
+            let mut any_ci = false;
+            for sub in subs {
+                let part = literal_part_bytes(sub)?;
+                bytes.extend_from_slice(&part.bytes);
+                any_ci |= part.case_insensitive;
+            }
+            Some(LiteralPart { bytes, case_insensitive: any_ci })
+        }
+
+        _ => None,
+    }
+}
+
+#[inline]
+fn concat_literal_parts(subs: &[Hir]) -> Vec<LiteralPart> {
+    let mut parts = Vec::new();
+    let mut run_bytes: Vec<u8> = Vec::new();
+    let mut run_ci = false;
+
+    for sub in subs {
+        if let Some(part) = literal_part_bytes(sub) {
+            run_bytes.extend_from_slice(&part.bytes);
+            run_ci |= part.case_insensitive;
+
+        } else {
+            if !run_bytes.is_empty() {
+                parts.push(LiteralPart {
+                    bytes: std::mem::take(&mut run_bytes),
+                    case_insensitive: run_ci
+                });
+                run_ci = false;
+            }
+
+            parts.extend(required_literal_parts(sub));
+        }
+    }
+
+    if !run_bytes.is_empty() {
+        parts.push(LiteralPart { bytes: run_bytes, case_insensitive: run_ci });
+    }
+
+    parts
+}
+
+fn alternation_literal_parts(subs: &[Hir]) -> Vec<LiteralPart> {
+    const MIN_ALTERNATION_SUBSTRING:  usize = 2;
+    const MAX_ALTERNATION_CANDIDATES: usize = 32;
+
+    let mut branches = subs.iter().map(required_literal_parts);
+    let mut candidates = match branches.next() {
+        Some(parts) => parts,
+        None => return Vec::new(),
+    };
+
+    for parts in branches {
+        if candidates.is_empty() {
+            break;
+        }
+
+        let mut next = Vec::new();
+        for c in &candidates {
+            for p in &parts {
+                //
+                // Not attempting cross-comparison between a case-sensitive
+                // candidate and a case-insensitive one; see the doc
+                // comment on `required_literal_parts`.
+                //
+                if c.case_insensitive != p.case_insensitive {
+                    continue;
+                }
+
+                for bytes in common_substrings(&c.bytes, &p.bytes, MIN_ALTERNATION_SUBSTRING) {
+                    next.push(LiteralPart { bytes, case_insensitive: c.case_insensitive });
+                }
+            }
+        }
+
+        next.sort();
+        next.dedup();
+
+        if next.len() > MAX_ALTERNATION_CANDIDATES {
+            next.sort_by_key(|c| std::cmp::Reverse(c.bytes.len()));
+            next.truncate(MAX_ALTERNATION_CANDIDATES);
+        }
+
+        candidates = next;
+    }
+
+    candidates
 }
 
 /// Bounds how large a literal we'll materialize by repeating a unit
@@ -265,12 +490,13 @@ fn common_substrings(a: &[u8], b: &[u8], min_len: usize) -> Vec<Vec<u8>> {
     results
 }
 
-#[inline]
 pub fn extract_regex_literals(
     pattern: &str,
-    case_insensitive: bool
-) -> Option<(Vec<u32>, usize)> {
+    case_insensitive: bool,
+) -> Option<(Vec<u32>, usize, bool)> {
+    use crate::logger::*;
     use crate::fragments::{MIN_FRAGMENT_LEN, extract_pattern_fragments_with_len, select_fragment_len};
+
     use nohash_hasher::IntSet;
 
     let hir = regex_syntax::ParserBuilder::new()
@@ -279,12 +505,26 @@ pub fn extract_regex_literals(
         .parse(pattern)
         .ok()?;
 
-    let mut parts = required_literals(&hir);
-    if case_insensitive {
-        parts = parts.into_iter()
-            .map(|p| p.to_ascii_lowercase())
-            .collect();
-    }
+    // Always the case-fold-aware extractor -- for a pattern with no
+    // case-insensitivity anywhere, this behaves identically to
+    // required_literals, since ascii_case_fold_byte only ever fires on a
+    // genuine case-fold class, which only exists if some form of
+    // case-insensitivity was actually active during parsing.
+    let literal_parts = required_literal_parts(&hir);
+
+    // The REAL signal for whether these fragments need folded hashing --
+    // derived from what actually got extracted, not from the incoming
+    // `case_insensitive` argument, which only reflects the parser's
+    // default and can disagree with the pattern's own inline syntax.
+    let needs_folding = literal_parts.iter().any(|p| p.case_insensitive);
+
+    let mut parts: Vec<Vec<u8>> = if needs_folding {
+        literal_parts.into_iter().map(|p| p.bytes.to_ascii_lowercase()).collect()
+    } else {
+        literal_parts.into_iter().map(|p| p.bytes).collect()
+    };
+
+    dbg!(&parts);
 
     //
     // All parts' lengths must be >= MIN_FRAGMENT_LEN
@@ -292,6 +532,13 @@ pub fn extract_regex_literals(
     parts.retain(|p| p.len() >= MIN_FRAGMENT_LEN);
     if parts.is_empty() {
         return None;
+    }
+
+    if log_enabled() {
+        crate::debug!(
+            "Extracted literals from regex: [{}]",
+            parts.iter().map(|v| String::from_utf8_lossy(v)).collect::<Vec<_>>().join(", ")
+        );
     }
 
     let fragment_len = select_fragment_len(parts.iter().map(|p| p.as_slice()))?;
@@ -302,5 +549,5 @@ pub fn extract_regex_literals(
         all_fragments.extend(frags);
     }
 
-    Some((all_fragments.into_iter().collect(), fragment_len))
+    Some((all_fragments.into_iter().collect(), fragment_len, needs_folding))
 }

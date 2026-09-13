@@ -223,7 +223,7 @@ impl Matcher {
     /// pre-escape it themselves.
     fn regex_fallback(pattern: &str, ignore_case: bool) -> io::Result<Self> {
         #[cfg(feature = "hyperscan")]
-        if let Some(matcher) = Self::try_hyperscan(pattern, ignore_case) {
+        if let Ok(matcher) = Self::try_hyperscan(pattern, ignore_case) {
             return Ok(matcher);
         }
 
@@ -251,7 +251,7 @@ impl Matcher {
     /// pattern (unsupported syntax, pattern too large, etc.) or if scratch allocation
     /// fails, in which case the caller should fall back to the regex-automata engine.
     #[cfg(feature = "hyperscan")]
-    fn try_hyperscan(pattern: &str, ignore_case: bool) -> Option<Self> {
+    fn try_hyperscan(pattern: &str, ignore_case: bool) -> io::Result<Self> {
         let _span = tracy::span!("Matcher::try_hyperscan");
 
         //
@@ -267,13 +267,21 @@ impl Matcher {
         if ignore_case { flags |= hyperscan::CompileFlags::CASELESS };
 
         let db: BlockDatabase = Pattern::with_flags(pattern, flags)
-            .ok()?
+            .unwrap()
             .build()
-            .ok()?;
+            .map_err(|e| io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid regex '{pattern}': {e}"),
+            ))?;
 
-        let scratch = db.alloc_scratch().ok()?;
+        let scratch = db.alloc_scratch().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Couldn't allocate scratch for Hyperscan: {e}"),
+            )
+        })?;
 
-        Some(Matcher::Hyperscan {
+        Ok(Matcher::Hyperscan {
             db,
             case_insensitive: ignore_case,
             scratch: SendSyncScratch(scratch),
@@ -433,7 +441,7 @@ impl Matcher {
     /// because some literal (or, for alternations/regex, the shortest literal) is under
     /// `MIN_FRAGMENT_LEN`. Callers must not fall back to a smaller fragment in that case;
     /// see `select_fragment_len`'s docs for why.
-    pub fn extract_fragment_hashes(&self) -> Option<(Vec<u32>, usize)> {
+    pub fn extract_fragment_hashes(&self) -> Option<(Vec<u32>, usize, bool)> {
         use nohash_hasher::IntSet;
 
         match self {
@@ -441,7 +449,7 @@ impl Matcher {
                 let needle = finder.needle();
                 let fragment_len = crate::fragments::select_fragment_len(std::iter::once(needle))?;
                 let hashes = crate::fragments::extract_pattern_fragments_with_len(needle, fragment_len);
-                Some((hashes, fragment_len))
+                Some((hashes, fragment_len, false))
             }
 
             Matcher::MultiLiteral { patterns, case_insensitive, .. } => {
@@ -473,7 +481,7 @@ impl Matcher {
                     let frags = crate::fragments::extract_pattern_fragments_with_len(pattern, fragment_len);
                     all_fragments.extend(frags);
                 }
-                Some((all_fragments.into_iter().collect(), fragment_len))
+                Some((all_fragments.into_iter().collect(), fragment_len, *case_insensitive))
             }
 
             Matcher::Regex { pattern, case_insensitive, .. } => {

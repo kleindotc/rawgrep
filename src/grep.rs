@@ -30,6 +30,7 @@ pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
     fragment_index: IntSet<u32>,
     selected_fragment_hash_len: FragmentLen,
 
+    pub ignore_case: bool,
     pub sink: S
 }
 
@@ -39,9 +40,9 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
         let matcher = make_matcher(cli)?;
 
         // `None` means the pattern is too short for any window to be useful -- treat that the same as "no fragments".
-        let (fragment_hashes, selected_fragment_hash_len) = match matcher.extract_fragment_hashes() {
-            Some((hashes, fragment_len)) => (hashes, FragmentLen::from_fragment_len(fragment_len)),
-            None => (Vec::new(), FragmentLen::Four),
+        let (fragment_hashes, selected_fragment_hash_len, ignore_case) = match matcher.extract_fragment_hashes() {
+            Some((hashes, fragment_len, ignore_case)) => (hashes, FragmentLen::from_fragment_len(fragment_len), ignore_case),
+            None => (Vec::new(), FragmentLen::Four, cli.ignore_case),
         };
 
         let fragment_index = fragment_hashes.iter().copied().collect();
@@ -67,6 +68,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             cli: cli.clone(),
             fs,
             matcher,
+            ignore_case,
             cache,
             fragment_hashes,
             sink,
@@ -438,6 +440,11 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
     }
 
     #[inline]
+    pub fn ignore_case(&self) -> bool {
+        self.ignore_case
+    }
+
+    #[inline]
     pub fn fragment_index(&self) -> &IntSet<u32> {
         &self.fragment_index
     }
@@ -534,6 +541,15 @@ impl<S: MatchSink> AnyGrepper<S> {
             AnyGrepper::Ext4(g) => g.matcher(),
             AnyGrepper::Apfs(g) => g.matcher(),
             AnyGrepper::Ntfs(g) => g.matcher(),
+        }
+    }
+
+    #[inline]
+    pub fn ignore_case(&self) -> bool {
+        match self {
+            AnyGrepper::Ext4(g) => g.ignore_case(),
+            AnyGrepper::Apfs(g) => g.ignore_case(),
+            AnyGrepper::Ntfs(g) => g.ignore_case(),
         }
     }
 

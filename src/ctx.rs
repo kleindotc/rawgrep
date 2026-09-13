@@ -422,6 +422,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
             matcher_cache = Some(job.grepper.matcher().create_cache().unwrap());
         }
 
+        let ignore_case = job.grepper.ignore_case();
+
         macro_rules! dispatch {
             ($g:expr) => {
                 WorkerCtx {
@@ -439,6 +441,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     stats:            Default::default(),
                     print_line_numbers,
                     num_workers,
+                    ignore_case,
                     pacer,
                     output,
                     parser,
