@@ -266,12 +266,25 @@ fn common_substrings(a: &[u8], b: &[u8], min_len: usize) -> Vec<Vec<u8>> {
 }
 
 #[inline]
-pub fn extract_regex_literals(pattern: &str) -> Option<(Vec<u32>, usize)> {
+pub fn extract_regex_literals(
+    pattern: &str,
+    case_insensitive: bool
+) -> Option<(Vec<u32>, usize)> {
     use crate::fragments::{MIN_FRAGMENT_LEN, extract_pattern_fragments_with_len, select_fragment_len};
     use nohash_hasher::IntSet;
 
-    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let hir = regex_syntax::ParserBuilder::new()
+        .case_insensitive(case_insensitive)
+        .build()
+        .parse(pattern)
+        .ok()?;
+
     let mut parts = required_literals(&hir);
+    if case_insensitive {
+        parts = parts.into_iter()
+            .map(|p| p.to_ascii_lowercase())
+            .collect();
+    }
 
     //
     // All parts' lengths must be >= MIN_FRAGMENT_LEN

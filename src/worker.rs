@@ -505,9 +505,12 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub cli:             &'a Cli,
     pub fragment_index:  &'a IntSet<u32>,
     pub pacer:           &'a FlushPacer,
+
     pub selected_fragment_hash_len: FragmentLen,
-    pub gitignore_enabled: bool,
+
+    pub gitignore_enabled:                      bool,
     pub stdout_is_being_redirected_to_dev_null: bool,
+    pub print_line_numbers:                     bool,
 
     pub parser: Parser,
     pub output: SlotWriter,
@@ -1118,23 +1121,53 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         let mut bytes_searched = 0usize;
         let chunks_len = self.parser.scratch_chunks.len();
 
+        //
+        // Hinting is @Cutnpaste from Ext4Fs::read_file_content
+        //
+
+        #[cfg(unix)]
+        use std::os::fd::AsRawFd;
+
+        #[cfg(unix)]
+        const PREFETCH_AHEAD: usize = 4;
+
+        #[cfg(unix)]
+        let fd = self.fs.device_file().as_raw_fd();
+
+        #[cfg(unix)]
+        {
+            for &(offset, len) in self.parser.scratch_chunks.iter().take(PREFETCH_AHEAD) {
+                unsafe {
+                    libc::posix_fadvise(
+                        fd, offset as i64, len as i64,
+                        libc::POSIX_FADV_WILLNEED
+                    );
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        let mut hinted_up_to = PREFETCH_AHEAD.min(chunks_len);
+
         for chunk_index in 0..chunks_len {
             let (disk_offset, len) = *unsafe { self.parser.scratch_chunks.get_unchecked(chunk_index) };
             let len = len as usize;
 
-            self.parser.chunk.clear();
-            self.parser.chunk.reserve(len);
-            unsafe { self.parser.chunk.set_len(len); }
+            #[cfg(unix)] {
+                let want = chunk_index + 1;
+                if want >= hinted_up_to {
+                    if let Some(&(next_offset, next_len)) = self.parser.scratch_chunks.get(want) {
+                        unsafe {
+                            libc::posix_fadvise(
+                                fd, next_offset as i64, next_len as i64,
+                                libc::POSIX_FADV_WILLNEED
+                            );
+                        }
+                    }
 
-            debug_assert!(self.parser.chunk.len() >= len);
-            let chunk_to_read = unsafe { self.parser.chunk.get_unchecked_mut(..len) };
-            let n = match self.fs.read_at_offset(chunk_to_read, disk_offset) {
-                Ok(n)  => n,
-                Err(_) => break,
-            };
-
-            if n == 0 { break; }
-            bytes_searched += n;
+                    hinted_up_to = want + 1;
+                }
+            }
 
             let tail_len = carry.tail.len();
             let total = tail_len + len;
@@ -1142,13 +1175,19 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             let mut buf = std::mem::take(&mut self.parser.chunk);
             buf.clear();
             buf.reserve(total);
-            unsafe { buf.set_len(total); }
-            unsafe { buf.get_unchecked_mut(..tail_len).copy_from_slice(&carry.tail); }
+            unsafe {
+                buf.set_len(total);
+                buf.get_unchecked_mut(..tail_len).copy_from_slice(&carry.tail);
+            }
 
             let n = match self.fs.read_at_offset(&mut buf[tail_len..total], disk_offset) {
-                Ok(n) => n,
+                Ok(n)  => n,
                 Err(_) => { self.parser.chunk = buf; break; }
             };
+
+            if n == 0 { self.parser.chunk = buf; break; }
+
+            bytes_searched += n;
             carry.tail.clear();
 
             self.find_and_print_matches_in_chunk(&buf[..tail_len + n], &mut carry, false)?;
@@ -1195,7 +1234,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             self.fragment_hashes,
             &mut self.fragment_presence_scratch,
             self.fragment_index,
-            self.selected_fragment_hash_len.as_usize()
+            self.selected_fragment_hash_len.as_usize(),
+            self.cli.ignore_case
         );
 
         self.stats.time_fragment_presence_checking_took_in_millis += t0.elapsed().as_millis() as u32;
@@ -1231,7 +1271,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             return self.find_and_print_matches_small_decode::<C>(skip);
         }
 
-        let should_print_color = should_enable_ansi_coloring();
+        let should_print_color        = should_enable_ansi_coloring();
+        let should_print_line_numbers = self.print_line_numbers;
 
         if C::RAW_PASSTHROUGH {
             //
@@ -1342,6 +1383,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                         line_num,
                         &self.line_ranges_scratch,
                         should_print_color,
+                        should_print_line_numbers,
                     );
                 }
 
@@ -1441,6 +1483,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                         line_num,
                         line_matches,
                         should_print_color,
+                        should_print_line_numbers
                     );
                 }
 
@@ -1503,7 +1546,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         let data = unsafe { data.get_unchecked(skip..) };
         if data.is_empty() { return Ok(()) }
 
-        let should_print_color = should_enable_ansi_coloring();
+        let should_print_color        = should_enable_ansi_coloring();
+        let should_print_line_numbers = self.print_line_numbers;
 
         //
         // Chunk reads must land on a multiple of C::UNIT_WIDTH bytes
@@ -1589,6 +1633,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                         carry.line_num,
                         &self.ranges_scratch,
                         should_print_color,
+                        should_print_line_numbers
                     );
                 }
 
@@ -1643,7 +1688,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         );
         if self.ranges_scratch.is_empty() { return Ok(false); }
 
-        let should_print_color = should_enable_ansi_coloring();
+        let should_print_color        = should_enable_ansi_coloring();
+        let should_print_line_numbers = self.print_line_numbers;
 
         let mut found_any = false;
         let mut i         = 0;
@@ -1734,8 +1780,15 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             if !self.stdout_is_being_redirected_to_dev_null {
                 Self::write_match_line(
-                    &mut self.output, &mut self.parser.scratch2, self.cli, &self.path_buf,
-                    line, line_num, &self.line_ranges_scratch, should_print_color,
+                    &mut self.output,
+                    &mut self.parser.scratch2,
+                    self.cli,
+                    &self.path_buf,
+                    line,
+                    line_num,
+                    &self.line_ranges_scratch,
+                    should_print_color,
+                    should_print_line_numbers
                 );
             }
 
@@ -1766,10 +1819,16 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         line:              &[u8],
         line_num:           u32,
         matches:           &[(u32, u32)],
-        should_print_color: bool,
+
+        should_print_color:       bool,
+        should_print_line_number: bool,
     ) {
         let mut itoa_buf = itoa::Buffer::new();
-        let line_num_str = itoa_buf.format(line_num); // format once, reuse len + bytes below
+        let line_num_str = if should_print_line_number {
+            itoa_buf.format(line_num)
+        } else {
+            ""
+        };
 
         // Reserve
         {
@@ -1805,11 +1864,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             scratch.extend_from_slice(b":");
         }
 
-        if should_print_color { scratch.extend_from_slice(COLOR_CYAN.as_bytes()); }
-        scratch.extend_from_slice(line_num_str.as_bytes());
-        if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
+        if line_num_str.len() != 0 {
+            if should_print_color { scratch.extend_from_slice(COLOR_CYAN.as_bytes()); }
+            scratch.extend_from_slice(line_num_str.as_bytes());
+            if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
 
-        scratch.extend_from_slice(b": ");
+            scratch.extend_from_slice(b": ");
+        }
 
         let display = truncate_utf8(line, 500); // @Configuration @Tune
 

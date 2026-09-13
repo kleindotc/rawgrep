@@ -142,6 +142,12 @@ pub fn select_fragment_len<'a>(patterns: impl IntoIterator<Item = &'a [u8]>) -> 
     }
 }
 
+#[inline(always)]
+pub fn ascii_lowercase_u32_le(w: u32) -> u32 {
+    let bytes = w.to_le_bytes().map(|b| b.to_ascii_lowercase());
+    u32::from_le_bytes(bytes)
+}
+
 /// Determine stride for file fragment extraction based on file size.
 ///
 /// Balances extraction speed vs accuracy using adaptive sampling:
@@ -216,6 +222,7 @@ pub fn check_fragment_presence(
     fragment_presence_scratch: &mut [u64],
     fragment_index: &IntSet<u32>,
     fragment_len: usize,
+    case_insensitive: bool,
 ) {
     let num_frags = fragment_hashes.len();
 
@@ -231,22 +238,49 @@ pub fn check_fragment_presence(
 
     #[cfg(target_arch = "x86_64")] {
         if is_x86_feature_detected!("avx2") && buf.len() >= 32 {
-            return unsafe { check_fragment_presence_avx2(buf, fragment_hashes, fragment_presence_scratch, mask) };
+            return unsafe {
+                if case_insensitive {
+                    check_fragment_presence_avx2_ci(buf, fragment_hashes, fragment_presence_scratch, mask)
+                } else {
+                    check_fragment_presence_avx2(buf, fragment_hashes, fragment_presence_scratch, mask)
+                }
+            }
         }
     }
 
-    #[cfg(target_arch = "aarch64")] {
+    #[cfg(target_arch = "aarch64")]
+    {
         if std::arch::is_aarch64_feature_detected!("neon") && buf.len() >= 16 {
-            return unsafe { check_fragment_presence_neon(buf, fragment_hashes, fragment_presence_scratch, mask) };
+            return unsafe {
+                if case_insensitive {
+                    check_fragment_presence_neon_ci(buf, fragment_hashes, fragment_presence_scratch, mask)
+                } else {
+                    check_fragment_presence_neon(buf, fragment_hashes, fragment_presence_scratch, mask)
+                }
+            }
         }
     }
 
-    check_fragment_presence_scalar(buf, fragment_hashes, fragment_presence_scratch, fragment_index, mask)
+    check_fragment_presence_scalar(
+        buf,
+        fragment_hashes,
+        fragment_presence_scratch,
+        fragment_index,
+        mask,
+        case_insensitive,
+    )
 }
 
 /// Scalar fallback for fragment presence checking
 #[inline]
-fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64], fragment_index: &IntSet<u32>, mask: u32) {
+pub fn check_fragment_presence_scalar(
+    buf: &[u8],
+    fragment_hashes: &[u32],
+    fragment_presence_scratch: &mut [u64],
+    fragment_index: &IntSet<u32>,
+    mask: u32,
+    case_insensitive: bool,
+) {
     let num_frags = fragment_hashes.len();
     let stride = stride_heuristic(buf.len());
 
@@ -254,13 +288,18 @@ fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32], fragment_
 
     let mut i = 0;
     while i + 4 <= buf.len() {
-        // Address-only dependency -- safe to issue unconditionally, no data needed.
+        // Address-only dependency
         let ahead = i + stride;
         if ahead + 4 <= buf.len() {
             prefetch_read(unsafe { buf.as_ptr().add(ahead) });
         }
 
-        let raw = u32::from_le_bytes([buf[i], buf[i+1], buf[i+2], buf[i+3]]) & mask;
+        let mut raw = u32::from_le_bytes([buf[i], buf[i+1], buf[i+2], buf[i+3]]);
+        if case_insensitive {
+            raw = ascii_lowercase_u32_le(raw);
+        }
+        raw &= mask;
+
         let hash = hash_fragment_u32(raw);
 
         if fragment_index.contains(&hash) {
@@ -282,13 +321,215 @@ fn check_fragment_presence_scalar(buf: &[u8], fragment_hashes: &[u32], fragment_
     }
 }
 
+//
+// Case folding primitives.
+//
+//
+// Both expose a single function that lowercases every byte in a full SIMD
+// register, ASCII-only, with no cross-byte or cross-lane dependency: byte
+// value in, byte value out, independently per lane.
+//
+// That memoryless property is what makes it safe to apply to a register built from
+// *overlapping* sliding windows (see the fragment_load closures below), the
+// fold doesn't know or care which logical 4-byte window a given byte
+// belongs to, and a byte's lowercase form never depends on its neighbors or
+// its position, so folding the raw packed bytes once and then slicing them
+// back into windows gives exactly the same answer as folding each window
+// individually first.
+//
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod simd_fold {
+    use std::arch::x86_64::*;
+
+    /// Lowercase every byte in a 256-bit AVX2 vector, ASCII-only.
+    /// Byte-for-byte equivalent to mapping `u8::to_ascii_lowercase` over the 32 lanes independently.
+    ///
+    /// AVX2 has no unsigned byte compare ... only signed `_mm256_cmpgt_epi8`,
+    /// so an unsigned range check on `0..=255` has to be emulated: XOR every
+    /// byte with 0x80 first.
+    ///
+    /// That flip is a monotonic bijection from the unsigned ordering `[0, 255]`
+    /// onto the signed ordering `[-128, 127]`, so comparing the biased bytes with
+    /// 'signed >' reproduces an unsigned `>` on the originals.
+    #[target_feature(enable = "avx2")]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    pub unsafe fn ascii_lowercase_avx2(v: __m256i) -> __m256i {
+        let bias = _mm256_set1_epi8(0x80u8 as i8);
+        let biased = _mm256_xor_si256(v, bias);
+
+        // byte >= 'A' (0x41)  <=>  biased > biased(0x40)
+        let ge_a = _mm256_cmpgt_epi8(biased, _mm256_set1_epi8((0x40u8 ^ 0x80u8) as i8));
+
+        // byte <= 'Z' (0x5A)  <=>  biased(0x5B) > biased
+        let le_z = _mm256_cmpgt_epi8(_mm256_set1_epi8((0x5Bu8 ^ 0x80u8) as i8), biased);
+
+        let is_upper = _mm256_and_si256(ge_a, le_z);
+        let lower_bit = _mm256_and_si256(is_upper, _mm256_set1_epi8(0x20));
+        _mm256_or_si256(v, lower_bit)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[inline]
+        fn run(bytes32: [u8; 32]) -> [u8; 32] {
+            unsafe {
+                let v = _mm256_loadu_si256(bytes32.as_ptr() as *const __m256i);
+                let folded = ascii_lowercase_avx2(v);
+                let mut out = [0u8; 32];
+                _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, folded);
+                out
+            }
+        }
+
+        #[inline]
+        fn reference(bytes: [u8; 32]) -> [u8; 32] {
+            bytes.map(|b| b.to_ascii_lowercase())
+        }
+
+        #[test]
+        fn exhaustive_per_lane_with_boundary_neighbors() {
+            // All 256 values in each of the 32 lane positions, other lanes
+            // held at adversarial boundary values right outside the
+            // 'A'-'Z' range (and 0x00/0xFF), to catch any lane-crossing
+            // mistake in the bias/compare trick.
+            let adversarial: [u8; 8] = [0x00, 0xFF, 0x40, 0x5B, 0x60, 0x7B, 0x41, 0x5A];
+
+            for lane in 0..32 {
+                for v in 0..=255u8 {
+                    for &other in &adversarial {
+                        let mut bytes = [other; 32];
+                        bytes[lane] = v;
+                        assert_eq!(run(bytes), reference(bytes), "lane {lane} value {v:#04x}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn large_random_sample() {
+            let mut rng = 0x9E3779B97F4A7C15u64;
+            let mut next_byte = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng & 0xFF) as u8
+            };
+
+            for _ in 0..2_000_000u32 {
+                let bytes: [u8; 32] = std::array::from_fn(|_| next_byte());
+                assert_eq!(run(bytes), reference(bytes));
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod simd_fold {
+    use std::arch::aarch64::*;
+
+    /// Same contract as the AVX2 version above, but simpler.
+    /// NEON has native unsigned byte compares (`vcgeq_u8`, `vcleq_u8`),
+    /// so there's no need for AVX2's sign-bit-flip trick.
+    /// The range check on 'A'..='Z' is a direct unsigned `>=`/`<=`.
+    #[target_feature(enable = "neon")]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    pub unsafe fn ascii_lowercase_neon(v: uint8x16_t) -> uint8x16_t {
+        let ge_a = vcgeq_u8(v, vdupq_n_u8(b'A'));
+        let le_z = vcleq_u8(v, vdupq_n_u8(b'Z'));
+        let is_upper = vandq_u8(ge_a, le_z);
+        let lower_bit = vandq_u8(is_upper, vdupq_n_u8(0x20));
+        vorrq_u8(v, lower_bit)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[inline]
+        fn run(bytes16: [u8; 16]) -> [u8; 16] {
+            unsafe {
+                let v = vld1q_u8(bytes16.as_ptr());
+                let folded = ascii_lowercase_neon(v);
+                let mut out = [0u8; 16];
+                vst1q_u8(out.as_mut_ptr(), folded);
+                out
+            }
+        }
+
+        #[inline]
+        fn reference(bytes: [u8; 16]) -> [u8; 16] {
+            bytes.map(|b| b.to_ascii_lowercase())
+        }
+
+        #[test]
+        fn exhaustive_per_lane_with_boundary_neighbors() {
+            // Mirrors the AVX2 exhaustive test exactly, just with 16 lanes
+            // instead of 32. NEON's compares are unsigned so there's no
+            // bias trick to get wrong, but the range boundaries ('@'/'A'
+            // and 'Z'/'[') are still the values most likely to expose an
+            // off-by-one in `vcgeq_u8`/`vcleq_u8` usage.
+            let adversarial: [u8; 8] = [0x00, 0xFF, 0x40, 0x5B, 0x60, 0x7B, 0x41, 0x5A];
+
+            for lane in 0..16 {
+                for v in 0..=255u8 {
+                    for &other in &adversarial {
+                        let mut bytes = [other; 16];
+                        bytes[lane] = v;
+                        assert_eq!(run(bytes), reference(bytes), "lane {lane} value {v:#04x}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn large_random_sample() {
+            let mut rng = 0x2545F4914F6CDD1Du64;
+            let mut next_byte = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng & 0xFF) as u8
+            };
+
+            for _ in 0..2_000_000u32 {
+                let bytes: [u8; 16] = std::array::from_fn(|_| next_byte());
+                assert_eq!(run(bytes), reference(bytes));
+            }
+        }
+    }
+}
+
+
+// Hashes one window scalar-style, folding case first when this instantiation is the CI variant.
+#[inline(always)]
+fn tail_hash_at<const CASE_INSENSITIVE: bool>(buf: &[u8], offset: usize, mask: u32) -> u32 {
+    let mut raw = u32::from_le_bytes([
+        buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3],
+    ]);
+
+    if CASE_INSENSITIVE {
+        raw = ascii_lowercase_u32_le(raw);
+    }
+
+    raw &= mask;
+    hash_fragment_u32(raw)
+}
+
 macro_rules! impl_fragment_presence_scanner {
     (
         fn_name: $fn_name:ident,
         cfg: $cfg_arch:literal,
+
         feature: $feature:literal,
+        lanes: $lanes:expr,
         min_stride: $min_stride:expr,
+
+        case_insensitive: $case_insensitive:expr,
         hashes_ty: $hashes_ty:ty,
+
         fragment_load: |$data_ptr:ident, $mask_val:ident| $load_block:block,
         splat: |$scalar:ident| $splat_block:block,
         any_match: |$ha:ident, $hb:ident| $match_block:block,
@@ -296,10 +537,21 @@ macro_rules! impl_fragment_presence_scanner {
         #[cfg(target_arch = $cfg_arch)]
         #[target_feature(enable = $feature)]
         #[allow(unsafe_op_in_unsafe_fn)]
-        unsafe fn $fn_name(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64], mask: u32) {
+        pub unsafe fn $fn_name(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64], mask: u32) {
             let num_frags = fragment_hashes.len();
             let stride = stride_heuristic(buf.len()).max($min_stride);
             let buf_len = buf.len();
+
+            //
+            // Each outer iteration reads `$lanes` overlapping 4-byte
+            // windows starting at `offset` (offset+0, offset+1, ..., offset+lanes-1).
+            //
+            // The last of those windows starts at offset + lanes - 1
+            // and itself reads 4 bytes, so the furthest byte touched is
+            // `offset + lanes + 2`. i.e. the iteration needs
+            // `offset + (lanes + 3) <= buf_len` bytes remaining.
+            //
+            let read_extent = $lanes + 3;
 
             if crate::util::likely(num_frags <= 64) {
                 //
@@ -310,7 +562,7 @@ macro_rules! impl_fragment_presence_scanner {
                 let all_found_mask: u64 = if num_frags == 64 { u64::MAX } else { (1u64 << num_frags) - 1 };
 
                 let mut offset = 0;
-                while offset + (12 - 1) <= buf_len {
+                while offset + read_extent <= buf_len {
                     let $data_ptr = buf.as_ptr().add(offset);
                     let $mask_val = mask;
                     let hashes: $hashes_ty = $load_block;
@@ -342,6 +594,34 @@ macro_rules! impl_fragment_presence_scanner {
                     offset += stride;
                 }
 
+                //
+                // Tail: sweep whatever window-starts the batching above
+                // left unvisited (up to lanes - 1 of them), one at a time.
+                //
+                if found_mask != all_found_mask {
+                    while offset + 4 <= buf_len {
+                        let hash = tail_hash_at::<$case_insensitive>(buf, offset, mask);
+                        for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
+                            let bit = 1u64 << frag_idx;
+                            if found_mask & bit != 0 {
+                                continue;
+                            }
+
+                            if frag_hash == hash {
+                                found_mask |= bit;
+                                break;
+                            }
+                        }
+
+                        if found_mask == all_found_mask {
+                            break;
+                        }
+
+                        offset += 1;
+                    }
+                }
+
+
                 fragment_presence_scratch[0] = found_mask;
             } else {
                 //
@@ -351,13 +631,13 @@ macro_rules! impl_fragment_presence_scanner {
                 let mut remaining = num_frags;
 
                 let mut offset = 0;
-                while offset + (12 - 1) <= buf_len {
+                while offset + read_extent <= buf_len {
                     let $data_ptr = buf.as_ptr().add(offset);
                     let $mask_val = mask;
                     let hashes: $hashes_ty = $load_block;
 
                     for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
-                        debug_assert!(frag_idx < fragment_presence_scratch.len());
+                        debug_assert!(frag_idx / 64 < fragment_presence_scratch.len());
 
                         if *fragment_presence_scratch.get_unchecked(frag_idx / 64) & (1u64 << (frag_idx % 64)) != 0 {
                             continue;
@@ -379,23 +659,65 @@ macro_rules! impl_fragment_presence_scanner {
 
                     offset += stride;
                 }
+
+                if remaining != 0 {
+                    // @Cutnpaste from above
+
+                    //
+                    // Tail: sweep whatever window-starts the batching above
+                    // left unvisited (up to lanes - 1 of them), one at a time.
+                    //
+
+                    while offset + 4 <= buf_len {
+                        let hash = tail_hash_at::<$case_insensitive>(buf, offset, mask);
+                        for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
+                            if *fragment_presence_scratch.get_unchecked(frag_idx / 64) & (1u64 << (frag_idx % 64)) != 0 {
+                                continue;
+                            }
+
+                            if frag_hash == hash {
+                                *fragment_presence_scratch.get_unchecked_mut(frag_idx / 64) |= 1u64 << (frag_idx % 64);
+                                remaining -= 1;
+                                break;
+                            }
+                        }
+
+                        if remaining == 0 {
+                            break;
+                        }
+
+                        offset += 1;
+                    }
+                }
             }
         }
     };
 }
 
+//
+//
+//
+// ------------------------------------ avx2 kernel
+//
+//
+//
+
 impl_fragment_presence_scanner! {
     fn_name: check_fragment_presence_avx2,
     cfg: "x86_64",
     feature: "avx2",
+    lanes: 8,
     min_stride: 8,
+    case_insensitive: false,
     hashes_ty: std::arch::x86_64::__m256i,
 
     fragment_load: |data_ptr, mask_val| {
         use std::arch::x86_64::*;
+
         let w0 = (data_ptr.add(0) as *const u32).read_unaligned();
         let w1 = (data_ptr.add(1) as *const u32).read_unaligned();
         let w2 = (data_ptr.add(2) as *const u32).read_unaligned();
+
         let w3 = (data_ptr.add(3) as *const u32).read_unaligned();
         let w4 = (data_ptr.add(4) as *const u32).read_unaligned();
         let w5 = (data_ptr.add(5) as *const u32).read_unaligned();
@@ -426,10 +748,69 @@ impl_fragment_presence_scanner! {
 }
 
 impl_fragment_presence_scanner! {
+    fn_name: check_fragment_presence_avx2_ci,
+    cfg: "x86_64",
+    feature: "avx2",
+    lanes: 8,
+    min_stride: 8,
+    case_insensitive: true,
+    hashes_ty: std::arch::x86_64::__m256i,
+
+    fragment_load: |data_ptr, mask_val| {
+        use std::arch::x86_64::*;
+
+        // @Cutnpaste from check_fragment_presence_avx2
+
+        let w0 = (data_ptr.add(0) as *const u32).read_unaligned();
+        let w1 = (data_ptr.add(1) as *const u32).read_unaligned();
+        let w2 = (data_ptr.add(2) as *const u32).read_unaligned();
+
+        let w3 = (data_ptr.add(3) as *const u32).read_unaligned();
+        let w4 = (data_ptr.add(4) as *const u32).read_unaligned();
+        let w5 = (data_ptr.add(5) as *const u32).read_unaligned();
+        let w6 = (data_ptr.add(6) as *const u32).read_unaligned();
+        let w7 = (data_ptr.add(7) as *const u32).read_unaligned();
+        let fragments = _mm256_set_epi32(
+            w7 as i32, w6 as i32, w5 as i32, w4 as i32,
+            w3 as i32, w2 as i32, w1 as i32, w0 as i32,
+        );
+
+        //
+        // Fold BEFORE masking/hashing, folding the whole register at once
+        // is equivalent to folding each of the 8 overlapping u32 windows
+        // individually first.
+        //
+        // (see the `simd_fold` module doc comment for why overlap doesn't matter here).
+        //
+
+        let folded = simd_fold::ascii_lowercase_avx2(fragments);
+        let masked = _mm256_and_si256(folded, _mm256_set1_epi32(mask_val as i32));
+        _mm256_mullo_epi32(masked, _mm256_set1_epi32(0x9e3779b9_u32 as i32))
+    },
+
+    splat: |scalar| {
+        std::arch::x86_64::_mm256_set1_epi32(scalar as i32)
+    },
+
+    any_match: |a, b| {
+        use std::arch::x86_64::*;
+        _mm256_movemask_epi8(_mm256_cmpeq_epi32(a, b)) != 0
+    },
+}
+
+//
+//
+// ------------------------------------ aarch64 kernel
+//
+//
+
+impl_fragment_presence_scanner! {
     fn_name: check_fragment_presence_neon,
     cfg: "aarch64",
     feature: "neon",
+    lanes: 4,
     min_stride: 4,
+    case_insensitive: false,
     hashes_ty: std::arch::aarch64::uint32x4_t,
 
     fragment_load: |data_ptr, mask_val| {
@@ -449,72 +830,54 @@ impl_fragment_presence_scanner! {
 
     any_match: |a, b| {
         use std::arch::aarch64::*;
+
+        //
+        // vceqq_u32 gives an all-ones/all-zeros mask per lane;
+        // vmaxvq_u32 horizontally reduces the 4 lanes to a single u32,
+        // which is nonzero if at least one lane matched.
+        //
+
         vmaxvq_u32(vceqq_u32(a, b)) != 0
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl_fragment_presence_scanner! {
+    fn_name: check_fragment_presence_neon_ci,
+    cfg: "aarch64",
+    feature: "neon",
+    lanes: 4,
+    min_stride: 4,
+    case_insensitive: true,
+    hashes_ty: std::arch::aarch64::uint32x4_t,
 
-    #[test]
-    fn short_pattern_gets_fragments_with_3_byte_fragment() {
-        // "foo" is 3 bytes -- with the old fixed 4-byte fragment this produced zero fragments.
-        let fragment_len = select_fragment_len(std::iter::once("foo".as_bytes())).unwrap();
-        assert_eq!(fragment_len, 3);
+    fragment_load: |data_ptr, mask_val| {
+        use std::arch::aarch64::*;
 
-        let frags = extract_pattern_fragments_with_len("foo".as_bytes(), fragment_len);
-        assert_eq!(frags.len(), 1, "a 3-byte pattern with a 3-byte fragment is exactly one fragment");
-    }
+        let w0 = (data_ptr.add(0) as *const u32).read_unaligned();
+        let w1 = (data_ptr.add(1) as *const u32).read_unaligned();
+        let w2 = (data_ptr.add(2) as *const u32).read_unaligned();
+        let w3 = (data_ptr.add(3) as *const u32).read_unaligned();
 
-    #[test]
-    fn em_dash_gets_fragments() {
-        // U+2014 EM DASH is 3 bytes in UTF-8: [0xE2, 0x80, 0x94]
-        let em_dash = "—".as_bytes();
-        assert_eq!(em_dash.len(), 3);
+        let words: [u32; 4] = [w0, w1, w2, w3];
+        let fragments = vld1q_u32(words.as_ptr());
 
-        let fragment_len = select_fragment_len(std::iter::once(em_dash)).unwrap();
-        let frags = extract_pattern_fragments_with_len(em_dash, fragment_len);
-        assert_eq!(frags.len(), 1);
-    }
+        //
+        // Reinterpret the 4 packed u32 lanes as 16 packed bytes,
+        // fold case byte-wise, then reinterpret back.
+        //
 
-    #[test]
-    fn too_short_pattern_disables_fragment_cache() {
-        // 2 bytes is below MIN_FRAGMENT_LEN -- the whole point is that the cache is not worth
-        // using at all here, not that it should use an even smaller fragment.
-        assert_eq!(select_fragment_len(std::iter::once("fo".as_bytes())), None);
-        assert_eq!(select_fragment_len(std::iter::once("f".as_bytes())), None);
-    }
+        let folded_bytes = crate::simd_fold::ascii_lowercase_neon(vreinterpretq_u8_u32(fragments));
+        let folded = vreinterpretq_u32_u8(folded_bytes);
+        let masked = vandq_u32(folded, vdupq_n_u32(mask_val));
+        vmulq_u32(masked, vdupq_n_u32(0x9e3779b9u32))
+    },
 
-    #[test]
-    fn mixed_length_alternation_uses_shortest() {
-        // "fo|hello" -- "fo" is only 2 bytes, so the fragment cache must bail out entirely for
-        // the whole alternation, not just quietly drop "fo" from consideration.
-        let patterns: [&[u8]; 2] = ["fo".as_bytes(), "hello".as_bytes()];
-        assert_eq!(select_fragment_len(patterns), None);
+    splat: |scalar| {
+        std::arch::aarch64::vdupq_n_u32(scalar)
+    },
 
-        // "foo|hello" -- shortest is 3 bytes, so fragment_len should be 3 for both.
-        let patterns: [&[u8]; 2] = ["foo".as_bytes(), "hello".as_bytes()];
-        assert_eq!(select_fragment_len(patterns), Some(3));
-    }
-
-    #[test]
-    fn masked_buffer_hash_matches_padded_pattern_hash() {
-        // The whole trick relies on: hash(pattern zero-padded to 4 bytes) ==
-        // hash(masked 4-byte buffer load), for any 4th byte in the buffer.
-        let fragment_len = 3;
-        let mask = fragment_mask_u32(fragment_len);
-
-        let pattern_frag = {
-            let mut frag = [0u8; 4];
-            frag[..3].copy_from_slice(b"foo");
-            hash_fragment(frag)
-        };
-
-        for tail_byte in 0..=255u8 {
-            let buf_word = u32::from_le_bytes([b'f', b'o', b'o', tail_byte]);
-            let buf_hash = hash_fragment_u32(buf_word & mask);
-            assert_eq!(buf_hash, pattern_frag, "tail byte {tail_byte} should be masked out");
-        }
-    }
+    any_match: |a, b| {
+        use std::arch::aarch64::*;
+        vmaxvq_u32(vceqq_u32(a, b)) != 0
+    },
 }

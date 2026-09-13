@@ -162,10 +162,26 @@ impl Matcher {
         let pattern = &cli.pattern;
 
         if cli.force_literal {
-            return Ok(Matcher::Literal(Finder::new(pattern.as_bytes()).into_owned()));
+            if !cli.word_regexp && let Some(m) = Self::literal_matcher(pattern.as_bytes(), cli.ignore_case)? {
+                return Ok(m);
+            }
+
+            //
+            // ignore case + non-ascii literal: ... ascii_case_insensitive can't fold it
+            // correctly, so fall back to the regex engine for full unicode case folding.
+            //
+            // `pattern` is raw literal text here (force_literal means we
+            // never ran it through regex_syntax), so it must be escaped before
+            // reaching a regex engine, or its own characters would be reinterpreted
+            // as regex syntax instead of literal bytes.
+            //
+
+            let escaped = regex_syntax::escape(pattern);
+            let escaped = if cli.word_regexp { Self::wrap_word(&escaped) } else { escaped };
+            return Self::regex_fallback(&escaped, cli.ignore_case);
         }
 
-        if let Ok(hir) = regex_syntax::Parser::new().parse(pattern) {
+        if !cli.word_regexp && let Ok(hir) = regex_syntax::Parser::new().parse(pattern) {
             if let Some(literal) = literal_bytes(&hir) {
                 if let Some(m) = Self::literal_matcher(&literal, cli.ignore_case)? {
                     return Ok(m);
@@ -182,13 +198,32 @@ impl Matcher {
             //
         }
 
-        //
-        // Fallback to regex: prefer Hyperscan when it's available and can compile this
-        // pattern; otherwise fall back to the regex-automata engine below.
-        //
+        let pattern: std::borrow::Cow<str> = if cli.word_regexp {
+            Self::wrap_word(pattern).into()
+        } else {
+            pattern.as_str().into()
+        };
 
+        Self::regex_fallback(&pattern, cli.ignore_case)
+    }
+
+    /// Wraps `pattern` in word-boundary assertions.
+    ///
+    /// The pattern is grouped in a non-capturing group so alternations and other
+    /// multi-branch patterns get boundaries applied to the whole expression, not just
+    /// the first/last branch.
+    fn wrap_word(pattern: &str) -> String {
+        format!(r"\b(?:{pattern})\b")
+    }
+
+    /// Fallback to a full regex engine: prefer Hyperscan when available and able to
+    /// compile this pattern, otherwise the regex-automata engine.
+    ///
+    /// `pattern` is used as-is -- callers wanting literal semantics (e.g. `force_literal`) must
+    /// pre-escape it themselves.
+    fn regex_fallback(pattern: &str, ignore_case: bool) -> io::Result<Self> {
         #[cfg(feature = "hyperscan")]
-        if let Some(matcher) = Self::try_hyperscan(pattern, cli.ignore_case) {
+        if let Some(matcher) = Self::try_hyperscan(pattern, ignore_case) {
             return Ok(matcher);
         }
 
@@ -202,14 +237,14 @@ impl Matcher {
                     .dfa_size_limit(Some(LIMIT))
                     .nfa_size_limit(Some(LIMIT))
             )
-            .syntax(util::syntax::Config::new().case_insensitive(cli.ignore_case))
+            .syntax(util::syntax::Config::new().case_insensitive(ignore_case))
             .build(pattern)
             .map_err(|e| io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid regex '{pattern}': {e}"),
             ))?;
 
-        Ok(Matcher::Regex { re, pattern: pattern.clone().into_boxed_str(), case_insensitive: cli.ignore_case })
+        Ok(Matcher::Regex { re, pattern: pattern.to_owned().into_boxed_str(), case_insensitive: ignore_case })
     }
 
     /// Try to compile `pattern` with Hyperscan. Returns `None` if Hyperscan rejects the
@@ -228,7 +263,10 @@ impl Matcher {
         // UTF-8 mode is documented as undefined behavior on invalid input.
         //
 
-        let db: BlockDatabase = Pattern::with_flags(pattern, hyperscan::CompileFlags::SOM_LEFTMOST)
+        let mut flags = hyperscan::CompileFlags::SOM_LEFTMOST;
+        if ignore_case { flags |= hyperscan::CompileFlags::CASELESS };
+
+        let db: BlockDatabase = Pattern::with_flags(pattern, flags)
             .ok()?
             .build()
             .ok()?;
@@ -367,8 +405,9 @@ impl Matcher {
     /// Allocate the per-thread scan state this matcher's backend needs, if any.
     ///
     /// Call this once per thread and reuse the result across every `find_matches` /
-    /// `push_all_matches` call that thread makes on *this* `Matcher` — see
-    /// [`MatcherCache`] for the rules around sharing.
+    /// `push_all_matches` call that thread makes on *this* `Matcher`.
+    ///
+    /// See [`MatcherCache`] for the rules around sharing.
     #[inline]
     pub fn create_cache(&self) -> io::Result<MatcherCache> {
         match self {
@@ -398,14 +437,6 @@ impl Matcher {
         use nohash_hasher::IntSet;
 
         match self {
-            //
-            // @Incomplete: No case-insensitive regex-literal/multi-literal extraction for now...
-            //
-            #[cfg(feature = "hyperscan")]
-            Matcher::Hyperscan    { case_insensitive: true, .. } |
-            Matcher::Regex        { case_insensitive: true, .. } |
-            Matcher::MultiLiteral { case_insensitive: true, .. } => None,
-
             Matcher::Literal(finder) => {
                 let needle = finder.needle();
                 let fragment_len = crate::fragments::select_fragment_len(std::iter::once(needle))?;
@@ -413,15 +444,29 @@ impl Matcher {
                 Some((hashes, fragment_len))
             }
 
-            Matcher::MultiLiteral { patterns, .. } => {
+            Matcher::MultiLiteral { patterns, case_insensitive, .. } => {
+                //
+                // ascii_case_insensitive MultiLiteral matchers are only ever
+                // built from pure-ASCII literals (multi_literal_matcher bails
+                // to the regex fallback otherwise), so folding case here is
+                // always a plain a-z/A-Z lowercase, never a lossy Unicode
+                // guess.
+                //
+
+                let folded: Vec<Vec<u8>>;
+                let patterns: Vec<&[u8]> = if *case_insensitive {
+                    folded = patterns.iter().map(|p| p.to_ascii_lowercase()).collect();
+                    folded.iter().map(|p| p.as_slice()).collect()
+                } else {
+                    patterns.iter().map(|p| p.as_ref()).collect()
+                };
+
                 //
                 // One fragment length shared across every alternation branch, must be chosen
                 // from the shortest branch, not per-branch (see select_fragment_len docs).
                 //
 
-                let fragment_len = crate::fragments::select_fragment_len(
-                    patterns.iter().map(|p| p.as_ref())
-                )?;
+                let fragment_len = crate::fragments::select_fragment_len(patterns.iter().copied())?;
 
                 let mut all_fragments = IntSet::default();
                 for pattern in patterns.iter() {
@@ -431,10 +476,14 @@ impl Matcher {
                 Some((all_fragments.into_iter().collect(), fragment_len))
             }
 
-            Matcher::Regex { pattern, .. } => extract_regex_literals(pattern),
+            Matcher::Regex { pattern, case_insensitive, .. } => {
+                extract_regex_literals(pattern, *case_insensitive)
+            }
 
             #[cfg(feature = "hyperscan")]
-            Matcher::Hyperscan { pattern, .. } => extract_regex_literals(pattern)
+            Matcher::Hyperscan { pattern, case_insensitive, .. } => {
+                extract_regex_literals(pattern, *case_insensitive)
+            }
         }
     }
 }

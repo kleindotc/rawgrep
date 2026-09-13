@@ -55,6 +55,10 @@ pub struct Cli {
     #[bpaf(short('u'), long("unrestricted"), req_flag(()), many, map(|v| v.len() as u8))]
     pub unrestricted: u8,
 
+    /// The equivalent to surrounding every pattern with \b{start-half} and \b{end-half}.
+    #[bpaf(short, long)]
+    pub word_regexp: bool,
+
     /// Don't respect .gitignore files
     #[bpaf(long("no-ignore"))]
     pub no_ignore: bool,
@@ -100,6 +104,14 @@ pub struct Cli {
 
     #[bpaf(short('i'), long("ignore-case"))]
     pub ignore_case: bool,
+
+    /// Show line numbers (default when printing to a terminal)
+    #[bpaf(short('n'), long("line-number"))]
+    pub line_numbers: bool,
+
+    /// Never show line numbers (overrides --line-number and any terminal auto-detection)
+    #[bpaf(short('N'), long("no-line-number"))]
+    pub no_line_numbers: bool,
 
     /// Number of worker threads to use
     ///

@@ -87,11 +87,11 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             flush_ack_rx: plumbing.flush_ack_rx,
         };
 
-        ctx.spawn_workers(num_threads, plumbing.output_kind);
+        ctx.spawn_workers(num_threads, plumbing.output_kind, true);
         ctx
     }
 
-    fn spawn_workers(&self, num_threads: usize, output_kind: OutputKind) {
+    fn spawn_workers(&self, num_threads: usize, output_kind: OutputKind, print_line_numbers: bool) {
         let mut local_workers = Vec::with_capacity(num_threads);
         let mut stealers      = Vec::with_capacity(num_threads);
         for _ in 0..num_threads {
@@ -114,7 +114,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
             std::thread::spawn(move || {
                 crate::util::pin_thread_to_core(worker_id % num_cores);
-                worker_thread_main(worker_id as _, ctx, &stealers, local, &pacer, slot_pool);
+                worker_thread_main(worker_id as _, ctx, &stealers, local, &pacer, slot_pool, print_line_numbers);
             });
         }
     }
@@ -156,7 +156,12 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         ctx.injector.push(work);
         ctx.running.store(true, Ordering::SeqCst);
 
-        ctx.spawn_workers(num_threads, plumbing.output_kind);
+        ctx.spawn_workers(
+            num_threads,
+            plumbing.output_kind,
+            config.line_numbers || (!config.no_line_numbers && plumbing.output_kind == OutputKind::Tty)
+        );
+
         Ok(ctx)
     }
 
@@ -326,6 +331,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
     local:     DequeWorker<WorkItem>,
     pacer:     &FlushPacer,
     slot_pool: SlotPool,
+    print_line_numbers: bool,
 ) {
     debug!("[ctx] worker {worker_id} started, waiting on condvar");
 
@@ -423,6 +429,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     sink:             $g.sink.clone(),
                     output_tx:        ctx.output_tx.clone(),
                     stats:            Default::default(),
+                    print_line_numbers,
                     pacer,
                     output,
                     parser,
@@ -430,7 +437,8 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     swap_path_buf,
                     matcher_cache: matcher_cache.as_mut(),
                     gitignore_enabled: job.gitignore_enabled,
-                    node_scratch: $g.fs().take_node_scratch(&mut node_scratch),
+                    node_scratch:
+                    $g.fs().take_node_scratch(&mut node_scratch),
                     node_cache:   $g.fs().take_node_cache(&mut node_cache),
                     entries_arena,
                     subdirs_arena,

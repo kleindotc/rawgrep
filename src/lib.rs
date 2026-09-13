@@ -84,9 +84,12 @@ pub struct RawGrepConfig {
     pub all:          bool,
     pub unrestricted: u8,
     pub hidden:       bool,
+    pub word_regexp:  bool,
     pub no_require_git:bool,
 
     // ---- output ---------------------------------------------------------
+    pub line_numbers:   bool,
+    pub no_line_numbers:bool,
     pub no_color:       bool,
     pub jump:           bool,
     pub stats:          bool,
@@ -123,8 +126,11 @@ impl RawGrepConfig {
             jump:             false,
             stats:            false,
             no_require_git:   false,
+            word_regexp:      false,
             force_literal:    false,
             ignore_case:      false,
+            no_line_numbers:  false,
+            line_numbers:     true,
             should_ignore_reserved_tool_dir_filter: false,
             threads:          std::thread::available_parallelism()
                                   .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) }),
@@ -137,14 +143,17 @@ impl RawGrepConfig {
 
     pub fn device(mut self, d: impl Into<Box<str>>)     -> Self { self.device = Some(d.into());    self }
     pub fn no_color(mut self)                           -> Self { self.no_color      = true;       self }
-    pub fn no_require_git(mut self)                               -> Self { self.no_require_git          = true;       self }
+    pub fn no_require_git(mut self)                     -> Self { self.no_require_git          = true;       self }
+    pub fn word_regexp(mut self)                        -> Self { self.word_regexp          = true;       self }
     pub fn jump(mut self)                               -> Self { self.jump          = true;       self }
     pub fn stats(mut self)                              -> Self { self.stats         = true;       self }
+    pub fn line_numbers(mut self)                       -> Self { self.line_numbers         = true;       self }
+    pub fn no_line_numbers(mut self)                    -> Self { self.no_line_numbers         = true;       self }
     pub fn all(mut self)                                -> Self { self.all           = true;       self }
     pub fn binary(mut self)                             -> Self { self.binary        = true;       self }
     pub fn no_ignore(mut self)                          -> Self { self.no_ignore     = true;       self }
     pub fn large(mut self)                              -> Self { self.large         = true;       self }
-    pub fn should_ignore_reserved_tool_dir_filter(mut self)-> Self { self.should_ignore_reserved_tool_dir_filter = true; self }
+    pub fn should_ignore_reserved_tool_dir_filter(mut self)->Self{ self.should_ignore_reserved_tool_dir_filter = true; self }
     pub fn force_literal(mut self)                      -> Self { self.force_literal = true;       self }
     pub fn ignore_case(mut self)                        -> Self { self.ignore_case = true;         self }
     pub fn no_cache(mut self)                           -> Self { self.no_cache      = true;       self }
@@ -168,6 +177,9 @@ impl RawGrepConfig {
             large:            c.large,
             hidden:           c.hidden,
             all:              c.all,
+            no_line_numbers:  c.no_line_numbers,
+            line_numbers:     c.line_numbers,
+            word_regexp:      c.word_regexp,
             no_cache_write:   c.no_cache_write,
             unrestricted:     c.unrestricted,
             no_color:         c.no_color,
@@ -194,10 +206,13 @@ impl RawGrepConfig {
             device:           self.device.clone().map(String::from),
             no_ignore:        self.no_ignore,
             binary:           self.binary,
+            line_numbers:     self.line_numbers,
+            no_line_numbers:  self.no_line_numbers,
             no_require_git:   self.no_require_git,
             large:            self.large,
             all:              self.all,
             unrestricted:     self.unrestricted,
+            word_regexp:      self.word_regexp,
             no_color:         self.no_color,
             jump:             self.jump,
             stats:            self.stats,

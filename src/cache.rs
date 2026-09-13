@@ -687,9 +687,9 @@ impl<S: CacheStorage> FragmentCache<S> {
         eprintln!(
             "ensure_owned called: num_files={}, new_capacity={}, bits_per_file_u64={}, total_bitset_KB={}",
             num_files,
-            (num_files * 4).max(64 * 1024).min(self.max_files as usize),
+            new_capacity,
             num_fragments.div_ceil(64).max(1),
-            ((num_files * 4).max(64 * 1024).min(self.max_files as usize) * num_fragments.div_ceil(64).max(1) * 8) / 1024,
+            (new_capacity * bits_per_file_u64 * 8) / 1024,
         );
 
         // allocate uninit and only copy what we need

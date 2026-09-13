@@ -282,7 +282,7 @@ hyperfine \
 # RAM usage
 #
 # hyperfine's --export-json already captured peak RSS per run in
-# memory_usage_byte (see note at top of file) — just pull it back out and
+# memory_usage_byte (see note at top of file), just pull it back out and
 # report mean/max per command across every JSON file we wrote above.
 
 echo ""
