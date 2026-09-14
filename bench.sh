@@ -210,14 +210,6 @@ run_search_benchmarks() {
     local cmd_rg="rg '$pattern' '$search_dir' --no-heading --color=never -n --threads $THREADS"
     # hypergrep has no on-disk fragment cache to toggle like rawgrep does,
     # so (like rg) one command covers all four cache-state phases below.
-    # NOTE: flags MUST precede PATTERN/PATH -- hgrep's own SYNOPSIS is
-    # `hgrep [OPTIONS] PATTERN [PATH ...]`, and PATH accepts multiple
-    # values. Putting -n/--ignore-gitindex after the search dir risks them
-    # being swallowed as extra (nonexistent) PATH arguments instead of
-    # being parsed as options, which silently turns this into a no-op
-    # search that errors out near-instantly (a hyperfine mean in the low
-    # single-digit milliseconds against a multi-GB tree is that failure
-    # mode, not a real result).
     local cmd_hypergrep="$HYPERGREP_BIN -n --ignore-gitindex '$pattern' '$search_dir'"
 
     echo ""
