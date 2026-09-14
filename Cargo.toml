@@ -79,7 +79,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [[bin]]
-name = "gitignore_oracle_check"
+name = "gitignore-oracle-check"
 required-features = ["ignore-oracle-check"]
 
 [dev-dependencies]
