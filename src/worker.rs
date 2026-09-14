@@ -2,7 +2,7 @@
 //   TODO(#28): Daemon mode
 //
 // TODO(#1): Implement symlinks
-// TODO(#24): Support for searching in large file(s). (detect that)
+// TODO(#24): Support for work splitting for large file(s). (detect that)
 
 use crate::liner::*;
 use crate::pacer::FlushPacer;
@@ -1883,7 +1883,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             scratch.extend_from_slice(b": ");
         }
 
-        let display = truncate_utf8(line, 500); // @Configuration @Tune
+        let display = truncate_utf8(line, 500); // @Incomplete @Configuration @Tune
 
         let mut reserve_len = display.len() + 1;
         if should_print_color {

@@ -918,7 +918,10 @@ impl<S: CacheStorage> FragmentCache<S> {
                 let new_offset = file_id * new_stride;
                 for i in 0..old_stride {
                     if old_offset + i < old_bits.len() {
-                        new_bits[new_offset + i] = old_bits[old_offset + i];
+                        unsafe {
+                            *new_bits.get_unchecked_mut(new_offset + i) =
+                            *old_bits.get_unchecked(old_offset + i);
+                        }
                     }
                 }
             }
@@ -1527,8 +1530,8 @@ impl<S: CacheStorage> FragmentCache<S> {
         let mut changed = has_new_fragment;
 
         for file_index in 0..file_keys.len() {
-            let file_key  = file_keys[file_index];
-            let file_meta = file_metas[file_index];
+            let file_key  = *unsafe { file_keys .get_unchecked(file_index) };
+            let file_meta = *unsafe { file_metas.get_unchecked(file_index) };
 
             let existing_id = self.lookup_file_id(file_key);
             let meta_changed = match existing_id {
@@ -1550,16 +1553,20 @@ impl<S: CacheStorage> FragmentCache<S> {
             //
             if !changed && let Some(id) = existing_id {
                 let offset = (id as usize) * bits_per_file_u64;
-                let presence = &fragment_presence[
-                    file_index * words_per_file
-                     ..
-                    (file_index + 1) * words_per_file
-                ];
+
+                let presence = unsafe {
+                    fragment_presence.get_unchecked(
+                        file_index * words_per_file .. (file_index + 1) * words_per_file
+                    )
+                };
 
                 for (frag_i, frag_plan) in frags.iter().enumerate() {
                     // has_new_fragment is false here, so this is always Some.
                     let frag_index     = frag_plan.existing_index.unwrap() as usize;
-                    let is_present     = (presence[frag_i / 64] & (1 << (frag_i % 64))) != 0;
+
+                    let presence       = unsafe { *presence.get_unchecked(frag_i / 64) };
+                    let is_present     = (presence & (1 << (frag_i % 64))) != 0;
+
                     let expect_bit_set = !is_present;
 
                     let u64_index      = offset + (frag_index >> 6);
@@ -1646,8 +1653,8 @@ impl<S: CacheStorage> FragmentCache<S> {
                 break;
             }
 
-            let file_key  = file_keys[file_plan.file_index as usize];
-            let file_meta = file_metas[file_plan.file_index as usize];
+            let file_key  = *unsafe { file_keys .get_unchecked(file_plan.file_index as usize) };
+            let file_meta = *unsafe { file_metas.get_unchecked(file_plan.file_index as usize) };
 
             let file_id = match file_plan.existing_id {
                 Some(id) => id as usize,
@@ -1672,26 +1679,35 @@ impl<S: CacheStorage> FragmentCache<S> {
             // Update metadata
             //
 
-            self.owned_file_keys .as_mut().unwrap()[file_id] = file_key;
-            self.owned_file_metas.as_mut().unwrap()[file_id] = file_meta;
+            unsafe {
+                *self.owned_file_keys.as_mut().unwrap_unchecked()
+                    .get_unchecked_mut(file_id) = file_key;
+
+                *self.owned_file_metas.as_mut().unwrap_unchecked()
+                    .get_unchecked_mut(file_id) = file_meta;
+            }
 
             let needs_full_reset =
                 file_plan.existing_id.is_none()
              || file_plan.meta_changed
              || file_id >= original_num_files;
 
-            let presence = &fragment_presence[
-                (file_plan.file_index       * words_per_file) as usize
-                ..
-                ((file_plan.file_index + 1) * words_per_file) as usize
-            ];
+            let presence = unsafe {
+                let file_index     = file_plan.file_index as usize;
+                let words_per_file = words_per_file       as usize;
+                fragment_presence.get_unchecked(
+                    file_index * words_per_file .. (file_index + 1) * words_per_file
+                )
+            };
 
             //
             // Add fragments and collect indexes with their presence status
             //
             let mut fragment_data = Vec::with_capacity(frag_indexes.len());
             for (frag_i, &frag_index) in frag_indexes.iter().enumerate() {
-                let is_present = (presence[frag_i / 64] & (1 << (frag_i % 64))) != 0;
+                let presence = unsafe { *presence.get_unchecked(frag_i / 64) };
+
+                let is_present = (presence & (1 << (frag_i % 64))) != 0;
                 fragment_data.push((frag_index, is_present));
             }
 
@@ -1724,7 +1740,13 @@ impl<S: CacheStorage> FragmentCache<S> {
                 for i in 0..bits_per_file_u64 {
                     let index = offset + i;
                     if index < owned_file_bitsets.len() {
-                        owned_file_bitsets[index] = 0u64;  // Unknown -- only checked fragments get marked
+                        unsafe {
+                            //
+                            // Unknown -- only checked fragments get marked
+                            //
+
+                            *owned_file_bitsets.get_unchecked_mut(index) = 0u64;
+                        }
                     }
                 }
             }
@@ -1736,12 +1758,13 @@ impl<S: CacheStorage> FragmentCache<S> {
                 let bit_index = frag_index % 64;
 
                 if u64_index < owned_file_bitsets.len() {
+                    let bits = unsafe { owned_file_bitsets.get_unchecked_mut(u64_index) };
                     if is_present {
                         // ----- Fragment PRESENT - clear bit (bit=0)
-                        owned_file_bitsets[u64_index] &= !(1u64 << bit_index);
+                        *bits &= !(1u64 << bit_index);
                     } else {
-                        // ----- Fragment ABSENT - set bit (bit=1)
-                        owned_file_bitsets[u64_index] |=   1u64 << bit_index;
+                        // ----- Fragment ABSENT  - set bit (bit=1)
+                        *bits |=   1u64 << bit_index;
                     }
                 }
             }
