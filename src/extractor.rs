@@ -524,8 +524,6 @@ pub fn extract_regex_literals(
         literal_parts.into_iter().map(|p| p.bytes).collect()
     };
 
-    dbg!(&parts);
-
     //
     // All parts' lengths must be >= MIN_FRAGMENT_LEN
     //
