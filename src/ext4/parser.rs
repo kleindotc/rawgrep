@@ -165,7 +165,7 @@ impl RawFs for Ext4Fs {
 
         self.read_at_offset(buf, inode_offset as _)?;
 
-        Self::decode_inode(file_id as u64, buf, self.sb.inode_size)
+        Self::decode_inode(file_id, buf, self.sb.inode_size)
     }
 
     #[inline(always)]

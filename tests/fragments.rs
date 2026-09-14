@@ -22,7 +22,7 @@ mod simd_tests {
         };
         let hashes = extract_pattern_fragments_with_len(pattern_for_extraction, fragment_len);
         let index: IntSet<u32> = hashes.iter().copied().collect();
-        let mut scratch = vec![0u64; (hashes.len() + 63) / 64];
+        let mut scratch = vec![0u64; hashes.len().div_ceil(64)];
         check_fragment_presence(buf, &hashes, &mut scratch, &index, fragment_len, case_insensitive);
         let bits: Vec<bool> = (0..hashes.len())
             .map(|i| scratch[i / 64] & (1u64 << (i % 64)) != 0)
@@ -151,12 +151,12 @@ mod simd_tests {
 
         let mut present_buf = vec![b'x'; 40];
         present_buf[10..16].copy_from_slice(b"NeEdLE");
-        let mut scratch = vec![0u64; (hashes.len() + 63) / 64];
+        let mut scratch = vec![0u64; hashes.len().div_ceil(64)];
         unsafe { check_fragment_presence_avx2_ci(&present_buf, &hashes, &mut scratch, mask) };
         assert!((0..hashes.len()).all(|i| scratch[i / 64] & (1u64 << (i % 64)) != 0));
 
         let absent_buf = vec![b'x'; 40];
-        let mut scratch2 = vec![0u64; (hashes.len() + 63) / 64];
+        let mut scratch2 = vec![0u64; hashes.len().div_ceil(64)];
         unsafe { check_fragment_presence_avx2_ci(&absent_buf, &hashes, &mut scratch2, mask) };
         assert!((0..hashes.len()).all(|i| scratch2[i / 64] & (1u64 << (i % 64)) == 0));
     }
@@ -267,7 +267,7 @@ mod simd_tests {
         let upper: Vec<u8> = pattern.iter().map(|b| b.to_ascii_uppercase()).collect();
         buf[50..50 + upper.len()].copy_from_slice(&upper);
 
-        let mut scratch = vec![0u64; (hashes.len() + 63) / 64];
+        let mut scratch = vec![0u64; hashes.len().div_ceil(64)];
         check_fragment_presence(&buf, &hashes, &mut scratch, &index, fragment_len, true);
         let all_found = (0..hashes.len()).all(|i| scratch[i / 64] & (1u64 << (i % 64)) != 0);
         assert!(all_found, "every fragment of the embedded (case-swapped) pattern should be found");
@@ -296,7 +296,7 @@ mod simd_tests {
         let index: IntSet<u32> = hashes.iter().copied().collect();
 
         let buf = vec![b'.'; 200];
-        let mut scratch = vec![0u64; (hashes.len() + 63) / 64];
+        let mut scratch = vec![0u64; hashes.len().div_ceil(64)];
         check_fragment_presence(&buf, &hashes, &mut scratch, &index, fragment_len, true);
         let none_found = (0..hashes.len()).all(|i| scratch[i / 64] & (1u64 << (i % 64)) == 0);
         assert!(none_found, "an unrelated buffer should report no fragments found");
@@ -350,8 +350,8 @@ mod simd_tests {
             let index: IntSet<u32> = hashes.iter().copied().collect();
             let mask = fragment_mask_u32(fragment_len);
 
-            let mut scratch_dispatched = vec![0u64; (hashes.len() + 63) / 64];
-            let mut scratch_scalar = vec![0u64; (hashes.len() + 63) / 64];
+            let mut scratch_dispatched = vec![0u64; hashes.len().div_ceil(64)];
+            let mut scratch_scalar = vec![0u64; hashes.len().div_ceil(64)];
 
             check_fragment_presence(&buf, &hashes, &mut scratch_dispatched, &index, fragment_len, true);
             check_fragment_presence_scalar(&buf, &hashes, &mut scratch_scalar, &index, mask, true);

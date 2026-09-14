@@ -1875,7 +1875,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             scratch.extend_from_slice(b":");
         }
 
-        if line_num_str.len() != 0 {
+        if line_num_str.is_empty() {
             if should_print_color { scratch.extend_from_slice(COLOR_CYAN.as_bytes()); }
             scratch.extend_from_slice(line_num_str.as_bytes());
             if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }

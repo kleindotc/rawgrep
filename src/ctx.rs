@@ -331,6 +331,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_thread_main<S: MatchSink + 'static>(
     worker_id:   u16,
     num_workers: u16,

@@ -534,6 +534,8 @@ macro_rules! impl_fragment_presence_scanner {
         splat: |$scalar:ident| $splat_block:block,
         any_match: |$ha:ident, $hb:ident| $match_block:block,
     ) => {
+        /// # Safety
+        /// Don't fuck up
         #[cfg(target_arch = $cfg_arch)]
         #[target_feature(enable = $feature)]
         #[allow(unsafe_op_in_unsafe_fn)]

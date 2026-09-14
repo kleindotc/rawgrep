@@ -85,6 +85,7 @@ unsafe impl Sync for SendSyncScratch {}
 #[cfg(feature = "hyperscan")]
 unsafe impl Send for SendSyncScratch {}
 
+#[allow(clippy::large_enum_variant, reason = "Same as for MatchIterator")]
 pub enum MatcherCache {
     /// `Literal` and `MultiLiteral` are stateless and need no scan state.
     Empty,
@@ -427,9 +428,8 @@ impl Matcher {
             Matcher::Hyperscan { db, .. } => db
                 .alloc_scratch()
                 .map(MatcherCache::Hyperscan)
-                .map_err(|e| io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to allocate hyperscan scratch: {e}"),
+                .map_err(|e| io::Error::other(
+                    format!("failed to allocate hyperscan scratch: {e}")
                 )),
         }
     }
