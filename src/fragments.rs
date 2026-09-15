@@ -170,17 +170,6 @@ pub const fn stride_heuristic(buf_len: usize) -> usize {
     }
 }
 
-/// Extract fragment hashes from a search pattern using the default 4-byte fragment.
-///
-/// Kept for callers that don't care about short patterns; prefer
-/// [`extract_pattern_fragments_with_fragment`] together with [`select_fragment_len`] for new code,
-/// since this always returns empty for patterns under 4 bytes.
-#[inline]
-pub fn extract_pattern_fragments(pattern: &[u8]) -> Vec<u32> {
-    let fragment_len = pattern.len().clamp(3, 4);
-    extract_pattern_fragments_with_len(pattern, fragment_len)
-}
-
 /// Extract fragment hashes from a search pattern using a `fragment_len`-byte sliding fragment
 /// (`fragment_len` should be in `MIN_FRAGMENT_LEN..=4`, typically from [`select_fragment_len`]).
 ///

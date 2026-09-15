@@ -35,36 +35,36 @@ profile-sort-lens = []
 no-cache-stats = []
 
 [dependencies]
-hyperscan = { version = "0.3", optional = true }
-regex-automata = { version = "0.4.18", default-features=false, features=["std", "meta", "unicode-perl", "unicode-script"] }
+hyperscan         = { version = "0.3",     default-features = true,  features = [], optional = true }
+regex-automata    = { version = "0.4.18",  default-features = false, features = ["std", "meta", "unicode-perl", "unicode-script"] }
 
-aho-corasick = { version = "1.1.4", default-features = false }
-memchr = { version = "2.7.6", default-features = false, features = ["std"] }
+aho-corasick      = { version = "1.1.4",   default-features = false, features = [] }
+memchr            = { version = "2.7.6",   default-features = false, features = ["std"] }
 
-libc = { version = "0.2.177", default-features = false }
-memmap2 = { version = "0.9.11", default-features = false }
+libc              = { version = "0.2.177", default-features = false, features = [] }
+memmap2           = { version = "0.9.11",  default-features = false, features = [] }
 
-dhat = { version = "0.3.3", default-features = false, optional = true }
-mimalloc = { version = "=0.1.47", optional = true }
+dhat              = { version = "0.3.3",   default-features = false, features = [], optional = true }
+mimalloc          = { version = "=0.1.47", default-features = true,  features = [], optional = true }
 
-smallvec = { version = "1.15.1", features = ["const_generics"] }
-ctrlc = { version = "3.5.2", default-features = false }
-tracy-client = { version = "0.17.3", default-features = false }
+smallvec          = { version = "1.15.1",                            features = ["const_generics"] }
+ctrlc             = { version = "3.5.2",   default-features = false, features = [] }
+tracy-client      = { version = "0.17.3",  default-features = false, features = [] }
 
-crossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }
-crossbeam-deque = { version = "0.8.7", default-features = false, features = ["std"] }
+crossbeam-channel = { version = "0.5.15",  default-features = false, features = ["std"] }
+crossbeam-deque   = { version = "0.8.7",   default-features = false, features = ["std"] }
 
-itoa = { version = "1.0.15", default-features = false }
-fastrand = { version = "2.3.0", default-features = false, features = ["std"] }
-bytemuck = { version = "1.24", features = ["derive"] }
+itoa              = { version = "1.0.15",  default-features = false, features = [] }
+fastrand          = { version = "2.3.0",   default-features = false, features = ["std"] }
+bytemuck          = { version = "1.24",                              features = ["derive"] }
 
-bpaf = { version = "0.9.27", features = ["derive"], default-features = false }
-nohash-hasher = { version = "0.2.0", default-features = false, features = ["std"] }
-parking_lot = { version =  "0.12.5", default-features = false }
-phf = { version = "0.14.0", features = ["macros"] }
+bpaf              = { version = "0.9.27",  default-features = false, features = ["derive"], }
+nohash-hasher     = { version = "0.2.0",   default-features = false, features = ["std"] }
+parking_lot       = { version =  "0.12.5", default-features = false, features = [] }
 
-ignore = { version = "0.4.30", optional = true }
-regex-syntax = "0.8.11"
+regex-syntax      = { version = "0.8.11",  default-features = true,  features = [] }
+
+ignore            = { version = "0.4.30",  default-features = false,                optional = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 gdt-cpus = { version = "0.2606.1", default-features = false }

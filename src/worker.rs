@@ -9,7 +9,6 @@ use crate::pacer::FlushPacer;
 use crate::cache::{FileKey, FileMeta, FragmentCache};
 use crate::slab::{OutputSlab, SlotWriter, OwnedOverflow};
 use crate::cli::{should_enable_ansi_coloring, Cli};
-use crate::grep::{AnyNodeScratch, AnyNodeCache};
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::matcher::{Matcher, MatcherCache};
 use crate::binary::{is_binary_ext, is_reserved_tool_dir};
@@ -46,16 +45,10 @@ pub const STREAMING_THRESHOLD:     usize = 10 * 1024 * 1024; // 10MB @Tune
 
 pub const STREAMING_CHUNK_SIZE:    usize = 512 * 1024;       // 512KB read buffer @Tune
 
-pub const LARGE_DIR_THRESHOLD:     usize = 256;              // Split dirs with 1000+ entries @Tune
-pub const FILE_BATCH_SIZE:         usize = 64;               // Process files in batches of 500 @Tune
-
-pub const WORKER_FLUSH_BATCH:      usize = 16 * 1024;        // @Tune
 pub const OUTPUTTER_FLUSH_BATCH:   usize = 512 * 1024;       // @Tune
 
 pub const BINARY_CONTROL_COUNT:    usize = 51;               // @Tune
 pub const BINARY_PROBE_BYTE_SIZE:  usize = 0x1000;           // @Tune
-
-pub const MAX_EXTENTS_UNTIL_SPILL: usize = 64;               // @Tune
 
 pub const __MAX_FILE_BYTE_SIZE:    usize = 30 * 1024 * 1024; // @Tune
 
@@ -184,12 +177,6 @@ pub enum OutputMessage {
     Slot { slab: &'static OutputSlab, slot: u16, len: u32 },
     Owned(OwnedOverflow),
     FlushReq,
-}
-
-#[cfg(target_os = "linux")]
-pub enum PendingRelease {
-    Slot(&'static OutputSlab, u16),
-    Owned(OwnedOverflow),
 }
 
 pub enum PendingBuf {
@@ -485,9 +472,6 @@ pub struct WorkerResult {
     pub       line_ranges_scratch: Vec<(u32, u32)>,
     pub fragment_presence_scratch: Vec<u64>,
 
-    pub node_scratch: AnyNodeScratch,
-    pub node_cache:   AnyNodeCache,
-
     pub         path_arena: PathArena,
     pub file_entries_arena: FileEntryArena,
     pub      subdirs_arena: SubdirsArena,
@@ -551,7 +535,6 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
 
     // ----- Cold / output plumbing ----
     pub sink: S,
-    pub output_tx: Sender<OutputMessage>,
 }
 
 impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
@@ -570,8 +553,6 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
             stats: self.stats,
             entries_arena: self.entries_arena,
             parser: self.parser,
-            node_scratch: self.fs.erase_node_scratch(self.node_scratch),
-            node_cache:   self.fs.erase_node_cache(self.node_cache),
             path_arena: self.path_arena,
             file_entries_arena: self.file_entries_arena,
             swap_path_buf: self.swap_path_buf,
@@ -1205,7 +1186,9 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             self.parser.chunk = buf;
         }
 
-        // Flush final partial line (no trailing newline)
+        //
+        // Flush final partial line with no trailing newline
+        //
         if !carry.tail.is_empty() {
             let tail = std::mem::take(&mut carry.tail);
             self.find_and_print_matches_in_chunk(&tail, &mut carry, true)?;
@@ -1222,6 +1205,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         let found_any = carry.found_any;
         self.chunk_carry = Some(carry);
+
         Ok(found_any)
     }
 
@@ -1256,7 +1240,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 // impl block for printing matches
 #[allow(clippy::while_let_on_iterator)]
 impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
-    #[inline]
+    #[inline(always)]
     fn find_and_print_matches(&mut self) -> io::Result<bool> {
         let _span = tracy::span!("find_and_print_matches");
 
@@ -1293,6 +1277,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             // this lets us return before ever building newlines_scratch and so on.
             //
 
+            debug_assert_eq!(C::UNIT_WIDTH, 1);
+
             self.ranges_scratch.clear();
             self.matcher.push_all_matches(
                 buf,
@@ -1310,97 +1296,44 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             let mut i         = 0usize;
 
             while i < self.ranges_scratch.len() {
-                let m_start = unsafe { self.ranges_scratch.get_unchecked(i).0 } as usize;
-
-                //
-                // the matcher is expected to return sorted non-overlapping ranges.
-                //
-                debug_assert!(
-                    m_start >= scan_pos,
-                    "matcher returned an out-of-order or overlapping match: m_start={} scan_pos={}",
-                    m_start, scan_pos
+                let (m_start, line_start) = Self::resolve_match_line_bounds(
+                    buf, &self.ranges_scratch, i, scan_pos, &mut line_num, should_print_line_numbers,
                 );
 
-                let m_start = m_start.max(scan_pos);
+                //
+                // The next newline at or after m_start, since we already know
+                // where the line starts.
+                //
 
-                let mut cursor      = scan_pos;
-                let mut last_nl_end = None;
-                let mut line_end    = buf_len;
-                while let Some(rel) = C::find_newline(unsafe { buf.get_unchecked(cursor..) }) {
-                    let nl_start = cursor + rel;
-                    if nl_start < m_start {
-                        line_num += 1;
-                        last_nl_end = Some(nl_start + C::UNIT_WIDTH);
-                        cursor = nl_start + C::UNIT_WIDTH;
-                    } else {
-                        line_end = nl_start;
-                        break;
-                    }
-                }
-
-                let line_start = last_nl_end.unwrap_or(scan_pos);
+                let line_end = C::find_newline(unsafe { buf.get_unchecked(m_start..) })
+                    .map(|rel| m_start + rel)
+                    .unwrap_or(buf_len);
 
                 let line = C::strip_trailing_cr(unsafe { buf.get_unchecked(line_start..line_end) });
 
-                let group_start = i;
-                while i < self.ranges_scratch.len()
-                && (unsafe { self.ranges_scratch.get_unchecked(i) }.0 as usize) < line_end
-                {
-                    i += 1;
-                }
-
-                if i == group_start { i += 1; }
-
-                let global_matches = unsafe {
-                    self.ranges_scratch.get_unchecked(group_start..i.min(self.ranges_scratch.len()))
-                };
-
-                let line_start_u32 = line_start as u32;
-                let line_len_u32   = line.len() as u32;
-
-                self.line_ranges_scratch.clear();
-                self.line_ranges_scratch.extend(global_matches.iter().map(|&(s, e)| {
-                    let rel_end   = e.saturating_sub(line_start_u32).min(line_len_u32);
-                    let rel_start = s.saturating_sub(line_start_u32).min(rel_end);
-                    (rel_start, rel_end)
-                }));
+                Self::collect_line_ranges(
+                    &self.ranges_scratch,
+                    &mut self.line_ranges_scratch,
+                    &mut i,
+                    line_start, line_end, line.len(), |_| {},
+                );
 
                 self.parser.scratch2.clear();
 
-                if !found_any {
-                    //
-                    // First match!!
-                    //
-
-                    found_any = true;
-
-                    if !self.stdout_is_being_redirected_to_dev_null {
-                        Self::write_file_header(
-                            &mut self.parser.scratch2,
-                            self.cli,
-                            &self.path_buf,
-                            should_print_color,
-                        );
-                    }
-                }
-
-                if !self.stdout_is_being_redirected_to_dev_null {
-                    Self::write_match_line(
-                        &mut self.output,
-                        &mut self.parser.scratch2,
-                        self.cli,
-                        &self.path_buf,
-                        line,
-                        line_num,
-                        &self.line_ranges_scratch,
-                        should_print_color,
-                        should_print_line_numbers,
-                    );
-                }
-
-                if S::STDOUT_NOP {  // @Memory
-                    self.sink.push(self.path_buf.as_ref(), line_num as _, line, &self.line_ranges_scratch);
-                }
+                Self::emit_match(
+                    &mut self.output,
+                    &mut self.parser.scratch2,
+                    self.cli,
+                    &self.path_buf,
+                    self.stdout_is_being_redirected_to_dev_null,
+                    &mut found_any,
+                    line_num,
+                    line,
+                    &self.line_ranges_scratch,
+                    should_print_color,
+                    should_print_line_numbers,
+                    &mut self.sink,
+                );
 
                 scan_pos = (line_end + C::UNIT_WIDTH).min(buf_len);
                 line_num += 1;
@@ -1414,7 +1347,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         }
 
         //
-        // Collect every raw newline offset up front, so UTF-16/32 "\n"
+        // Collect every raw newline offset up front, so UTF-16/32 '\n'
         // sequences are found at the right stride instead of assuming one byte/line.
         //
 
@@ -1425,12 +1358,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         while let Some(rel) = C::find_newline(unsafe { buf.get_unchecked(scan_pos..) }) {
             let abs = scan_pos + rel;
             self.newlines_scratch.push(abs as u32);
+
             scan_pos = abs + C::UNIT_WIDTH;
         }
 
-        let mut found_any = false;
+        let mut found_any  = false;
         let mut line_start = 0;
-        let mut line_num = 1u32;
+        let mut line_num   = 1u32;
 
         for &newline_pos in self.newlines_scratch.iter().chain([&(buf_len as u32)]) {
             let line_end = newline_pos as usize;
@@ -1442,7 +1376,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             //
             // Non-UTF-8 sources get transcoded one line at a time into a
-            // small reusable buffer, so that a huge UTF-16 file doesn't cost a second huge allocation.
+            // small reusable buffer, so that a huge UTF-16 file doesn't cost
+            // a second huge allocation.
             //
             let line: &[u8] = {
                 self.parser.scratch.clear();
@@ -1467,45 +1402,26 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             if !line_matches.is_empty() {
                 self.parser.scratch2.clear(); // @Speed?
 
-                if !found_any {
-                    //
-                    // First match!!
-                    //
-
-                    found_any = true;
-
-                    if !self.stdout_is_being_redirected_to_dev_null {
-                        Self::write_file_header(
-                            &mut self.parser.scratch2,
-                            self.cli,
-                            &self.path_buf,
-                            should_print_color
-                        );
-                    }
-                }
-
-                if !self.stdout_is_being_redirected_to_dev_null {
-                    Self::write_match_line(
-                        &mut self.output,
-                        &mut self.parser.scratch2,
-                        self.cli,
-                        &self.path_buf,
-                        line,
-                        line_num,
-                        line_matches,
-                        should_print_color,
-                        should_print_line_numbers
-                    );
-                }
-
-                if S::STDOUT_NOP {  // @Memory
-                    self.sink.push(self.path_buf.as_ref(), line_num as _, line, line_matches);
-                }
+                Self::emit_match(
+                    &mut self.output,
+                    &mut self.parser.scratch2,
+                    self.cli,
+                    &self.path_buf,
+                    self.stdout_is_being_redirected_to_dev_null,
+                    &mut found_any,
+                    line_num,
+                    line,
+                    line_matches,
+                    should_print_color,
+                    should_print_line_numbers,
+                    &mut self.sink,
+                );
             }
 
             if line_end >= buf_len { break }
+
             line_start = line_end + C::UNIT_WIDTH;
-            line_num += 1;
+            line_num  += 1;
         }
 
         if found_any {
@@ -1527,13 +1443,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         if data.is_empty() { return Ok(()); }
 
         //
-        // The encoding is only knowable from the very first chunk (that's where a BOM would live),
-        // so sniff it once and remember it on the carry for every later chunk of this file.
+        // The encoding is only knowable from the very first chunk, so sniff it
+        // once and remember it on the carry for every later chunk of this file.
         //
         let (encoding, skip) = match carry.encoding {
             Some(e) => (e, 0),
             None => match crate::binary::detect_byte_order_leading_mark_len(data) {
-                Some(e) => { carry.encoding = Some(e); (e, e.bom_len()) }
+                Some(e) => { carry.encoding = Some(e);              (e, e.bom_len())    }
                 None    => { carry.encoding = Some(Encoding::Utf8); (Encoding::Utf8, 0) }
             },
         };
@@ -1583,6 +1499,83 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             }
         };
 
+        if C::RAW_PASSTHROUGH {
+            debug_assert_eq!(C::UNIT_WIDTH, 1);
+
+            let region = unsafe { data.get_unchecked(..process_until) };
+
+            self.ranges_scratch.clear();
+            self.matcher.push_all_matches(
+                region,
+                self.matcher_cache.as_deref_mut(),
+                &mut self.ranges_scratch
+            );
+
+            if self.ranges_scratch.is_empty() {
+                //
+                // carry.line_num has to stay correct for whatever chunk comes next, but only
+                // if it's ever actually read -- same guard as the non-chunk path.
+                //
+                if should_print_line_numbers || S::STDOUT_NOP {
+                    carry.line_num += memchr::memchr_iter(b'\n', region).count() as u32;
+                }
+
+                carry.tail.clear();
+                if !is_last && process_until < data.len() {
+                    carry.tail.extend_from_slice(unsafe { data.get_unchecked(process_until..) });
+                }
+
+                return Ok(());
+            }
+
+            let mut scan_pos = 0usize;
+            let mut i        = 0usize;
+
+            while i < self.ranges_scratch.len() {
+                let (m_start, line_start) = Self::resolve_match_line_bounds(
+                    region, &self.ranges_scratch, i, scan_pos, &mut carry.line_num, should_print_line_numbers,
+                );
+
+                let line_end = memchr::memchr(b'\n', unsafe { region.get_unchecked(m_start..) })
+                    .map(|rel| m_start + rel)
+                    .unwrap_or(process_until);
+
+                let line = C::strip_trailing_cr(unsafe { region.get_unchecked(line_start..line_end) });
+
+                Self::collect_line_ranges(
+                    &self.ranges_scratch, &mut self.line_ranges_scratch, &mut i,
+                    line_start, line_end, line.len(), |_| {},
+                );
+
+                self.parser.scratch2.clear();
+
+                Self::emit_match(
+                    &mut self.output,
+                    &mut self.parser.scratch2,
+                    self.cli,
+                    &self.path_buf,
+                    self.stdout_is_being_redirected_to_dev_null,
+                    &mut carry.found_any,
+                    carry.line_num,
+                    line,
+                    &self.line_ranges_scratch,
+                    should_print_color,
+                    should_print_line_numbers,
+                    &mut self.sink,
+                );
+
+                scan_pos = (line_end + 1).min(process_until);
+                carry.line_num += 1;
+            }
+
+            carry.tail.clear();
+            if !is_last && process_until < data.len() {
+                carry.tail.extend_from_slice(unsafe { data.get_unchecked(process_until..) });
+            }
+
+            return Ok(());
+        }
+
         self.newlines_scratch.clear();
         self.newlines_scratch.reserve(average_newline_count_heuristic(data.len()));
 
@@ -1590,6 +1583,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         while let Some(rel) = C::find_newline(unsafe { data.get_unchecked(scan_pos..) }) {
             let abs = scan_pos + rel;
             self.newlines_scratch.push(abs as u32);
+
             scan_pos = abs + C::UNIT_WIDTH;
         }
 
@@ -1599,13 +1593,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             let line_end = newline_pos as usize;
 
             let raw_line = C::strip_trailing_cr(unsafe { data.get_unchecked(line_start..line_end) });
-            let line: &[u8] = if C::RAW_PASSTHROUGH {
-                raw_line
-            } else {
-                self.parser.scratch.clear();
-                C::decode_line(raw_line, &mut self.parser.scratch);
-                self.parser.scratch.as_slice()
-            };
+
+            self.parser.scratch.clear();
+            C::decode_line(raw_line, &mut self.parser.scratch);
+            let line: &[u8] = self.parser.scratch.as_slice();
 
             self.ranges_scratch.clear();
             self.matcher.push_all_matches(
@@ -1617,43 +1608,24 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             if !self.ranges_scratch.is_empty() {
                 self.parser.scratch2.clear(); // @Speed?
 
-                if !carry.found_any {  // @Cutnpaste from find_and_print_matches
-                    //
-                    // First match!!
-                    //
-
-                    carry.found_any = true;
-
-                    if !self.stdout_is_being_redirected_to_dev_null {
-                        Self::write_file_header(
-                            &mut self.parser.scratch2,
-                            self.cli,
-                            &self.path_buf,
-                            should_print_color
-                        );
-                    }
-                }
-
-                if !self.stdout_is_being_redirected_to_dev_null {
-                    Self::write_match_line(
-                        &mut self.output,
-                        &mut self.parser.scratch2,
-                        self.cli,
-                        &self.path_buf,
-                        line,
-                        carry.line_num,
-                        &self.ranges_scratch,
-                        should_print_color,
-                        should_print_line_numbers
-                    );
-                }
-
-                if S::STDOUT_NOP {  // @Memory @Cutnpaste from find_and_print_matches
-                    self.sink.push(self.path_buf.as_ref(), carry.line_num as _, line, &self.ranges_scratch);
-                }
+                Self::emit_match(
+                    &mut self.output,
+                    &mut self.parser.scratch2,
+                    self.cli,
+                    &self.path_buf,
+                    self.stdout_is_being_redirected_to_dev_null,
+                    &mut carry.found_any,
+                    carry.line_num,
+                    line,
+                    &self.ranges_scratch,
+                    should_print_color,
+                    should_print_line_numbers,
+                    &mut self.sink,
+                );
             }
 
             if line_end >= process_until { break; }
+
             line_start = line_end + C::UNIT_WIDTH;
             carry.line_num += 1;
         }
@@ -1668,6 +1640,11 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
     #[inline(never)]
     fn find_and_print_matches_small_decode<C: LineCodec>(&mut self, skip: usize) -> io::Result<bool> {
+        //
+        // This monomorphization firewall here reduces the executable size
+        // by ~55KB, it's nice I guess.
+        //
+
         let buf = unsafe { self.parser.file.get_unchecked(skip..) };
 
         let buf_len = buf.len();
@@ -1676,18 +1653,24 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         self.parser.scratch.clear();
         C::decode_line(buf, &mut self.parser.scratch);
 
+        self.find_and_print_matches_small_decode_impl()
+    }
+
+    #[inline(never)]
+    fn find_and_print_matches_small_decode_impl(&mut self) -> io::Result<bool> {
         let decoded_len = self.parser.scratch.len();
         if decoded_len == 0 { return Ok(false); }
 
         //
-        // @Cutnpaste from find_and_print_matches_impl::<RawCodec>
-        //
-
-        //
         // Search the whole buffer first.
         //
-        // Most files in a typical run contain zero matches, so
-        // this lets us return before ever building newlines_scratch and so on.
+        // Most files in a typical run contain zero matches, so this lets us
+        // return before ever building newlines_scratch and so on.
+        //
+        // Note this walks the *decoded* buffer, so unlike the RAW_PASSTHROUGH
+        // loops above it can't use C::find_newline / C::strip_trailing_cr --
+        // decode_line has already normalized everything to plain bytes with
+        // single-byte '\n's, regardless of what C originally was.
         //
 
         self.ranges_scratch.clear();
@@ -1709,37 +1692,17 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         while i < self.ranges_scratch.len() {
             let decoded = self.parser.scratch.as_slice();
-            let decoded_len = decoded.len();
 
-            let m_start = unsafe { self.ranges_scratch.get_unchecked(i).0 } as usize;
-
-            //
-            // the matcher is expected to return sorted non-overlapping ranges.
-            //
-            debug_assert!(
-                m_start >= scan_pos,
-                "matcher returned an out-of-order or overlapping match: m_start={} scan_pos={}",
-                m_start, scan_pos
+            let (m_start, line_start) = Self::resolve_match_line_bounds(
+                decoded,
+                &self.ranges_scratch, i, scan_pos,
+                &mut line_num, should_print_line_numbers,
             );
 
-            let m_start = m_start.max(scan_pos);
+            let line_end = memchr::memchr(b'\n', unsafe { decoded.get_unchecked(m_start..) })
+                .map(|rel| m_start + rel)
+                .unwrap_or(decoded_len);
 
-            let mut cursor      = scan_pos;
-            let mut last_nl_end = None;
-            let mut line_end    = decoded_len;
-            while let Some(rel) = memchr::memchr(b'\n', unsafe { decoded.get_unchecked(cursor..) }) {
-                let nl_pos = cursor + rel;
-                if nl_pos < m_start {
-                    line_num += 1;
-                    last_nl_end = Some(nl_pos + 1);
-                    cursor = nl_pos + 1;
-                } else {
-                    line_end = nl_pos;
-                    break;
-                }
-            }
-
-            let line_start = last_nl_end.unwrap_or(scan_pos);
             let raw_line = unsafe { decoded.get_unchecked(line_start..line_end) };
             let line = if raw_line.last() == Some(&0x0D) {
                 unsafe { raw_line.get_unchecked(..raw_line.len() - 1) }
@@ -1747,65 +1710,33 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 raw_line
             };
 
-            let group_start = i;
-            while i < self.ranges_scratch.len()
-                && (unsafe { self.ranges_scratch.get_unchecked(i) }.0 as usize) < line_end
-            {
-                i += 1;
-            }
+            Self::collect_line_ranges(
+                &self.ranges_scratch, &mut self.line_ranges_scratch, &mut i, line_start, line_end, line.len(),
 
-            if i == group_start { i += 1; }
-
-            // Warm the next match's line while we format/write the current one.
-            if let Some(&(next_start, _)) = self.ranges_scratch.get(i) {
-                prefetch_read(unsafe { buf.as_ptr().add(next_start as usize) });
-            }
-
-            let global_matches = unsafe {
-                self.ranges_scratch.get_unchecked(group_start..i.min(self.ranges_scratch.len()))
-            };
-
-            let line_start_u32 = line_start as u32;
-            let line_len_u32   = line.len() as u32;
-
-            self.line_ranges_scratch.clear();
-            self.line_ranges_scratch.extend(global_matches.iter().map(|&(s, e)| {
-                let rel_end   = e.saturating_sub(line_start_u32).min(line_len_u32);
-                let rel_start = s.saturating_sub(line_start_u32).min(rel_end);
-                (rel_start, rel_end)
-            }));
+                |next_i| {
+                    // Warm the next match's line while we process the current one
+                    if let Some(&(next_start, _)) = self.ranges_scratch.get(next_i) {
+                        prefetch_read(unsafe { decoded.as_ptr().add(next_start as usize) });
+                    }
+                },
+            );
 
             self.parser.scratch2.clear();
 
-            if !found_any {
-                //
-                // First match!!
-                //
-
-                found_any = true;
-
-                if !self.stdout_is_being_redirected_to_dev_null {
-                    Self::write_file_header(&mut self.parser.scratch2, self.cli, &self.path_buf, should_print_color);
-                }
-            }
-
-            if !self.stdout_is_being_redirected_to_dev_null {
-                Self::write_match_line(
-                    &mut self.output,
-                    &mut self.parser.scratch2,
-                    self.cli,
-                    &self.path_buf,
-                    line,
-                    line_num,
-                    &self.line_ranges_scratch,
-                    should_print_color,
-                    should_print_line_numbers
-                );
-            }
-
-            if S::STDOUT_NOP {  // @Memory
-                self.sink.push(self.path_buf.as_ref(), line_num as _, line, &self.line_ranges_scratch);
-            }
+            Self::emit_match(
+                &mut self.output,
+                &mut self.parser.scratch2,
+                self.cli,
+                &self.path_buf,
+                self.stdout_is_being_redirected_to_dev_null,
+                &mut found_any,
+                line_num,
+                line,
+                &self.line_ranges_scratch,
+                should_print_color,
+                should_print_line_numbers,
+                &mut self.sink,
+            );
 
             scan_pos = (line_end + 1).min(decoded_len);
             line_num += 1;
@@ -1817,9 +1748,159 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         Ok(found_any)
     }
+
+    /// Pulls the next candidate match out of `ranges_scratch[i]`, clamps it
+    /// against `scan_pos`, and resolves the start of the line it falls on via
+    /// a backward scan. Also bumps `line_num` by however many newlines were
+    /// skipped over, when that count is actually observable.
+    ///
+    /// `buf` is whatever the match offsets are relative to, since this
+    /// never touches codec-specific newline semantics (that's still up to
+    /// the caller, per the RAW_PASSTHROUGH/decoded distinction below).
+    #[inline(always)]
+    fn resolve_match_line_bounds(
+        buf: &[u8],
+        ranges_scratch: &[(u32, u32)],
+        i: usize,
+        scan_pos: usize,
+        line_num: &mut u32,
+        should_print_line_numbers: bool,
+    ) -> (usize, usize) {
+        let m_start = unsafe { ranges_scratch.get_unchecked(i).0 } as usize;
+
+        //
+        // The matcher is expected to return sorted non-overlapping ranges.
+        //
+
+        debug_assert!(
+            m_start >= scan_pos,
+            "matcher returned an out-of-order or overlapping match: m_start={} scan_pos={}",
+            m_start, scan_pos
+        );
+
+        let m_start = m_start.max(scan_pos);
+
+        let line_start = match memchr::memrchr(b'\n', unsafe { buf.get_unchecked(scan_pos..m_start) }) {
+            Some(rel) => scan_pos + rel + 1,
+            None      => scan_pos,
+        };
+
+        //
+        // line_num is only observable via the printed column or
+        // S::push (which always takes one); skip the O(gap) count
+        // otherwise so a sparse match in a huge file doesn't pay
+        // for newlines it never reports.
+        //
+        if should_print_line_numbers || S::STDOUT_NOP {
+            *line_num += memchr::memchr_iter(
+                b'\n', unsafe { buf.get_unchecked(scan_pos..line_start) }
+            ).count() as u32;
+        }
+
+        (m_start, line_start)
+    }
+
+    /// Given a resolved `line_end`, groups every consecutive entry in
+    /// `ranges_scratch` starting at `i` that still falls on this line,
+    /// advances `*i` past them, and rewrites that group into `line_ranges_scratch`
+    /// as offsets relative to the line instead of the whole buffer.
+    ///
+    /// `mid_hook` runs right after the group is found but before the relative
+    /// ranges are built, and is handed the post-group index -- small_decode uses
+    /// this to prefetch the next match's line while this one is still being formatted.
+    #[inline(always)]
+    fn collect_line_ranges(
+        ranges_scratch: &[(u32, u32)],
+        line_ranges_scratch: &mut Vec<(u32, u32)>,
+        i: &mut usize,
+        line_start: usize,
+        line_end: usize,
+        line_len: usize,
+        mid_hook: impl FnOnce(usize),
+    ) {
+        let group_start = *i;
+        while *i < ranges_scratch.len()
+        && (unsafe { ranges_scratch.get_unchecked(*i) }.0 as usize) < line_end
+        {
+            *i += 1;
+        }
+
+        if *i == group_start { *i += 1; }
+
+        let i = *i;
+
+        mid_hook(i);
+
+        let global_matches = unsafe {
+            ranges_scratch.get_unchecked(group_start..(i).min(ranges_scratch.len()))
+        };
+
+        let line_start_u32 = line_start as u32;
+        let line_len_u32   = line_len   as u32;
+
+        line_ranges_scratch.clear();
+        line_ranges_scratch.extend(global_matches.iter().map(|&(s, e)| {
+            let rel_end   = e.saturating_sub(line_start_u32).min(line_len_u32);
+            let rel_start = s.saturating_sub(line_start_u32).min(rel_end);
+            (rel_start, rel_end)
+        }));
+    }
+
+    /// The tail every printed match goes through: write the file header the
+    /// first time this file/chunk produces a match, write the match line
+    /// itself, and push it to the sink if the sink wants it.
+    ///
+    /// Assumes `scratch2` has already been cleared by the caller and `line` is
+    /// bound at the call site.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments, reason = "alwaysinline")]
+    fn emit_match(
+        output:                                  &mut SlotWriter,
+        scratch2:                                &mut Vec<u8>,
+        cli:                                     &Cli,
+        path:                                    &[u8],
+        stdout_is_being_redirected_to_dev_null:   bool,
+        found_any:                               &mut bool,
+        line_num:                                 u32,
+        line:                                    &[u8],
+        matches:                                 &[(u32, u32)],
+        should_print_color:                       bool,
+        should_print_line_numbers:                bool,
+        sink:                                    &mut S,
+    ) {
+        if !*found_any {
+            //
+            // First match!!
+            //
+
+            *found_any = true;
+
+            if !stdout_is_being_redirected_to_dev_null {
+                Self::write_file_header(scratch2, cli, path, should_print_color);
+            }
+        }
+
+        if !stdout_is_being_redirected_to_dev_null {
+            Self::write_match_line(
+                output,
+                scratch2,
+                cli,
+                path,
+                line,
+                line_num,
+                matches,
+                should_print_color,
+                should_print_line_numbers,
+            );
+        }
+
+        if S::STDOUT_NOP {  // @Memory
+            sink.push(path.as_ref(), line_num as _, line, matches);
+        }
+    }
 }
 
-#[allow(clippy::too_many_arguments, reason = "@Speed: Hoist should_print_color branching out of these writing functions...? Might be a good idea.")]
+#[allow(clippy::too_many_arguments, reason = "alwaysinline + LICM")]
 impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     #[inline(always)]
     fn write_match_line(
@@ -1973,7 +2054,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         None
     }
 
-    #[inline]
+    #[inline(always)]
     fn find_gitignore_file_id_in_buf(&self, kind: BufKind) -> Option<FileId> {
         self.parser.find_file_id_in_buf(self.fs, b".gitignore", kind)
     }
@@ -2064,25 +2145,32 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
         stealers: &[Stealer<WorkItem>],
         consecutive_steals: &mut usize,
     ) -> Option<WorkItem> {
+        //
         // Local queue
+        //
         if let Some(work) = local.pop() {
             *consecutive_steals = 0;
             return Some(work);
         }
 
+        //
         // Global injector
+        //
         loop {
             match injector.steal_batch_and_pop(local) {
                 Steal::Success(work) => {
                     *consecutive_steals = 0;
                     return Some(work);
                 }
+
                 Steal::Empty => break,
                 Steal::Retry => continue,
             }
         }
 
+        //
         // Steal from others
+        //
         let start = if *consecutive_steals < 3 {
             (self.worker_id as usize + 1) % stealers.len() // @Constant @Tune
         } else {

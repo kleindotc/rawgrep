@@ -1,7 +1,7 @@
 use crate::tracy;
 use crate::grep::{AnyNodeCache, AnyNodeScratch, NodeCacheStats};
 use crate::binary::{is_binary_chunk, is_dot_entry, is_hidden_entry};
-use crate::worker::{BINARY_PROBE_BYTE_SIZE, PendingSubdir};
+use crate::worker::{BINARY_PROBE_BYTE_SIZE, PendingSubdir, STREAMING_CHUNK_SIZE};
 use crate::cli::BufferConfig;
 
 use std::fs::File;
@@ -197,7 +197,8 @@ impl Parser {
         self.dir.reserve(config.dir_buf);
         self.file.reserve(config.file_buf);
         self.gitignore.reserve(config.gitignore_buf);
-        self.scratch.reserve(config.extent_buf * 8); // extents are ~8 bytes each
+        self.scratch.reserve(config.extent_buf * 8);  // Extents are ~8 bytes each
+        self.chunk.reserve(2 * STREAMING_CHUNK_SIZE); // Covers tail carry + one full chunk without growing
     }
 
     /// Find a file id by name in buf

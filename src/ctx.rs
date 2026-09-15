@@ -438,7 +438,6 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     selected_fragment_hash_len: $g.selected_fragment_hash_len(),
                     cli:              $g.cli(),
                     sink:             $g.sink.clone(),
-                    output_tx:        ctx.output_tx.clone(),
                     stats:            Default::default(),
                     print_line_numbers,
                     num_workers,

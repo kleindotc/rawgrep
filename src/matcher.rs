@@ -318,6 +318,17 @@ impl Matcher {
         }))
     }
 
+    /// Above this many branches, Aho-Corasick's own prefilter (Teddy included)
+    /// stops kicking in -- its docs put the cutoff at "less than 100" patterns,
+    /// and call that out as a heuristic that may change in a semver-compatible
+    /// release. Past this point we're better off falling through to
+    /// `regex_fallback`: it tries Hyperscan first (no meaningful pattern-count
+    /// ceiling there), and even without Hyperscan, unlike the unbounded `build()`
+    /// call below, it's compiled under an actual size limit
+    /// (see `LIMIT` in `regex_fallback`), so a pathological alternation can't blow
+    /// up memory here.
+    const MAX_MULTI_LITERAL_PATTERNS: usize = 64; // @Configuration
+
     /// Builds the exact-alternation fast path. Same ASCII caveat as
     /// `literal_matcher`, but applied to the whole set: `ascii_case_insensitive`
     /// is one builder-level setting for the whole automaton, so a single
@@ -329,13 +340,23 @@ impl Matcher {
             return Ok(None);
         }
 
+        //
+        // Past aho-corasick's own prefilter ceiling, its plain automaton walk
+        // (no Teddy, no memchr prefilter) is worse than what regex_fallback
+        // can do -- Hyperscan has no comparable ceiling, and regex-automata's
+        // own strategy selection is at least size-bounded, which this isn't.
+        //
+        if literals.len() > Self::MAX_MULTI_LITERAL_PATTERNS {
+            return Ok(None);
+        }
+
         let ac = AhoCorasick::builder()
             .match_kind(aho_corasick::MatchKind::LeftmostFirst)
             .ascii_case_insensitive(ignore_case)
             .build(literals)
             .map_err(|e| io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("invalid alternation pattern '{:?}': {e}", literals),
+                format!("invalid alternation pattern '{literals:?}': {e}"),
             ))?;
 
         Ok(Some(Matcher::MultiLiteral {
@@ -346,7 +367,7 @@ impl Matcher {
     }
 
     #[inline(always)]
-    #[allow(clippy::redundant_locals, clippy::while_let_on_iterator)]
+    #[allow(clippy::while_let_on_iterator)]
     pub fn push_all_matches(
         &self,
         haystack: &[u8],

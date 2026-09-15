@@ -1,8 +1,6 @@
 #[cfg(windows)]
 use std::sync::OnceLock;
-use std::{fs::File, io, sync::Arc};
-
-use smallvec::SmallVec;
+use std::{fs::File, io};
 
 #[inline(always)]
 pub fn cast_slice<A: bytemuck::NoUninit, B: bytemuck::AnyBitPattern>(a: &[A]) -> &[B] {
@@ -140,65 +138,6 @@ pub fn vec_into_boxed_slice_noshrink<T>(mut v: Vec<T>) -> Box<[T]> {
 
     unsafe {
         Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, len))
-    }
-}
-
-/// `std::vec::Vec::into_boxed_slice` takes CPU cycles to shrink
-/// itself to the `.len`, this function does not shrink and saves
-/// us some time
-#[inline]
-#[must_use]
-pub fn vec_into_arc_slice_noshrink<T>(mut v: Vec<T>) -> Arc<[T]> {
-    let len = v.len();
-    let ptr = v.as_mut_ptr();
-
-    let boxed_slice = unsafe {
-        // SAFETY: We use the raw parts from Vec to reconstruct a Box<[T]>.
-        // This transfers ownership of the heap memory from Vec to Box.
-        // This is safe ONLY because we are immediately calling core::mem::forget(v) below,
-        // preventing the original Vec from attempting to free the memory.
-        let slice_ptr = core::slice::from_raw_parts_mut(ptr, len);
-        Box::from_raw(slice_ptr)
-    };
-
-    core::mem::forget(v);
-
-    Arc::from(boxed_slice)
-}
-
-#[inline]
-#[must_use]
-pub fn smallvec_into_arc_slice_noshrink<A, T>(mut v: SmallVec<A>) -> Arc<[T]>
-where
-    A: smallvec::Array<Item = T>,
-{
-    if v.spilled() {
-        // SAFETY: we are taking ownership of the allocated buffer.
-        let boxed = unsafe {
-            Box::from_raw(v.as_mut_slice())
-        };
-        core::mem::forget(v);
-        Arc::from(boxed)
-    } else {
-        vec_into_arc_slice_noshrink(v.into_vec())
-    }
-}
-
-#[inline]
-#[must_use]
-pub fn smallvec_into_boxed_slice_noshrink<A, T>(mut v: SmallVec<A>) -> Box<[T]>
-where
-    A: smallvec::Array<Item = T>,
-{
-    if v.spilled() {
-        // SAFETY: we are taking ownership of the allocated buffer.
-        let boxed = unsafe {
-            Box::from_raw(v.as_mut_slice())
-        };
-        core::mem::forget(v);
-        boxed
-    } else {
-        vec_into_boxed_slice_noshrink(v.into_vec())
     }
 }
 

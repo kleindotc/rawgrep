@@ -1,8 +1,6 @@
 use crate::liner::Encoding;
 use crate::worker::BINARY_CONTROL_COUNT;
 
-use phf::{phf_set, Set};
-
 #[inline(always)]
 pub const fn is_dot_entry(name: &[u8]) -> bool {
     name.len() == 1 && name[0] == b'.' ||
@@ -14,88 +12,7 @@ pub const fn is_hidden_entry(name: &[u8]) -> bool {
     name[0] == b'.'
 }
 
-#[inline(always)]
-pub fn is_reserved_tool_dir(dir: &[u8]) -> bool {
-    pub static RESERVED_TOOL_DIRS: Set<&'static [u8]> = phf_set! {
-        // Version control
-        b".git", b".hg", b".svn", b".jj", b".bzr", b"_darcs",
-        b"CVS", b"RCS", b"SCCS",
-
-        // Language / package manager caches & deps
-        b"node_modules", b"__pycache__", b".mypy_cache", b".pytest_cache",
-        b".tox", b".nox", b".venv", b"venv", b"env", b".env",
-        b".eggs", b".ipynb_checkpoints",
-        b"vendor", b"Pods", b".dart_tool", b".pub-cache",
-        b".cargo", b".rustup", b"target",
-        b".gradle", b".m2", b".ivy2",
-        b".bundle", b".stack-work", b"_build", b"deps",
-        b".yarn", b".pnpm-store", b".npm",
-        b".cabal-sandbox", b"dist-newstyle",
-
-        // Build / output dirs
-        b"build", b"dist", b"out", b"bin", b"obj",
-        b".next", b".nuxt", b".output", b".svelte-kit", b".angular",
-        b".parcel-cache", b".turbo", b".cache", b".webpack",
-
-        // IDE / editor
-        b".idea", b".vscode", b".vs", b".fleet", b".settings",
-
-        // Infra / IaC
-        b".terraform", b".serverless", b".aws-sam",
-
-        // Coverage / test artifacts
-        b".nyc_output", b"coverage", b".sass-cache",
-
-        // OS junk directories
-        b"$RECYCLE.BIN", b"System Volume Information",
-    };
-
-    RESERVED_TOOL_DIRS.contains(dir)
-}
-
-#[inline(always)]
-pub fn is_binary_ext(ext: &[u8]) -> bool {
-    pub static BINARY_EXTS: Set<&'static [u8]> = phf_set! {
-        // Images
-        b"png", b"jpg", b"jpeg", b"gif", b"bmp", b"ico", b"webp",
-        b"tiff", b"tif", b"heic", b"heif", b"avif", b"psd", b"xcf",
-        b"raw", b"cr2", b"nef", b"orf", b"sr2", b"dng",
-
-        // Audio
-        b"mp3", b"wav", b"flac", b"ogg", b"oga", b"m4a", b"aac",
-        b"wma", b"opus", b"aiff", b"mid", b"midi", b"amr",
-
-        // Video
-        b"mp4", b"mkv", b"avi", b"mov", b"webm", b"flv", b"wmv",
-        b"m4v", b"mpg", b"mpeg", b"3gp", b"ts", b"mts",
-
-        // Archives / compressed
-        b"zip", b"tar", b"gz", b"tgz", b"bz2", b"tbz2", b"7z",
-        b"rar", b"xz", b"zst", b"lz4", b"lzma", b"z", b"cab", b"br",
-
-        // Executables / compiled objects
-        b"exe", b"dll", b"so", b"a", b"o", b"obj", b"lib",
-        b"class", b"pyc", b"pyo", b"pyd", b"wasm", b"bin",
-        b"dylib", b"msi", b"deb", b"rpm", b"apk", b"elf", b"com",
-
-        // Documents (binary formats)
-        b"pdf", b"doc", b"docx", b"xls", b"xlsx", b"ppt", b"pptx",
-        b"odt", b"ods", b"odp", b"rtf",
-
-        // Fonts
-        b"ttf", b"otf", b"woff", b"woff2", b"eot",
-
-        // Databases / data blobs
-        b"db", b"sqlite", b"sqlite3", b"mdb", b"accdb", b"dat",
-        b"parquet", b"avro", b"orc",
-
-        // Disk images / packages
-        b"iso", b"dmg", b"img", b"jar", b"war", b"ear", b"pak",
-        b"vhd", b"vmdk", b"qcow2", b"appimage", b"flatpak",
-    };
-
-    BINARY_EXTS.contains(ext)
-}
+pub use crate::binary_ext::{is_binary_ext, is_reserved_tool_dir};
 
 const BYTE_CLASS: [bool; 256] = {
     let mut table = [false; 256];
