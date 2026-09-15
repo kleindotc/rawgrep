@@ -7,7 +7,7 @@
 
 benchmark script: [`bench.sh`](https://github.com/rakivo/rawgrep/blob/master/bench.sh)
 
-The following benchmarks compare `rawgrep` `0.2.0` (rev `51d3afe`, with `Hyperscan`)  against:
+The following benchmarks compare `rawgrep` `0.2.0` (rev `d05ccd7`, with `Hyperscan`)  against:
 
 - [ripgrep](https://github.com/BurntSushi/ripgrep) `15.2.0` (rev `3fce3b5bb0`)
 - [hypergrep](https://github.com/p-ranav/hypergrep) `0.1.1` (rev `ee85b71`)
@@ -43,21 +43,23 @@ The following searches are performed against a full clone of the [Chromium sourc
 
 **Pattern: `TODO`**
 
-| Scenario                    | rawgrep       | ripgrep           | hypergrep         |
-| ---------------------------- | -------------- | ------------------ | ------------------- |
-| warm, with fragment cache    | **130.5 ms**  | 364.7 ms (2.79x)   | 353.2 ms (2.71x)    |
-| warm, no fragment cache      | **312.8 ms**  | 364.5 ms (1.17x)   | 350.9 ms (1.12x)    |
-| cold, no fragment cache      | **8.298 s**   | 11.905 s (1.43x)   | 10.213 s (1.23x)    |
-| cold, with fragment cache    | **2.695 s**   | 11.950 s (4.43x)   | 10.242 s (3.80x)    |
+| Scenario                     | rawgrep      | ripgrep           | hypergrep         |
+| ---------------------------- | ------------ | ------------------ | ------------------- |
+| warm, with fragment cache    | **130.8 ms** | 364.7 ms (2.79x)   | 353.2 ms (2.71x)    |
+| warm, no fragment cache      | **289.1 ms** | 362.9 ms (1.26x)  | 355.8 ms (1.23x)  |
+| cold, no fragment cache      | **8.450 s**  | 11.911 s (1.41x)  | 10.187 s (1.21x)  |
+| cold, with fragment cache    | **2.676 s**  | 11.875 s (4.44x)  | 10.140 s (3.79x)  |
+
 
 **Pattern: `(?i)\bTODO\((?:crbug\.com/\d+|[a-zA-Z][\w.-]*)\)`**
 
-| Scenario                    | rawgrep       | ripgrep           | hypergrep         |
-| ---------------------------- | -------------- | ------------------ | ------------------- |
-| warm, with fragment cache    | **119.4 ms**  | 384.0 ms (3.22x)   | 361.0 ms (3.02x)    |
-| warm, no fragment cache      | **335.9 ms**  | 385.3 ms (1.15x)   | 364.0 ms (1.08x)    |
-| cold, no fragment cache      | **8.303 s**   | 11.891 s (1.43x)   | 10.248 s (1.23x)    |
-| cold, with fragment cache    | **2.513 s**   | 11.919 s (4.74x)   | 10.306 s (4.10x)    |
+| Scenario                  | rawgrep      | ripgrep          | hypergrep         |
+| -------------------------- | ------------- | ----------------- | ------------------ |
+| warm, with fragment cache  | **111.9 ms** | 384.7 ms (3.44x)  | 364.6 ms (3.26x)  |
+| warm, no fragment cache    | **293.6 ms** | 386.4 ms (1.32x)  | 363.6 ms (1.24x)  |
+| cold, no fragment cache    | **8.488 s**  | 11.871 s (1.40x)  | 10.195 s (1.20x)  |
+| cold, with fragment cache  | **2.449 s**  | 11.844 s (4.84x)  | 10.206 s (4.17x)  |
+
 
 ### Codebase Search: `Linux 7.3.0-rc1` (~95K files)
 
@@ -65,31 +67,31 @@ The following searches are performed against a full clone of the [Linux kernel s
 
 **Pattern: `TODO`**
 
-| Scenario                    | rawgrep         | ripgrep          | hypergrep        |
-| ---------------------------- | --------------- | ---------------- | ----------------- |
-| warm, with fragment cache    | **54.4 ms**     | 109.3 ms (2.01x)  | 129.3 ms (2.38x)   |
-| warm, no fragment cache      | 158.0 ms (1.44x) | **109.4 ms**     | 130.1 ms (1.19x)   |
-| cold, no fragment cache      | **3.255 s**     | 3.524 s (1.08x)   | 3.363 s (1.03x)    |
-| cold, with fragment cache    | **509.8 ms**    | 3.552 s (6.97x)   | 3.377 s (6.62x)    |
+| Scenario                  | rawgrep          | ripgrep          | hypergrep         |
+| -------------------------- | ----------------- | ----------------- | ------------------ |
+| warm, with fragment cache  | **54.6 ms**       | 109.0 ms (2.00x)  | 129.7 ms (2.37x)  |
+| warm, no fragment cache    | 174.5 ms (1.60x)  | **108.8 ms**      | 131.9 ms (1.21x)  |
+| cold, no fragment cache    | **3.301 s**       | 3.529 s (1.07x)   | 3.375 s (1.02x)   |
+| cold, with fragment cache  | **494.8 ms**      | 3.538 s (7.15x)   | 3.346 s (6.76x)   |
 
 **Pattern: `[A-Z]+_SUSPEND`**
 
-| Scenario                    | rawgrep           | ripgrep           | hypergrep        |
-| ---------------------------- | ---------------  | ----------------- | ----------------- |
-| warm, with fragment cache    | **59.7 ms**      | 114.8 ms (1.92x)  | 139.8 ms (2.34x)   |
-| warm, no fragment cache      | 174.4 ms (1.52x) | **114.8 ms**      | 138.1 ms (1.20x)   |
-| cold, no fragment cache      | **3.317 s**      | 3.566 s (1.08x)   | 3.361 s (1.01x)    |
-| cold, with fragment cache    | **514.9 ms**     | 3.568 s (6.93x)   | 3.356 s (6.52x)    |
+| Scenario                  | rawgrep          | ripgrep          | hypergrep         |
+| -------------------------- | ----------------- | ----------------- | ------------------ |
+| warm, with fragment cache  | **62.2 ms**       | 113.8 ms (1.83x)  | 139.0 ms (2.23x)  |
+| warm, no fragment cache    | 179.6 ms (1.58x)  | **113.9 ms**      | 138.3 ms (1.21x)  |
+| cold, no fragment cache    | **3.328 s**       | 3.501 s (1.05x)   | 3.341 s (1.00x)   |
+| cold, with fragment cache  | **517.4 ms**      | 3.578 s (6.92x)   | 3.370 s (6.51x)   |
 
 
 ### Peak Memory Usage
 
 Peak RSS as measured by hyperfine, taken from the `chromium_todo` runs (representative of the other cases):
 
-| Scenario                     | rawgrep  |        ripgrep        |       hypergrep       |
-| ---------------------------- | -------- | --------------------- | --------------------- |
-| warm, with fragment cache    | 204 MiB  | 204 MiB               | 204 MiB |
-| warm, no fragment cache      | 258 MiB  | 263 MiB               | 263 MiB |
+| Scenario                  | rawgrep | ripgrep | hypergrep |
+| -------------------------- | ------- | ------- | --------- |
+| warm, with fragment cache  | 210 MiB | 210 MiB | 210 MiB   |
+| warm, no fragment cache    | 295 MiB | 306 MiB | 306 MiB   |
 
 **These RSS numbers aren't reliable yet** -- all three land within a few MiB of each other, which is, I'm pretty sure, just the leftover page cache from whatever ran before it. In actuality, `ripgrep` plateaus around ~70 MiB on the aforementioned benchmark, I'd imagine `hypergrep` using roughly the same amount of memory... `rawgrep`'s RAM usage hasn't been the main focus yet; the work so far has gone almost entirely into wall-time, though, there are for sure some known ideas to bring RSS down without affecting the performance much, or even at all.
 
@@ -286,17 +288,14 @@ Works exactly like `'grep-find` but better.
 **Q: Is this safe to use?**
 A: Yes. The tool only reads data and never writes. The `CAP_DAC_READ_SEARCH` capability is narrowly scoped.
 
-**Q: Is rawgrep faster than [ripgrep](https://github.com/BurntSushi/ripgrep)?**
-A: Yeah.
-
 **Q: Why am I missing some matches?**
-A: By default, rawgrep respects `.gitignore` and skips binary/large (> 30MB) files. Use `-u` to ignore `.gitignore`, `-uu` to also search binaries, or `-uuu` to search everything. This matches ripgrep's behavior.
+A: By default, rawgrep respects `.gitignore` and skips binary/large/usually-reserved (> 30MB) files. Use `-u` to ignore `.gitignore`, `-uu` to also search binaries, or `-uuu` to search everything. This matches ripgrep's behavior.
 
 **Q: Can I use this on other filesystems?**
 A: Currently only ext4/ntfs is supported. Support for other filesystems may be added in the future. (Motivate me with stars)
 
 **Q: Will this damage my filesystem?**
-A: No. The tool only performs read operations. It cannot modify your filesystem.
+A: No. `rawgrep` only ever performs read operations when bypassing the VFS. It cannot modify your filesystem (except for the *Fragment Cache*, of course, but rawgrep doesn't bypass the VFS in order to read it).
 
 **Q: What if partition auto-detection fails?**
 A: Specify the device manually with `--device=/dev/sdXY`. Use `df -Th` to find your partition.
