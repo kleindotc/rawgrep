@@ -1,7 +1,7 @@
 use crate::debug;
 use crate::pacer::FlushPacer;
 use crate::error::Error;
-use crate::slab::{SlotPool, SlotWriter};
+use crate::output::{OutputSlotPool, OutputSlotWriter};
 use crate::RawGrepConfig;
 use crate::parser::RawFs;
 use crate::path_buf::SmallPathBuf;
@@ -100,7 +100,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             local_workers.push(w);
         }
 
-        let mut slot_pools = SlotPool::new_for_workers(num_threads);
+        let mut slot_pools = OutputSlotPool::new_for_workers(num_threads);
         let num_cores      = crate::util::num_physical_cores_or(num_threads);
         let pacer_enabled  = !self.stdout_is_being_redirected_to_dev_null && output_kind == OutputKind::Tty;
         let pacer          = Arc::new(FlushPacer::new(pacer_enabled));
@@ -339,7 +339,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
     stealers:  &[Stealer<WorkItem>],
     local:     DequeWorker<WorkItem>,
     pacer:     &FlushPacer,
-    slot_pool: SlotPool,
+    slot_pool: OutputSlotPool,
     print_line_numbers: bool,
 ) {
     debug!("[ctx] worker {worker_id} started, waiting on condvar");
@@ -357,7 +357,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
     let mut file_entries_arena        = FileEntryArena::new();
     let mut subdirs_arena             = SubdirsArena::new();
     let mut entries_arena             = EntriesArena::new();
-    let mut output                    = SlotWriter::new(slot_pool, ctx.output_tx.clone());
+    let mut output                    = OutputSlotWriter::new(slot_pool, ctx.output_tx.clone());
 
     let mut node_scratch              = AnyNodeScratch::default();
     let mut node_cache                = AnyNodeCache::default();

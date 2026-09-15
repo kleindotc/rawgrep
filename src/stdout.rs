@@ -1,4 +1,4 @@
-use crate::slab::{SLOTS_PER_WORKER, SLOT_CAP};
+use crate::output::{SLOTS_PER_WORKER, SLOT_CAP};
 
 use std::fs::File;
 use std::mem::ManuallyDrop;

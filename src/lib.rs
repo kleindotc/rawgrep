@@ -32,7 +32,7 @@ pub mod cache;
 pub mod pacer;
 pub mod fragments;
 pub mod platform;
-pub mod slab;
+pub mod output;
 pub mod thin_path_arc;
 pub mod binary_ext;
 pub mod extractor;

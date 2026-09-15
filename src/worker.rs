@@ -7,7 +7,7 @@
 use crate::liner::*;
 use crate::pacer::FlushPacer;
 use crate::cache::{FileKey, FileMeta, FragmentCache};
-use crate::slab::{OutputSlab, SlotWriter, OwnedOverflow};
+use crate::output::{OutputSlab, OutputSlotWriter, OutputSlotOwnedOverflow};
 use crate::cli::{should_enable_ansi_coloring, Cli};
 use crate::ignore::{Gitignore, GitignoreChain};
 use crate::matcher::{Matcher, MatcherCache};
@@ -175,13 +175,13 @@ where
 
 pub enum OutputMessage {
     Slot { slab: &'static OutputSlab, slot: u16, len: u32 },
-    Owned(OwnedOverflow),
+    Owned(OutputSlotOwnedOverflow),
     FlushReq,
 }
 
 pub enum PendingBuf {
     Slot { slab: &'static OutputSlab, slot: u16, len: u32 },
-    Owned(OwnedOverflow),
+    Owned(OutputSlotOwnedOverflow),
 }
 
 impl PendingBuf {
@@ -458,7 +458,7 @@ pub struct WorkerResult {
     pub stats: Box<Stats>,
 
     pub parser: Parser,
-    pub output: SlotWriter,
+    pub output: OutputSlotWriter,
 
     pub file_keys:  Vec<FileKey>,
     pub file_metas: Vec<FileMeta>,
@@ -498,7 +498,7 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub print_line_numbers:                     bool,
 
     pub parser: Parser,
-    pub output: SlotWriter,
+    pub output: OutputSlotWriter,
 
     // ----- Hot
     pub         path_arena: PathArena,          // 24
@@ -1855,7 +1855,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     #[inline(always)]
     #[allow(clippy::too_many_arguments, reason = "alwaysinline")]
     fn emit_match(
-        output:                                  &mut SlotWriter,
+        output:                                  &mut OutputSlotWriter,
         scratch2:                                &mut Vec<u8>,
         cli:                                     &Cli,
         path:                                    &[u8],
@@ -1904,7 +1904,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     #[inline(always)]
     fn write_match_line(
-        output:            &mut SlotWriter,
+        output:            &mut OutputSlotWriter,
         scratch:           &mut Vec<u8>,
         cli:               &Cli,
         path:              &[u8],
