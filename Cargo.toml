@@ -49,7 +49,7 @@ dhat              = { version = "0.3.3",   default-features = false, features = 
 mimalloc          = { version = "=0.1.47", default-features = true,  features = [],         optional = true }
 
 smallvec          = { version = "1.15.1",                            features = ["const_generics"] }
-ctrlc             = { version = "3.5.2",   default-features = false, features = [] }
+
 tracy-client      = { version = "0.17.3",  default-features = false, features = [],         optional = true }
 
 crossbeam-channel = { version = "0.5.15",  default-features = false, features = ["std"] }
@@ -81,6 +81,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_Console",
 ] }
 
 [[bin]]

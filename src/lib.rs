@@ -15,6 +15,7 @@ pub mod ctx;
 pub mod cli;
 pub mod grep;
 pub mod ext4;
+pub mod ctrl_c;
 pub mod apfs;
 pub mod ntfs;
 pub mod util;
@@ -270,23 +271,7 @@ pub fn run_with_inspect_for_single_search<S: MatchSink + 'static>(
     Ok(ctx.wait_and_save_cache(&config))
 }
 
-#[inline]
-pub fn setup_signal_handler() -> Arc<AtomicBool> {
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::Relaxed);
-        {
-            let mut handle = io::stdout().lock();
-            _ = handle.write_all(CURSOR_UNHIDE.as_bytes());
-        }
-        _ = io::stdout().flush();
-        std::process::exit(0);
-    }).expect("Error setting Ctrl-C handler");
-
-    running
-}
+pub use ctrl_c::setup_signal_handler;
 
 use std::sync::atomic::AtomicUsize;
 
