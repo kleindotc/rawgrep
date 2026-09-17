@@ -1,7 +1,7 @@
 //! ext4 filesystem implementation of RawFs trait
 
 use crate::{tracy, util};
-use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u8_unaligned};
+use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u64_unaligned_le};
 use crate::grep::{AnyNodeScratch, AnyNodeCache, NodeCacheStats};
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe, FastDivU32};
 use crate::worker::{STREAMING_CHUNK_SIZE, PendingSubdir};
@@ -37,7 +37,6 @@ pub struct Ext4Fs {
     pub sb: Ext4SuperBlock,
     pub device_id: u64,
     pub max_block: u64,
-    pub dont_skip_dot_entries: bool,
     pub inode_table_blocks: Vec<u64>,
 }
 
@@ -477,10 +476,12 @@ impl RawFs for Ext4Fs {
         const ENTRY_SIZE: usize = mem::size_of::<raw::Ext4DirEntry2>();
 
         while offset + ENTRY_SIZE <= buf.len() {
-            let inode     = read_u32_unaligned_le(buf, offset);
-            let rec_len   = read_u16_unaligned_le(buf, offset + 4) as usize;
-            let name_len  = read_u8_unaligned(    buf, offset + 6);
-            let file_type = read_u8_unaligned(    buf, offset + 7);
+            let word      = read_u64_unaligned_le(buf, offset);
+
+            let inode     = word as u32;
+            let rec_len   = ((word >> 32) & 0xFFFF) as usize; // +4
+            let name_len  = ((word >> 48) & 0xFF)   as u8;    // +6
+            let file_type = ((word >> 56) & 0xFF)   as u8;    // +7
 
             //
             // ext4 spec: rec_len is always a multiple of 4 and at least ENTRY_SIZE.
@@ -595,15 +596,10 @@ impl Ext4Fs {
     pub fn parse_superblock(data: &[u8]) -> io::Result<Ext4SuperBlock> {
         let _span = tracy::span!("Ext4Fs::parse_superblock");
 
-        let block_size_log = read_u32_unaligned_le(data, EXT4_BLOCK_SIZE_OFFSET);
-
-        let block_size = 1024 << block_size_log;
-
+        let block_size_log   = read_u32_unaligned_le(data, EXT4_BLOCK_SIZE_OFFSET);
         let blocks_per_group = read_u32_unaligned_le(data, EXT4_BLOCKS_PER_GROUP_OFFSET);
-
         let inodes_per_group = read_u32_unaligned_le(data, EXT4_INODES_PER_GROUP_OFFSET);
-
-        let inode_size = read_u16_unaligned_le(data, EXT4_INODE_SIZE_OFFSET);
+        let inode_size       = read_u16_unaligned_le(data, EXT4_INODE_SIZE_OFFSET);
 
         let desc_size = if data.len() > EXT4_DESC_SIZE_OFFSET + 1 {
             let ds = read_u16_unaligned_le(data, EXT4_DESC_SIZE_OFFSET);
@@ -613,7 +609,7 @@ impl Ext4Fs {
         };
 
         Ok(Ext4SuperBlock {
-            block_size,
+            block_size: 1024 << block_size_log,
             blocks_per_group,
             inodes_per_group,
             inode_size,
@@ -650,9 +646,10 @@ impl Ext4Fs {
         // of `data` irrelevant, so a stack allocated `probe` array
         // (1 byte aligned) is fine here.
         //
-        let eh_magic   = read_u16_unaligned_le(data, 0);
-        let eh_entries = read_u16_unaligned_le(data, 2);
-        let eh_depth   = read_u16_unaligned_le(data, 6);
+        let word       = read_u64_unaligned_le(data, 0);
+        let eh_magic   = word as u16;
+        let eh_entries = (word >> 16) as u16;
+        let eh_depth   = (word >> 48) as u16;
 
         if unlikely(u16::from_le(eh_magic) != EXT4_EXTENT_MAGIC) {
             return Ok(());
@@ -670,9 +667,11 @@ impl Ext4Fs {
                     break;
                 }
 
-                let ee_len      = read_u16_unaligned_le(data, offset + 4);
-                let ee_start_hi = read_u16_unaligned_le(data, offset + 6);
-                let ee_start_lo = read_u32_unaligned_le(data, offset + 8);
+                let word = read_u64_unaligned_le(data, offset + 4);
+
+                let ee_len      = word as u16;
+                let ee_start_hi = ((word >> 16) & 0xFFFF)      as u16;
+                let ee_start_lo = ((word >> 32) & 0xFFFF_FFFF) as u32;
 
                 let start_block = ((ee_start_hi as u64) << 32) | (ee_start_lo as u64);
 
@@ -750,7 +749,6 @@ impl Ext4Fs {
     #[inline]
     fn decode_inode(inode_num: u64, src: &[u8], inode_size_field: u16) -> Ext4Inode {
         const I_MODE:       usize = 0x00;
-        const I_SIZE_LO:    usize = 0x04;
         const I_MTIME:      usize = 0x10;
         const I_FLAGS:      usize = 0x20;
         const I_BLOCK:      usize = 0x28;
@@ -759,8 +757,9 @@ impl Ext4Fs {
         const I_BLOCK_LEN:  usize = 60;  // 15 u32 block pointers / the extent header + extents
         const I_HEADER_MIN: usize = I_SIZE_HIGH + 4;
 
-        let mode      = read_u16_unaligned_le(src, I_MODE);
-        let size_lo   = read_u32_unaligned_le(src, I_SIZE_LO);
+        let word      = read_u64_unaligned_le(src, I_MODE);
+        let mode      = word as u16;
+        let size_lo   = ((word >> 32) & 0xFFFF_FFFF) as u32;
         let mtime_sec = read_u32_unaligned_le(src, I_MTIME) as i64;
         let flags     = read_u32_unaligned_le(src, I_FLAGS);
 

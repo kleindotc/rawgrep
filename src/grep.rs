@@ -179,7 +179,7 @@ impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
             inode_table_blocks.push(inode_table_block as u64);
         }
 
-        let fs = Ext4Fs { sb, device_id, max_block, file, inode_table_blocks, dont_skip_dot_entries: cli.hidden };
+        let fs = Ext4Fs { sb, device_id, max_block, file, inode_table_blocks };
         Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ext4)
     }
 }
