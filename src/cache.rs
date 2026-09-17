@@ -257,6 +257,40 @@ impl CacheBytes {
     }
 }
 
+/// Ownership of the cache directory/file may fuck up and error out
+/// when we try to write/read from it.
+///
+/// So this function is for preventing that.
+#[inline]
+#[cfg(unix)]
+fn fix_ownership(path: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let (sudo_uid, sudo_gid) = match (
+        std::env::var("SUDO_UID").ok().and_then(|s| s.parse::<u32>().ok()),
+        std::env::var("SUDO_GID").ok().and_then(|s| s.parse::<u32>().ok()),
+    ) {
+        (Some(uid), Some(gid)) => (uid, gid),
+        _ => return Ok(()), // not running with sudo, nothing to fix
+    };
+
+    let path_cstr = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    let ret = unsafe { libc::chown(path_cstr.as_ptr(), sudo_uid, sudo_gid) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+#[inline]
+#[cfg(not(unix))]
+fn fix_ownership(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct DiskStorage {
     path: PathBuf,
@@ -283,9 +317,9 @@ impl CacheStorage for DiskStorage {
         let tmp = self.path.with_extension("tmp");
         std::fs::write(&tmp, data)?;
 
-        Self::fix_ownership(&tmp)?;
+        fix_ownership(&tmp)?;
         std::fs::rename(&tmp, &self.path)?;
-        Self::fix_ownership(&self.path)?;
+        fix_ownership(&self.path)?;
 
         Ok(())
     }
@@ -314,7 +348,7 @@ impl CacheStorage for DiskStorage {
         file.sync_all()?;
         drop(file);
 
-        Self::fix_ownership(&tmp)?;
+        fix_ownership(&tmp)?;
         std::fs::rename(&tmp, &self.path)?;
 
         Ok(())
@@ -414,34 +448,6 @@ impl CacheStorage for DiskStorage {
     }
 }
 
-impl DiskStorage {
-    #[inline]
-    #[cfg(unix)]
-    fn fix_ownership(path: &Path) -> io::Result<()> {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-        let (sudo_uid, sudo_gid) = match (
-            std::env::var("SUDO_UID").ok().and_then(|s| s.parse::<u32>().ok()),
-            std::env::var("SUDO_GID").ok().and_then(|s| s.parse::<u32>().ok()),
-        ) {
-            (Some(uid), Some(gid)) => (uid, gid),
-            _ => return Ok(()),
-        };
-
-        let path_cstr = CString::new(path.as_os_str().as_bytes())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
-        let ret = unsafe { libc::chown(path_cstr.as_ptr(), sudo_uid, sudo_gid) };
-        if ret != 0 { return Err(io::Error::last_os_error()); }
-
-        Ok(())
-    }
-
-    #[inline]
-    #[cfg(not(unix))]
-    fn fix_ownership(_path: &Path) -> io::Result<()> { Ok(()) }
-}
-
 #[derive(Default)]
 pub struct MemoryStorage {
     data: parking_lot::Mutex<Option<Vec<u8>>>,
@@ -451,7 +457,6 @@ impl CacheStorage for MemoryStorage {
     #[inline]
     fn load(&self) -> io::Result<Option<Vec<u8>>> {
         Ok(self.data.lock().clone())
-
     }
 
     #[inline]
@@ -472,6 +477,73 @@ impl CacheStorage for MemoryStorage {
 
         *self.data.lock() = Some(data);
         Ok(())
+    }
+}
+
+/// Finish growing an array: copy `copy_len` elements from `src` into the
+/// front of `uninit`, then mark the whole box initialized. The tail past
+/// `copy_len` (if any) is left uninitialized -- callers own that invariant
+/// and must overwrite it before it's ever read (the bitset growth call
+/// sites below rely on this instead of paying to zero memory nothing will
+/// read yet).
+///
+/// # SAFETY
+/// `src` must be valid for reads of `copy_len` elements of `T`, and
+/// `copy_len` must not exceed `uninit.len()`.
+#[inline(always)]
+unsafe fn finish_grow<T: Copy>(
+    mut uninit: Box<[std::mem::MaybeUninit<T>]>,
+    src: *const T,
+    copy_len: usize,
+) -> Box<[T]> {
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, uninit.as_mut_ptr() as *mut T, copy_len);
+        uninit.assume_init()
+    }
+}
+
+/// Allocate a lookup table with `size` slots, all initialized to
+/// FILE_LOOKUP_EMPTY. `size` must be a power of two. Writing the 0xFF byte
+/// pattern directly is a single memset instead of a per-element store loop.
+#[inline(always)]
+fn new_empty_lookup(size: usize) -> Box<[u32]> {
+    let mut lookup = Box::new_uninit_slice(size);
+    unsafe {
+        std::ptr::write_bytes(lookup.as_mut_ptr(), 0xFF, size);
+        lookup.assume_init()
+    }
+}
+
+/// Insert `num_files` entries into `lookup` via open addressing, hashing
+/// each file's key through `key_at(file_id)`. Shared by the full-table
+/// rebuild in `ensure_capacity`'s rehash and by `load_from_disk`'s
+/// from-scratch build -- both used to carry their own copy of this loop.
+///
+/// Prefetches the next file's target slot one iteration ahead so its cache
+/// line is already in flight while we're still probing for the current file.
+fn rebuild_lookup(lookup: &mut [u32], num_files: usize, key_at: impl Fn(usize) -> FileKey) {
+    let mask = lookup.len() - 1;
+    let mut next_index = (num_files > 0).then(|| (key_at(0).hash() as usize) & mask);
+
+    for file_id in 0..num_files {
+        let index = unsafe { next_index.unwrap_unchecked() };
+
+        if let Some(next_id) = (file_id + 1 < num_files).then_some(file_id + 1) {
+            let nh = (key_at(next_id).hash() as usize) & mask;
+            prefetch_read(unsafe { lookup.as_ptr().add(nh) });
+            next_index = Some(nh);
+        }
+
+        let mut probe = index;
+        for _ in 0..16 {
+            let existing = unsafe { *lookup.get_unchecked(probe) };
+            if existing == FILE_LOOKUP_EMPTY {
+                unsafe { *lookup.get_unchecked_mut(probe) = file_id as u32 };
+                break;
+            }
+
+            probe = (probe + 1) & mask;
+        }
     }
 }
 
@@ -676,9 +748,10 @@ impl<S: CacheStorage> FragmentCache<S> {
         let new_capacity            = (num_files + 64*1024).min(self.max_files as usize);
 
         let alloc_start             = Instant::now();
-        let mut new_fragment_hashes = Box::<[u32]>::new_uninit_slice(self.max_fragments as usize);
-        let mut new_file_keys       = Box::<[FileKey]>::new_uninit_slice(new_capacity);
-        let mut new_file_metas      = Box::<[FileMeta]>::new_uninit_slice(new_capacity);
+
+        let new_fragment_hashes_u   = Box::<[u32]>::new_uninit_slice(self.max_fragments as usize);
+        let new_file_keys_u         = Box::<[FileKey]>::new_uninit_slice(new_capacity);
+        let new_file_metas_u        = Box::<[FileMeta]>::new_uninit_slice(new_capacity);
 
         let bits_per_file_u64       = num_fragments.div_ceil(64).max(1);
         let total_u64s              = new_capacity * bits_per_file_u64;
@@ -693,50 +766,28 @@ impl<S: CacheStorage> FragmentCache<S> {
         );
 
         // allocate uninit and only copy what we need
-        let mut new_file_bitsets = Box::<[u64]>::new_uninit_slice(total_u64s);
+        let new_file_bitsets_u = Box::<[u64]>::new_uninit_slice(total_u64s);
         let alloc_time = alloc_start.elapsed();
 
         //
         // Copy existing data from the mmap
         //
         let copy_start = Instant::now();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.fragment_hashes.ptr,
-                new_fragment_hashes.as_mut_ptr() as *mut u32,
-                num_fragments,
-            );
-            std::ptr::copy_nonoverlapping(
-                self.file_keys.ptr,
-                new_file_keys.as_mut_ptr() as *mut FileKey,
-                num_files,
-            );
-            std::ptr::copy_nonoverlapping(
-                self.file_metas.ptr,
-                new_file_metas.as_mut_ptr() as *mut FileMeta,
-                num_files,
-            );
+        let (new_fragment_hashes, new_file_keys, new_file_metas, new_file_bitsets) = unsafe {
+            (
+                finish_grow(new_fragment_hashes_u, self.fragment_hashes.ptr, num_fragments),
+                finish_grow(new_file_keys_u,       self.file_keys.ptr,       num_files),
+                finish_grow(new_file_metas_u,      self.file_metas.ptr,      num_files),
 
-            //
-            // Copy used bitsets from mmap!!
-            //
-            std::ptr::copy_nonoverlapping(
-                self.file_bitsets.ptr,
-                new_file_bitsets.as_mut_ptr() as *mut u64,
-                self.file_bitsets.len().min(used_u64s),
-            );
-
-            //
-            // We leave the rest uninitialized - `merge_updates` will
-            // initialize each new file's bitset when its added
-            //
-        }
+                //
+                // Copy used bitsets from mmap!! We leave the rest
+                // uninitialized - `merge_updates` will initialize each new
+                // file's bitset when its added
+                //
+                finish_grow(new_file_bitsets_u,    self.file_bitsets.ptr,    self.file_bitsets.len().min(used_u64s)),
+            )
+        };
         let copy_time = copy_start.elapsed();
-
-        let new_fragment_hashes    = unsafe { new_fragment_hashes.assume_init() };
-        let new_file_keys          = unsafe { new_file_keys.assume_init() };
-        let new_file_metas         = unsafe { new_file_metas.assume_init() };
-        let new_file_bitsets       = unsafe { new_file_bitsets.assume_init() };
 
         // ----------- Update pointers to point to owned data
         self.fragment_hashes       = FatPtr::from_box(&new_fragment_hashes);
@@ -785,89 +836,34 @@ impl<S: CacheStorage> FragmentCache<S> {
         let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
 
         //
-        // Grow file_keys
+        // Grow file_keys, file_metas and file_bitsets to new_capacity.
+        // (Used to be 3 separate copy-pasted alloc+copy blocks -- see
+        // finish_grow() near the top of the file. @Refactor done.)
         //
-        let old_file_keys = self.owned_file_keys.take().unwrap();
-        let mut new_file_keys = Box::<[FileKey]>::new_uninit_slice(new_capacity);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                old_file_keys.as_ptr(),
-                new_file_keys.as_mut_ptr() as *mut FileKey,
-                num_files,
-            );
-        }
-        let new_file_keys = unsafe { new_file_keys.assume_init() };
+        let old_file_keys    = self.owned_file_keys.take().unwrap();
+        let old_file_metas   = self.owned_file_metas.take().unwrap();
+        let old_file_bitsets = self.owned_file_bitsets.take().unwrap();
 
-        //
-        // Grow file_metas
-        //
-        // @Refactor @Cutnpaste from above
-        let old_file_metas = self.owned_file_metas.take().unwrap();
-        let mut new_file_metas = Box::<[FileMeta]>::new_uninit_slice(new_capacity);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                old_file_metas.as_ptr(),
-                new_file_metas.as_mut_ptr() as *mut FileMeta,
-                num_files,
-            );
-        }
-        let new_file_metas = unsafe { new_file_metas.assume_init() };
+        let old_u64s       = num_files * bits_per_file_u64;
+        let new_total_u64s = new_capacity * bits_per_file_u64;
 
-        //
-        // Grow file_bitsets
-        //
-        // @Refactor @Cutnpaste from above
-        let old_file_bitsets     = self.owned_file_bitsets.take().unwrap();
-        let old_u64s             = num_files * bits_per_file_u64;
-        let new_total_u64s       = new_capacity * bits_per_file_u64;
-        let mut new_file_bitsets = Box::<[u64]>::new_uninit_slice(new_total_u64s);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                old_file_bitsets.as_ptr(),
-                new_file_bitsets.as_mut_ptr() as *mut u64,
-                old_u64s.min(old_file_bitsets.len()),
-            );
-        }
-        let new_file_bitsets = unsafe { new_file_bitsets.assume_init() };
+        let (new_file_keys, new_file_metas, new_file_bitsets) = unsafe {
+            (
+                finish_grow(Box::<[FileKey]>::new_uninit_slice(new_capacity),  old_file_keys.as_ptr(),    num_files),
+                finish_grow(Box::<[FileMeta]>::new_uninit_slice(new_capacity), old_file_metas.as_ptr(),   num_files),
+                finish_grow(Box::<[u64]>::new_uninit_slice(new_total_u64s),    old_file_bitsets.as_ptr(), old_u64s.min(old_file_bitsets.len())),
+            )
+        };
 
         //
         // Grow lookup table if needed (maintain load factor < 0.5)
         //
         let needed_lookup_size = (new_capacity * 2).next_power_of_two();
         if needed_lookup_size > self.file_lookup.len() {
-            let mut new_lookup = Box::<[u32]>::new_uninit_slice(needed_lookup_size);
-            unsafe {
-                std::ptr::write_bytes(new_lookup.as_mut_ptr(), 0xFF, needed_lookup_size);
-            }
-            let mut new_lookup = unsafe { new_lookup.assume_init() };
+            let mut new_lookup = new_empty_lookup(needed_lookup_size);
 
-            //
             // Rehash all existing entries
-            //
-            let mask = needed_lookup_size - 1;
-            let mut next_index = (num_files > 0)
-                .then(|| (unsafe { new_file_keys.get_unchecked(0) }.hash() as usize) & mask);
-
-            for file_id in 0..num_files {
-                let index = unsafe { next_index.unwrap_unchecked() };
-
-                if let Some(next_id) = (file_id + 1 < num_files).then_some(file_id + 1) {
-                    let nh = (unsafe { new_file_keys.get_unchecked(next_id) }.hash() as usize) & mask;
-                    prefetch_read(unsafe { new_lookup.as_ptr().add(nh) });
-                    next_index = Some(nh);
-                }
-
-                let mut probe = index;
-                for _ in 0..16 {
-                    let existing = *unsafe { new_lookup.get_unchecked(probe) };
-                    if existing == FILE_LOOKUP_EMPTY {
-                        unsafe { *new_lookup.get_unchecked_mut(probe) = file_id as u32 };
-                        break;
-                    }
-
-                    probe = (probe + 1) & mask;
-                }
-            }
+            rebuild_lookup(&mut new_lookup, num_files, |id| unsafe { *new_file_keys.get_unchecked(id) });
 
             self.file_lookup = new_lookup;
         }
@@ -911,18 +907,19 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         if !old_bits.is_empty() {
             //
-            // Only copy if there's actually data to copy
+            // Only copy if there's actually data to copy. One copy_from_slice
+            // per file row compiles to a memcpy instead of the old per-word
+            // branch+store, which matters once old_stride is more than a
+            // word or two (@Speedup, same result).
             //
             for file_id in 0..num_files {
                 let old_offset = file_id * old_stride;
                 let new_offset = file_id * new_stride;
-                for i in 0..old_stride {
-                    if old_offset + i < old_bits.len() {
-                        unsafe {
-                            *new_bits.get_unchecked_mut(new_offset + i) =
-                            *old_bits.get_unchecked(old_offset + i);
-                        }
-                    }
+                let copy_len   = old_stride.min(old_bits.len().saturating_sub(old_offset));
+
+                if copy_len > 0 {
+                    new_bits[new_offset..new_offset + copy_len]
+                        .copy_from_slice(&old_bits[old_offset..old_offset + copy_len]);
                 }
             }
         }
@@ -997,34 +994,8 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         // ---- Build lookup table
         let lookup_size = ((num_files * 2).max(1024)).next_power_of_two();
-        let mut file_lookup = Box::<[u32]>::new_uninit_slice(lookup_size);
-        unsafe {
-            std::ptr::write_bytes(file_lookup.as_mut_ptr(), 0xFF, lookup_size);
-        }
-        let mut file_lookup = unsafe { file_lookup.assume_init() };
-
-        let mask = lookup_size - 1;
-        let mut next_index = (num_files > 0).then(|| (file_keys.get(0).hash() as usize) & mask);
-
-        for file_id in 0..num_files {
-            let index = unsafe { next_index.unwrap_unchecked() };
-
-            if let Some(next_id) = (file_id + 1 < num_files).then_some(file_id + 1) {
-                let nh = (file_keys.get(next_id).hash() as usize) & mask;
-                prefetch_read(unsafe { file_lookup.as_ptr().add(nh) });
-                next_index = Some(nh);
-            }
-
-            let mut probe = index;
-            for _ in 0..16 {
-                if file_lookup[probe] == FILE_LOOKUP_EMPTY {
-                    file_lookup[probe] = file_id as u32;
-                    break;
-                }
-
-                probe = (probe + 1) & mask;
-            }
-        }
+        let mut file_lookup = new_empty_lookup(lookup_size);
+        rebuild_lookup(&mut file_lookup, num_files, |id| file_keys.get(id));
 
         eprintln!(
             "Cache loaded: {} files, {} fragments, {:.2}MB in {:.2}ms",
@@ -1290,20 +1261,7 @@ impl<S: CacheStorage> FragmentCache<S> {
 
             let num_files         = self.num_files as usize;
             let bits_per_file_u64 = new_num_fragments.div_ceil(64).max(1);
-            let u64_offset        = index / 64;
-            let bit_index         = index % 64;
-
-            let owned_file_bitsets = unsafe { self.owned_file_bitsets.as_mut().unwrap_unchecked() };
-            let owned_file_bitsets_len = owned_file_bitsets.len();
-
-            for file_id in 0..num_files {
-                let bitset_index = file_id * bits_per_file_u64 + u64_offset;
-                if bitset_index < owned_file_bitsets_len {
-                    unsafe {
-                        *owned_file_bitsets.get_unchecked_mut(bitset_index) &= !(1u64 << bit_index);
-                    }
-                }
-            }
+            self.clear_fragment_bit_for_all_files(index, bits_per_file_u64, num_files);
 
             index as u32
         } else {
@@ -1330,23 +1288,54 @@ impl<S: CacheStorage> FragmentCache<S> {
             // so stride is already at its maximum and will never grow again
             let num_files         = self.num_files as usize;
             let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
-            let u64_offset        = index / 64;
-            let bit_index         = index % 64;
-
-            let owned_file_bitsets     = self.owned_file_bitsets.as_mut().unwrap();
-            let owned_file_bitsets_len = owned_file_bitsets.len();
-
-            for file_id in 0..num_files {
-                let bitset_index = file_id * bits_per_file_u64 + u64_offset;
-                if bitset_index < owned_file_bitsets_len {
-                    // Clear the bit (unknown/must-check)
-                    unsafe {
-                        *owned_file_bitsets.get_unchecked_mut(bitset_index) &= !(1u64 << bit_index);
-                    }
-                }
-            }
+            self.clear_fragment_bit_for_all_files(index, bits_per_file_u64, num_files);
 
             index as u32
+        }
+    }
+
+    /// Clear fragment `index`'s bit for every existing file, marking that
+    /// fragment "unknown/must-check" for files that predate it. Shared by
+    /// both branches of `add_fragment()` above -- growing the ring and
+    /// evicting into it both need every prior file re-checked against
+    /// whatever fragment now lives at `index`.
+    ///
+    /// Caller must have called `ensure_owned()` already (same precondition as `add_fragment`).
+    fn clear_fragment_bit_for_all_files(&mut self, index: usize, bits_per_file_u64: usize, num_files: usize) {
+        let u64_offset = index / 64;
+        let bit_index  = index % 64;
+        let mask       = !(1u64 << bit_index);
+
+        let owned_file_bitsets = unsafe { self.owned_file_bitsets.as_mut().unwrap_unchecked() };
+
+        if bits_per_file_u64 == 1 {
+            debug_assert_eq!(u64_offset, 0, "bits_per_file_u64 == 1 implies index < 64");
+
+            //
+            // Each file's word sits at exactly file_id -- one bounds check up
+            // front, and a flat contiguous slice that LLVM can auto-vectorize
+            // with unmasked loads/stores.
+            //
+            let n = num_files.min(owned_file_bitsets.len());
+            for word in &mut owned_file_bitsets[..n] {
+                *word &= mask;
+            }
+
+            return;
+        }
+
+        //
+        // General strided path (bits_per_file_u64 > 1)...
+        //
+
+        let owned_file_bitsets_len = owned_file_bitsets.len();
+        for file_id in 0..num_files {
+            let bitset_index = file_id * bits_per_file_u64 + u64_offset;
+            if bitset_index < owned_file_bitsets_len {
+                unsafe {
+                    *owned_file_bitsets.get_unchecked_mut(bitset_index) &= mask;
+                }
+            }
         }
     }
 
@@ -1428,41 +1417,9 @@ impl<S: CacheStorage> FragmentCache<S> {
         };
 
         std::fs::create_dir_all(&dir)?;
-        Self::fix_ownership(&dir)?;
+        fix_ownership(&dir)?;
 
         Ok(dir.join("fragment_cache.bin"))
-    }
-
-    /// Ownership of the cache directory/file may fuck up and error out
-    /// when we try to write/read from it.
-    ///
-    /// So this function is for preventing that.
-    #[cfg(unix)]
-    fn fix_ownership(path: &Path) -> io::Result<()> {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-        let (sudo_uid, sudo_gid) = match (
-            std::env::var("SUDO_UID").ok().and_then(|s| s.parse::<u32>().ok()),
-            std::env::var("SUDO_GID").ok().and_then(|s| s.parse::<u32>().ok()),
-        ) {
-            (Some(uid), Some(gid)) => (uid, gid),
-            _ => return Ok(()), // not running with sudo, nothing to fix
-        };
-
-        let path_cstr = CString::new(path.as_os_str().as_bytes())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
-        let ret = unsafe { libc::chown(path_cstr.as_ptr(), sudo_uid, sudo_gid) };
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn fix_ownership(_path: &Path) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -1495,6 +1452,7 @@ impl<S: CacheStorage> FragmentCache<S> {
     /// call before ensure_owned(). Shared by merge_updates() and
     /// merge_updates_if_changed() so the lookups only happen once no matter
     /// which caller ends up applying the result.
+    #[inline(never)]
     fn plan_batch(
         &self,
         file_keys: &[FileKey],
@@ -1529,7 +1487,18 @@ impl<S: CacheStorage> FragmentCache<S> {
         //
         let mut changed = has_new_fragment;
 
+        let fast_word = bits_per_file_u64 == 1 && words_per_file == 1 && !has_new_fragment;
+        let selector_mask: u64 = if fast_word {
+            frags.iter().fold(0u64, |m, f| m | (1u64 << f.existing_index.unwrap()))
+        } else {
+            0
+        };
+
         for file_index in 0..file_keys.len() {
+            if let Some(&next_key) = file_keys.get(file_index + 1) {
+                self.prefetch_lookup(next_key);
+            }
+
             let file_key  = *unsafe { file_keys .get_unchecked(file_index) };
             let file_meta = *unsafe { file_metas.get_unchecked(file_index) };
 
@@ -1554,28 +1523,57 @@ impl<S: CacheStorage> FragmentCache<S> {
             if !changed && let Some(id) = existing_id {
                 let offset = (id as usize) * bits_per_file_u64;
 
-                let presence = unsafe {
-                    fragment_presence.get_unchecked(
-                        file_index * words_per_file .. (file_index + 1) * words_per_file
-                    )
-                };
+                if fast_word {
+                    //
+                    // Fast branch-free path when bits_per_file_u64 == 1 ...
+                    //
 
-                for (frag_i, frag_plan) in frags.iter().enumerate() {
-                    // has_new_fragment is false here, so this is always Some.
-                    let frag_index     = frag_plan.existing_index.unwrap() as usize;
+                    let presence_word = unsafe { *fragment_presence.get_unchecked(file_index) };
 
-                    let presence       = unsafe { *presence.get_unchecked(frag_i / 64) };
-                    let is_present     = (presence & (1 << (frag_i % 64))) != 0;
+                    let mut deposited = 0u64;
+                    for (frag_i, f) in frags.iter().enumerate() {
+                        let bit = (presence_word >> frag_i) & 1;
+                        deposited |= bit << unsafe { f.existing_index.unwrap_unchecked() };
+                    }
 
-                    let expect_bit_set = !is_present;
+                    let expected = !deposited & selector_mask;
+                    let actual   = self.file_bitsets.get(offset) & selector_mask;
 
-                    let u64_index      = offset + (frag_index >> 6);
-                    let bit_index      = frag_index & 63;
-                    let actual_bit_set = (self.file_bitsets.get(u64_index) & (1u64 << bit_index)) != 0;
-
-                    if actual_bit_set != expect_bit_set {
+                    if actual != expected {
                         changed = true;
-                        break;
+                    }
+
+                } else {
+                    let presence = unsafe {
+                        fragment_presence.get_unchecked(
+                            file_index * words_per_file .. (file_index + 1) * words_per_file
+                        )
+                    };
+
+                    let mut cached_u64_index = usize::MAX;
+                    let mut cached_word = 0u64;
+
+                    for (frag_i, frag_plan) in frags.iter().enumerate() {
+                        // has_new_fragment is false here, so this is always Some.
+                        let frag_index     = unsafe { frag_plan.existing_index.unwrap_unchecked() } as usize;
+
+                        let presence       = unsafe { *presence.get_unchecked(frag_i / 64) };
+                        let is_present     = (presence & (1 << (frag_i % 64))) != 0;
+
+                        let expect_bit_set = !is_present;
+
+                        let u64_index      = offset + (frag_index >> 6);
+                        let bit_index      = frag_index & 63;
+
+                        if u64_index != cached_u64_index {
+                            cached_word = self.file_bitsets.get(u64_index);
+                            cached_u64_index = u64_index;
+                        }
+
+                        if (cached_word & (1u64 << bit_index) != 0) != expect_bit_set {
+                            changed = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -1737,17 +1735,12 @@ impl<S: CacheStorage> FragmentCache<S> {
             let offset = file_id * bits_per_file_u64;
 
             if needs_full_reset {
-                for i in 0..bits_per_file_u64 {
-                    let index = offset + i;
-                    if index < owned_file_bitsets.len() {
-                        unsafe {
-                            //
-                            // Unknown -- only checked fragments get marked
-                            //
-
-                            *owned_file_bitsets.get_unchecked_mut(index) = 0u64;
-                        }
-                    }
+                //
+                // Unknown -- only checked fragments get marked.
+                //
+                let end = (offset + bits_per_file_u64).min(owned_file_bitsets.len());
+                if end > offset {
+                    owned_file_bitsets[offset..end].fill(0u64);
                 }
             }
 

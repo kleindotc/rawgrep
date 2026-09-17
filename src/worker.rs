@@ -58,6 +58,9 @@ pub const __MAX_FILE_BYTE_SIZE:    usize = 30 * 1024 * 1024; // @Tune
 // into a second huge allocation up front.
 const SMALL_FILE_DECODE_THRESHOLD: usize =       512 * 1024; // @Tune
 
+pub const PREFETCH_AHEAD:          usize = 4;
+pub const PREFETCH_MIN_CHUNKS:     usize = 2;
+
 #[inline(always)]
 const fn average_newline_count_heuristic(buffer_length: usize) -> usize {
     buffer_length / 40 + 16
@@ -120,10 +123,10 @@ impl MatchSink for NoSink {
 
 #[derive(Debug)]
 pub struct RawMatch {
-    pub path:     Box<[u8]>,          // full file path
+    pub path:     Box<[u8]>,          // Full file path
     pub line_num: u32,                // 1-indexed line number
-    pub text:     Box<[u8]>,          // the matched line content
-    pub ranges:   Box<[(u32, u32)]>,  // byte ranges of match spans within text
+    pub text:     Box<[u8]>,          // The matched line content
+    pub ranges:   Box<[(u32, u32)]>,  // Byte ranges of match spans within text
 }
 
 #[derive(Clone)]
@@ -576,11 +579,9 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
             return;
         }
 
-        if self.output.is_empty() {
+        if self.output.is_empty() || self.stdout_is_being_redirected_to_dev_null {
             return;
         }
-
-        debug_assert!(!self.stdout_is_being_redirected_to_dev_null);
 
         self.output.flush();
         self.pacer.record_flush();
@@ -940,7 +941,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             self.process_file(&node, name_fat_ptr, parent_path, gitignore_chain)?;
 
-            if i & self.check_mask == 0 {
+            if !self.stdout_is_being_redirected_to_dev_null && i & self.check_mask == 0 {
                 let (should_flush, batch_hint, next_mask) = self.pacer.poll(!self.output.is_empty());
                 self.batch_size_cached = batch_hint;
                 self.check_mask = next_mask;
@@ -1095,6 +1096,19 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         );
         buf.clear();
 
+        //
+        // check_binary is forced off here.
+        //
+        // collect_file_chunks used to do the probe read into parser.file and set
+        // skip_first, so the chunk list started at +block_size.
+        //
+        // This loop reads chunks into parser.chunk and never looks at parser.file, so those
+        // first bytes were read and then dropped: a match in the first block of
+        // any file over STREAMING_THRESHOLD was silently missed.
+        //
+        // The probe now runs on the head of chunk 0 below, after it is read,
+        // which also removes the extra redundant pread from this path.
+        //
         if !self.fs.collect_file_chunks(
             &mut self.parser.scratch,
             &mut self.parser.scratch2,
@@ -1102,10 +1116,9 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             &mut self.parser.scratch_chunks,
             node,
             max_size,
-            check_binary,
+            false, // check_binary,
             buf
         )? {
-            self.stats.files_skipped_as_binary_due_to_probe += 1;
             self.chunk_carry = Some(carry);
             return Ok(false);
         }
@@ -1127,13 +1140,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         let fd = self.fs.device_file().as_raw_fd();
 
         #[cfg(unix)]
-        {
+        let hints_on = chunks_len >= PREFETCH_MIN_CHUNKS;
+
+        #[cfg(unix)]
+        if hints_on {
             for &(offset, len) in self.parser.scratch_chunks.iter().take(PREFETCH_AHEAD) {
                 unsafe {
-                    libc::posix_fadvise(
-                        fd, offset as i64, len as i64,
-                        libc::POSIX_FADV_WILLNEED
-                    );
+                    libc::posix_fadvise(fd, offset as i64, len as i64, libc::POSIX_FADV_WILLNEED);
                 }
             }
         }
@@ -1141,13 +1154,15 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         #[cfg(unix)]
         let mut hinted_up_to = PREFETCH_AHEAD.min(chunks_len);
 
+        let mut probed = !check_binary;
+
         for chunk_index in 0..chunks_len {
             let (disk_offset, len) = *unsafe { self.parser.scratch_chunks.get_unchecked(chunk_index) };
             let len = len as usize;
 
             #[cfg(unix)] {
                 let want = chunk_index + 1;
-                if want >= hinted_up_to {
+                if hints_on && want >= hinted_up_to {
                     if let Some(&(next_offset, next_len)) = self.parser.scratch_chunks.get(want) {
                         unsafe {
                             libc::posix_fadvise(
@@ -1178,6 +1193,23 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             };
 
             if n == 0 { self.parser.chunk = buf; break; }
+
+            //
+            // Probe the head of the first chunk we actually read. Same window
+            // width as the buffered path, so classification matches.
+            //
+            if !probed {
+                probed = true;
+
+                let probe_len = n.min(self.fs.block_size() as usize);
+                let probe = unsafe { buf.get_unchecked(tail_len..tail_len + probe_len) };
+                if crate::parser::binary_probe(probe, node.size() as usize) {
+                    self.parser.chunk = buf;
+                    self.stats.files_skipped_as_binary_due_to_probe += 1;
+                    self.chunk_carry = Some(carry);
+                    return Ok(false);
+                }
+            }
 
             bytes_searched += n;
             carry.tail.clear();
@@ -1325,7 +1357,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                     &mut self.parser.scratch2,
                     self.cli,
                     &self.path_buf,
-                    self.stdout_is_being_redirected_to_dev_null,
                     &mut found_any,
                     line_num,
                     line,
@@ -1407,7 +1438,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                     &mut self.parser.scratch2,
                     self.cli,
                     &self.path_buf,
-                    self.stdout_is_being_redirected_to_dev_null,
                     &mut found_any,
                     line_num,
                     line,
@@ -1554,7 +1584,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                     &mut self.parser.scratch2,
                     self.cli,
                     &self.path_buf,
-                    self.stdout_is_being_redirected_to_dev_null,
                     &mut carry.found_any,
                     carry.line_num,
                     line,
@@ -1613,7 +1642,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                     &mut self.parser.scratch2,
                     self.cli,
                     &self.path_buf,
-                    self.stdout_is_being_redirected_to_dev_null,
                     &mut carry.found_any,
                     carry.line_num,
                     line,
@@ -1728,7 +1756,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 &mut self.parser.scratch2,
                 self.cli,
                 &self.path_buf,
-                self.stdout_is_being_redirected_to_dev_null,
                 &mut found_any,
                 line_num,
                 line,
@@ -1859,7 +1886,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         scratch2:                                &mut Vec<u8>,
         cli:                                     &Cli,
         path:                                    &[u8],
-        stdout_is_being_redirected_to_dev_null:   bool,
         found_any:                               &mut bool,
         line_num:                                 u32,
         line:                                    &[u8],
@@ -1875,24 +1901,20 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             *found_any = true;
 
-            if !stdout_is_being_redirected_to_dev_null {
-                Self::write_file_header(scratch2, cli, path, should_print_color);
-            }
+            Self::write_file_header(scratch2, cli, path, should_print_color);
         }
 
-        if !stdout_is_being_redirected_to_dev_null {
-            Self::write_match_line(
-                output,
-                scratch2,
-                cli,
-                path,
-                line,
-                line_num,
-                matches,
-                should_print_color,
-                should_print_line_numbers,
-            );
-        }
+        Self::write_match_line(
+            output,
+            scratch2,
+            cli,
+            path,
+            line,
+            line_num,
+            matches,
+            should_print_color,
+            should_print_line_numbers,
+        );
 
         if S::STDOUT_NOP {  // @Memory
             sink.push(path.as_ref(), line_num as _, line, matches);
@@ -1915,6 +1937,9 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         should_print_color:       bool,
         should_print_line_number: bool,
     ) {
+        const MAX_DISPLAY: usize = 500;
+        const ELLIPSIS:    &[u8] = b"...";
+
         let mut itoa_buf = itoa::Buffer::new();
         let line_num_str = if should_print_line_number {
             itoa_buf.format(line_num)
@@ -1966,37 +1991,145 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             scratch.push(b' ');
         }
 
-        let display = truncate_utf8(line, 500); // @Incomplete @Configuration @Tune
+        //
+        // The whole line fits, just dump it.
+        //
+        if likely(line.len() <= MAX_DISPLAY) {
+            let display = line;
 
-        let mut reserve_len = display.len() + 1;
+            let mut reserve_len = display.len() + 1;
+            if should_print_color {
+                reserve_len += matches.len() * (COLOR_RED.len() + COLOR_RESET.len());
+            }
+            scratch.reserve(reserve_len);
+
+            let mut last = 0;
+            for &(s, e) in matches {
+                let s = s as usize;
+                let e = e as usize;
+
+                if s >= display.len() { break; }
+                let e = e.min(display.len());
+
+                debug_assert!(last <= s && s <= display.len());
+                scratch.extend_from_slice(unsafe { display.get_unchecked(last..s) });
+
+                if should_print_color { scratch.extend_from_slice(COLOR_RED.as_bytes()); }
+
+                debug_assert!(s <= e && e <= display.len());
+                scratch.extend_from_slice(unsafe { display.get_unchecked(s..e) });
+
+                if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
+
+                last = e;
+            }
+
+            scratch.extend_from_slice(unsafe { display.get_unchecked(last..) });
+            scratch.push(b'\n');
+
+            output.write_record(scratch);
+            return;
+        }
+
+        //
+        // Slow path: ... needs truncation. Window is chosen around the first
+        // match, with ellipsis markers on truncated sides.
+        //
+        let first_match_start = matches
+            .first()
+            .map(|&(s, _)| (s as usize).min(line.len()))
+            .unwrap_or(0);
+
+        //
+        // Worst-case budget reserves room for both ellipses; if only one
+        // side ends up truncated we simply waste up to 3 bytes of width.
+        //
+        let content_budget = MAX_DISPLAY - ELLIPSIS.len() * 2;
+
+        //
+        // ~1/3 of the budget as leading context, the rest for the match + tail.
+        //
+        let context_before = content_budget / 3;
+        let mut start = first_match_start.saturating_sub(context_before);
+
+        //
+        // Snap start down to a UTF-8 boundary.
+        //
+        while start > 0 && start < line.len() && (line[start] & 0xC0) == 0x80 {
+            start -= 1;
+        }
+
+        let mut end = start + truncate_utf8(&line[start..], content_budget).len();
+
+        //
+        // If we reached EOL with budget to spare, pull `start` further back.
+        //
+        if end == line.len() && start > 0 {
+            let slack = content_budget - (end - start);
+            if slack > 0 {
+                let mut new_start = start.saturating_sub(slack);
+
+                while new_start > 0
+                && new_start < line.len()
+                && (line[new_start] & 0xC0) == 0x80
+                {
+                    new_start -= 1;
+                }
+
+                if line.len() - new_start <= content_budget {
+                    start = new_start;
+                    end   = line.len();
+                }
+            }
+        }
+
+        let pre_ell     = start > 0;
+        let post_ell    = end < line.len();
+        let display     = unsafe { line.get_unchecked(start..end) };
+        let display_len = display.len();
+
+        let mut reserve_len = display_len + 1;
+        if pre_ell  { reserve_len += ELLIPSIS.len(); }
+        if post_ell { reserve_len += ELLIPSIS.len(); }
         if should_print_color {
             reserve_len += matches.len() * (COLOR_RED.len() + COLOR_RESET.len());
         }
         scratch.reserve(reserve_len);
 
-        let mut last = 0;
+        if pre_ell {
+            scratch.extend_from_slice(ELLIPSIS);
+        }
+
+        let mut last = 0usize;
+        let abs_end = end;   // == start + display_len
+
         for &(s, e) in matches {
             let s = s as usize;
             let e = e as usize;
 
-            if s >= display.len() { break; }
+            if s >= abs_end  { break; }
+            if e <= start    { continue; }   // match fully to the left of the window
 
-            let e = e.min(display.len());
+            let ds = s.saturating_sub(start).min(display_len);
+            let de = e.saturating_sub(start).min(display_len);
 
-            debug_assert!(last <= s && s <= display.len());
-            scratch.extend_from_slice(unsafe { display.get_unchecked(last..s) });
+            debug_assert!(last <= ds && ds <= display_len);
+            scratch.extend_from_slice(unsafe { display.get_unchecked(last..ds) });
 
             if should_print_color { scratch.extend_from_slice(COLOR_RED.as_bytes()); }
 
-            debug_assert!(s <= e && e <= display.len());
-            scratch.extend_from_slice(unsafe { display.get_unchecked(s..e) });
+            debug_assert!(ds <= de && de <= display_len);
+            scratch.extend_from_slice(unsafe { display.get_unchecked(ds..de) });
 
             if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
 
-            last = e;
+            last = de;
         }
 
         scratch.extend_from_slice(unsafe { display.get_unchecked(last..) });
+        if post_ell {
+            scratch.extend_from_slice(ELLIPSIS);
+        }
         scratch.push(b'\n');
 
         output.write_record(scratch);
@@ -2082,8 +2215,6 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
                 break;
             }
 
-            active_workers.fetch_add(1, Ordering::Release);
-
             let work = self.find_work(
                 local_worker,
                 injector,
@@ -2093,6 +2224,7 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
 
             match work {
                 Some(work_item) => {
+                    active_workers.fetch_add(1, Ordering::Release);
                     idle_iterations = 0;
 
                     _ = match work_item {
@@ -2104,32 +2236,26 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
                 }
 
                 None => {
-                    // Didn't find anything this iteration, go back to idle
-                    // before checking whether the whole search is done.
-                    active_workers.fetch_sub(1, Ordering::Release);
-
                     idle_iterations += 1;
                     self.flush_output();
 
-                    if active_workers.load(Ordering::Acquire) == 0 {
-                        if injector.is_empty() && local_worker.is_empty() {
-                            running.store(false, Ordering::Release);
-                            {
-                                let (lock, cvar) = running_signal;
-                                let _guard = lock.lock();
-                                cvar.notify_all();
-                            }
-                            break;
-                        }
+                    if active_workers.load(Ordering::Acquire) == 0
+                        && injector.is_empty()
+                        && local_worker.is_empty()
+                    {
+                        running.store(false, Ordering::Release);
+                        let (lock, cvar) = running_signal;
+                        let _guard = lock.lock();
+                        cvar.notify_all();
+                        break;
                     }
 
-                    // @Constant @Tune
                     if idle_iterations < 10 {
                         std::hint::spin_loop();
                     } else if idle_iterations < 20 {
                         std::thread::yield_now();
                     } else {
-                        std::thread::sleep(Duration::from_micros(10));
+                        std::thread::sleep(Duration::from_micros(20));
                     }
                 }
             }
@@ -2171,15 +2297,10 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
         //
         // Steal from others
         //
-        let start = if *consecutive_steals < 3 {
-            (self.worker_id as usize + 1) % stealers.len() // @Constant @Tune
-        } else {
-            fastrand::usize(..stealers.len())
-        };
-
+        let start = fastrand::usize(..stealers.len());
         for i in 0..stealers.len() {
             let victim_id = (start + i) % stealers.len();
-            if victim_id == self.worker_id as usize {
+            if victim_id == self.worker_id as usize || stealers[victim_id].is_empty() {
                 continue;
             }
 

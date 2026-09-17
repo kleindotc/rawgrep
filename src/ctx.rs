@@ -69,12 +69,13 @@ pub struct RawGrepCtx<S: MatchSink> {
 
 impl<S: MatchSink + 'static> RawGrepCtx<S> {
     #[inline]
-    pub fn new(num_threads: usize, running: Arc<AtomicBool>) -> Self {
-        let plumbing = setup_output_plumbing();
+    pub fn new(worker_count: usize, running: Arc<AtomicBool>) -> Self {
+        let plumbing = setup_output_plumbing(worker_count);
 
         let ctx = Self {
-            injector: Arc::default(),
             running,
+            worker_count,
+            injector: Arc::default(),
             active_workers: Arc::default(),
             job_done: Arc::default(),
             running_signal: Arc::default(),
@@ -82,26 +83,27 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             _cursor_hide_for_tty: plumbing.cursor_hide,
             current_job: Arc::default(),
             output_tx: plumbing.output_tx,
-            worker_count: num_threads,
             stdout_is_being_redirected_to_dev_null: plumbing.stdout_is_being_redirected_to_dev_null,
             flush_ack_rx: plumbing.flush_ack_rx,
         };
 
-        ctx.spawn_workers(num_threads, plumbing.output_kind, true);
+        ctx.spawn_workers(worker_count, plumbing.output_kind, true);
         ctx
     }
 
-    fn spawn_workers(&self, num_threads: usize, output_kind: OutputKind, print_line_numbers: bool) {
-        let mut local_workers = Vec::with_capacity(num_threads);
-        let mut stealers      = Vec::with_capacity(num_threads);
-        for _ in 0..num_threads {
+    fn spawn_workers(&self, worker_count: usize, output_kind: OutputKind, print_line_numbers: bool) {
+        let topology = crate::topology::detect();
+        let (worker_cores, _) = topology.claim(worker_count);
+
+        let mut local_workers = Vec::with_capacity(worker_count);
+        let mut stealers      = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
             let w = DequeWorker::new_lifo();
             stealers.push(w.stealer());
             local_workers.push(w);
         }
 
-        let mut slot_pools = OutputSlotPool::new_for_workers(num_threads);
-        let num_cores      = crate::util::num_physical_cores_or(num_threads);
+        let mut slot_pools = OutputSlotPool::new_for_workers(worker_count);
         let pacer_enabled  = !self.stdout_is_being_redirected_to_dev_null && output_kind == OutputKind::Tty;
         let pacer          = Arc::new(FlushPacer::new(pacer_enabled));
         let stealers       = Arc::new(stealers);
@@ -111,9 +113,10 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             let stealers  = stealers.clone();
             let pacer     = pacer.clone();
             let slot_pool = slot_pools.pop().unwrap();
+            let core      = worker_cores[worker_id];
 
             std::thread::spawn(move || {
-                crate::util::pin_thread_to_core(worker_id % num_cores);
+                crate::util::pin_thread_to_core(core);
 
                 worker_thread_main(
                     worker_id as _,
@@ -136,26 +139,26 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     /// there is nothing here that helps search #2 onward, use `new` +
     /// `search` instead.
     pub fn new_for_single_search(
-        num_threads: usize,
+        worker_count: usize,
         running: Arc<AtomicBool>,
         config: &RawGrepConfig,
         sink: S,
         inspect_before_search: impl FnOnce(&Path, &str, FsType, &str),
     ) -> Result<Self, Error> {
         let (job, work) = build_job_and_initial_work(config, sink, inspect_before_search)?;
-        let plumbing = setup_output_plumbing();
+        let plumbing = setup_output_plumbing(worker_count);
 
         let ctx = Self {
-            injector: Arc::new(Injector::new()),
             running,
+            worker_count,
+            injector: Arc::new(Injector::new()),
             active_workers: Arc::default(),
-            job_done: Arc::new((Mutex::new(num_threads), Condvar::new())),
+            job_done: Arc::new((Mutex::new(worker_count), Condvar::new())),
             running_signal: Arc::default(),
             wake: Arc::new((Mutex::new(1u64), Condvar::new())),
             _cursor_hide_for_tty: plumbing.cursor_hide,
             current_job: Arc::new(RwLock::new(Some(Arc::new(job)))),
             output_tx: plumbing.output_tx,
-            worker_count: num_threads,
             stdout_is_being_redirected_to_dev_null: plumbing.stdout_is_being_redirected_to_dev_null,
             flush_ack_rx: plumbing.flush_ack_rx,
         };
@@ -164,7 +167,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         ctx.running.store(true, Ordering::SeqCst);
 
         ctx.spawn_workers(
-            num_threads,
+            worker_count,
             plumbing.output_kind,
             config.line_numbers || (!config.no_line_numbers && plumbing.output_kind == OutputKind::Tty)
         );
@@ -500,11 +503,13 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
         debug!(
             "[ctx] worker {worker_id} search #{search_count} done - \
-             files_encountered={} files_searched={} files_with_matches={} slot_pool_spill_count={}",
+             files_encountered={} files_searched={} bytes_searched={} files_with_matches={} slot_pool_spill_count={}",
+
             result.stats.files_encountered,
             result.stats.files_searched,
+            result.stats.bytes_searched,
             result.stats.files_contained_matches,
-            output.pool.spill_count()
+            output.pool.spill_count(),
         );
 
         // Deposit cache data
@@ -650,7 +655,7 @@ struct OutputPlumbing {
     cursor_hide:  Option<CursorHide>,
 }
 
-fn setup_output_plumbing() -> OutputPlumbing {
+fn setup_output_plumbing(worker_count: usize) -> OutputPlumbing {
     let (output_tx, output_rx)       = unbounded();
     let (flush_ack_tx, flush_ack_rx) = unbounded();
 
@@ -664,7 +669,11 @@ fn setup_output_plumbing() -> OutputPlumbing {
     };
 
     if let Some((raw_stdout, _raw_fd)) = raw_stdout {
+        let topology = crate::topology::detect();
+
         _ = std::thread::spawn(move || {
+            place_output_worker(&topology, worker_count);
+
             OutputWorker {
                 rx: output_rx,
                 flush_ack_tx,
@@ -682,5 +691,15 @@ fn setup_output_plumbing() -> OutputPlumbing {
         stdout_is_being_redirected_to_dev_null,
         output_kind,
         cursor_hide
+    }
+}
+
+fn place_output_worker(topology: &crate::topology::CoreTopology, worker_count: usize) {
+    let (worker_cores, free) = topology.claim(worker_count);
+
+    match free {
+        Some(lp) => crate::util::pin_thread_to_core(lp),
+
+        None     => crate::topology::pin_thread_to_core_deprioritized(*worker_cores.last().unwrap()),
     }
 }

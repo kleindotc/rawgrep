@@ -33,6 +33,7 @@ pub mod pacer;
 pub mod fragments;
 pub mod platform;
 pub mod output;
+pub mod topology;
 pub mod thin_path_arc;
 pub mod binary_ext;
 pub mod extractor;
@@ -133,8 +134,7 @@ impl RawGrepConfig {
             no_line_numbers:  false,
             line_numbers:     true,
             should_ignore_reserved_tool_dir_filter: false,
-            threads:          std::thread::available_parallelism()
-                                  .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) }),
+            threads: crate::topology::default_worker_count(),
             no_cache:         false,
             cache_size_mb:    100,
             cache_dir:        Some(PathBuf::from("~/.cache/rawgrep").into()),  // @Cleanup

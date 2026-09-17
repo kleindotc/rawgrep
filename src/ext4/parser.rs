@@ -127,7 +127,7 @@ impl RawFs for Ext4Fs {
 
         let in_block = (inode_offset - block_start) as usize;
         let end = (in_block + inode_size).min(cache.buf.len());
-        (Self::decode_inode(inode_num as u64, &cache.buf[in_block..end], self.sb.inode_size), stats)
+        (Ok(Self::decode_inode(inode_num as u64, &cache.buf[in_block..end], self.sb.inode_size)), stats)
     }
 
     #[inline(always)]
@@ -165,7 +165,7 @@ impl RawFs for Ext4Fs {
 
         self.read_at_offset(buf, inode_offset as _)?;
 
-        Self::decode_inode(file_id, buf, self.sb.inode_size)
+        Ok(Self::decode_inode(file_id, buf, self.sb.inode_size))
     }
 
     #[inline(always)]
@@ -221,7 +221,7 @@ impl RawFs for Ext4Fs {
         buf.reserve(size_to_read);
 
         #[cfg(unix)]
-        let fd = self.file.as_raw_fd();
+        let fd = self.device_file().as_raw_fd();
 
         #[cfg(unix)]
         const PREFETCH_AHEAD: usize = 4;
@@ -682,7 +682,8 @@ impl Ext4Fs {
                         len: ee_len,
                         _pad: [0; 6],
                     };
-                    let bytes = bytemuck::bytes_of(&extent);
+
+                    let bytes = util::cast_slice(core::slice::from_ref(&extent));
                     scratch.extend_from_slice(bytes);
                 }
             }
@@ -709,7 +710,7 @@ impl Ext4Fs {
 
             #[cfg(unix)]
             {
-                let fd = self.file.as_raw_fd();
+                let fd = self.device_file().as_raw_fd();
                 for &cb in &child_blocks[mark..] {
                     unsafe {
                         libc::posix_fadvise(
@@ -724,10 +725,10 @@ impl Ext4Fs {
 
             let count = child_blocks.len() - mark;
 
+            let mut probe = std::mem::MaybeUninit::<[u8; 8192]>::uninit();  // ext4 block size is at most 8192 bytes  // @Memory @Speed
+
             for child in 0..count {
                 let child_block = child_blocks[mark + child];
-
-                let mut probe = std::mem::MaybeUninit::<[u8; 8192]>::uninit();  // ext4 block size is at most 8192 bytes
 
                 let probe = unsafe {
                     std::slice::from_raw_parts_mut(probe.as_mut_ptr() as *mut u8, block_size as usize)
@@ -747,36 +748,50 @@ impl Ext4Fs {
 
     /// Decode one inode from a byte slice already containing its raw record.
     #[inline]
-    fn decode_inode(inode_num: u64, mode_flags_src: &[u8], inode_size_field: u16) -> io::Result<Ext4Inode> {
-        let raw_size = mem::size_of::<raw::Ext4Inode>().min(mode_flags_src.len());
-        let raw = bytemuck::try_from_bytes::<raw::Ext4Inode>(  // @Speed
-            &mode_flags_src[..raw_size]
-        ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid inode data"))?;
+    fn decode_inode(inode_num: u64, src: &[u8], inode_size_field: u16) -> Ext4Inode {
+        const I_MODE:       usize = 0x00;
+        const I_SIZE_LO:    usize = 0x04;
+        const I_MTIME:      usize = 0x10;
+        const I_FLAGS:      usize = 0x20;
+        const I_BLOCK:      usize = 0x28;
+        const I_SIZE_HIGH:  usize = 0x6C;
 
-        let mode      = u16::from_le(raw.mode);
-        let size_low  = u32::from_le(raw.size_lo);
-        let flags     = u32::from_le(raw.flags);
-        let mtime_sec = u32::from_le(raw.mtime) as i64;
+        const I_BLOCK_LEN:  usize = 60;  // 15 u32 block pointers / the extent header + extents
+        const I_HEADER_MIN: usize = I_SIZE_HIGH + 4;
 
-        let size_high = if inode_size_field > 128 {
-            u32::from_le(raw.size_high)
+        let mode      = read_u16_unaligned_le(src, I_MODE);
+        let size_lo   = read_u32_unaligned_le(src, I_SIZE_LO);
+        let mtime_sec = read_u32_unaligned_le(src, I_MTIME) as i64;
+        let flags     = read_u32_unaligned_le(src, I_FLAGS);
+
+        let size_high = if inode_size_field > 128 && src.len() >= I_HEADER_MIN {
+            read_u32_unaligned_le(src, I_SIZE_HIGH)
         } else {
             0
         };
 
-        let size = ((size_high as u64) << 32) | (size_low as u64);
+        let size = ((size_high as u64) << 32) | (size_lo as u64);
+
+        let mut blocks = [0u32; 15];
 
         #[cfg(target_endian = "little")]
-        let blocks: [u32; 15] = bytemuck::cast(raw.block);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().add(I_BLOCK),
+                blocks.as_mut_ptr() as *mut u8,
+                I_BLOCK_LEN,
+            );
+        }
 
         #[cfg(target_endian = "big")]
-        let blocks: [u32; 15] = {
-            let raw_block = [raw.block];
-            let block_bytes = util::cast_slice::<[[u8; 12]; 5], u8>(&raw_block);
-            let as_u32: &[u32] = util::cast_slice(block_bytes);
-            std::array::from_fn(|i| u32::from_le(as_u32[i]))
-        };
+        {
+            let mut i = 0;
+            while i < 15 {
+                blocks[i] = read_u32_unaligned_le(src, I_BLOCK + i * 4);
+                i += 1;
+            }
+        }
 
-        Ok(Ext4Inode { inode_num, mode, size, flags, mtime_sec, blocks })
+        Ext4Inode { inode_num, mode, size, flags, mtime_sec, blocks }
     }
 }

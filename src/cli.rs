@@ -121,10 +121,7 @@ pub struct Cli {
         short('t'),
         long("threads"),
         argument("THREADS"),
-        fallback(
-            std::thread::available_parallelism()
-                .unwrap_or(unsafe { NonZeroUsize::new_unchecked(1) })
-        )
+        fallback(crate::topology::default_worker_count())
     )]
     pub threads: NonZeroUsize,
 

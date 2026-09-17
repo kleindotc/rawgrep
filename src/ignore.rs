@@ -567,6 +567,14 @@ impl Gitignore {
     }
 
     /// Check if ignored, returns bool (for non-negation fast path)
+    #[allow(dead_code, reason = "tests")]
+    #[inline(always)]
+    pub fn is_ignored_with_filename(&self, path: &[u8], filename: &[u8], is_dir: bool) -> bool {
+        let filename_hash = fnv1a(filename);
+        self.is_ignored_with_filename_hashed(path, filename, is_dir, filename_hash)
+    }
+
+    /// Check if ignored, returns bool (for non-negation fast path)
     #[inline(always)]
     pub fn is_ignored_with_filename_hashed(&self, path: &[u8], filename: &[u8], is_dir: bool, filename_hash: u64) -> bool {
         if self.order.is_empty() {
