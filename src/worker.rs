@@ -13,13 +13,14 @@ use crate::ignore::{Gitignore, GitignoreChain};
 use crate::matcher::{Matcher, MatcherCache};
 use crate::binary::{is_binary_ext, is_reserved_tool_dir};
 use crate::path_buf::SmallPathBuf;
+use crate::color::COLOR_RESET;
 use crate::fragments::FragmentLen;
 use crate::stats::Stats;
 use crate::stdout::{RawStdout, IOV_MAX};
 use crate::thin_path_arc::ThinPathArc;
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs};
 use crate::util::{likely, truncate_utf8, unlikely, prefetch_read};
-use crate::{tracy, COLOR_CYAN, COLOR_GREEN, COLOR_RED, COLOR_RESET};
+use crate::tracy;
 
 use std::ops::Not;
 use std::path::MAIN_SEPARATOR;
@@ -539,6 +540,10 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
 
     // ----- Cold / output plumbing ----
     pub sink: S,
+
+    pub red:   &'static str,
+    pub cyan:  &'static str,
+    pub green: &'static str,
 }
 
 impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
@@ -1365,6 +1370,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                     should_print_color,
                     should_print_line_numbers,
                     &mut self.sink,
+                    self.red, self.green, self.cyan
                 );
 
                 scan_pos = (line_end + C::UNIT_WIDTH).min(buf_len);
@@ -1446,6 +1452,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                     should_print_color,
                     should_print_line_numbers,
                     &mut self.sink,
+                    self.red, self.green, self.cyan
                 );
             }
 
@@ -1592,6 +1599,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                     should_print_color,
                     should_print_line_numbers,
                     &mut self.sink,
+                    self.red, self.green, self.cyan
                 );
 
                 scan_pos = (line_end + 1).min(process_until);
@@ -1650,6 +1658,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                     should_print_color,
                     should_print_line_numbers,
                     &mut self.sink,
+                    self.red, self.green, self.cyan
                 );
             }
 
@@ -1764,6 +1773,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 should_print_color,
                 should_print_line_numbers,
                 &mut self.sink,
+                self.red, self.green, self.cyan
             );
 
             scan_pos = (line_end + 1).min(decoded_len);
@@ -1885,15 +1895,22 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     fn emit_match(
         output:                                  &mut OutputSlotWriter,
         scratch2:                                &mut Vec<u8>,
+
         cli:                                     &Cli,
         path:                                    &[u8],
+
         found_any:                               &mut bool,
+
         line_num:                                 u32,
         line:                                    &[u8],
         matches:                                 &[(u32, u32)],
+
         should_print_color:                       bool,
         should_print_line_numbers:                bool,
+
         sink:                                    &mut S,
+
+        red:   &'static str, green: &'static str, cyan:  &'static str,
     ) {
         if !*found_any {
             //
@@ -1902,7 +1919,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             *found_any = true;
 
-            Self::write_file_header(scratch2, cli, path, should_print_color);
+            Self::write_file_header(scratch2, cli, path, should_print_color, green);
         }
 
         Self::write_match_line(
@@ -1915,6 +1932,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             matches,
             should_print_color,
             should_print_line_numbers,
+            red, green, cyan,
         );
 
         if S::STDOUT_NOP {  // @Memory
@@ -1937,6 +1955,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         should_print_color:       bool,
         should_print_line_number: bool,
+
+        red:   &'static str,
+        green: &'static str,
+        cyan:  &'static str,
     ) {
         const MAX_DISPLAY: usize = 500;
         const ELLIPSIS:    &[u8] = b"...";
@@ -1952,7 +1974,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         {
             let mut prefix_len = line_num_str.len() + 2; // digits + ": "
             if should_print_color {
-                prefix_len += COLOR_CYAN.len() + COLOR_RESET.len();
+                prefix_len += cyan.len() + COLOR_RESET.len();
             }
 
             if cli.jump {
@@ -1960,7 +1982,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
                 prefix_len += root.len() + usize::from(!ends_with_slash) + path.len() + 1; // ':'
                 if should_print_color {
-                    prefix_len += COLOR_GREEN.len() + COLOR_RESET.len();
+                    prefix_len += green.len() + COLOR_RESET.len();
                 }
             }
 
@@ -1968,7 +1990,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         }
 
         if cli.jump {
-            if should_print_color { scratch.extend_from_slice(COLOR_GREEN.as_bytes()); }
+            if should_print_color { scratch.extend_from_slice(green.as_bytes()); }
 
             let root = cli.search_root_path.as_bytes();
             let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
@@ -1983,7 +2005,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         }
 
         if !line_num_str.is_empty() {
-            if should_print_color { scratch.extend_from_slice(COLOR_CYAN.as_bytes()); }
+            if should_print_color { scratch.extend_from_slice(cyan.as_bytes()); }
             scratch.extend_from_slice(line_num_str.as_bytes());
             if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
 
@@ -2000,7 +2022,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             let mut reserve_len = display.len() + 1;
             if should_print_color {
-                reserve_len += matches.len() * (COLOR_RED.len() + COLOR_RESET.len());
+                reserve_len += matches.len() * (red.len() + COLOR_RESET.len());
             }
             scratch.reserve(reserve_len);
 
@@ -2015,7 +2037,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 debug_assert!(last <= s && s <= display.len());
                 scratch.extend_from_slice(unsafe { display.get_unchecked(last..s) });
 
-                if should_print_color { scratch.extend_from_slice(COLOR_RED.as_bytes()); }
+                if should_print_color {
+                    scratch.extend_from_slice(crate::color::BOLD.as_bytes()); // @Incomplete: Check if whatever we output to supports bold?...
+                    scratch.extend_from_slice(red.as_bytes());
+                }
 
                 debug_assert!(s <= e && e <= display.len());
                 scratch.extend_from_slice(unsafe { display.get_unchecked(s..e) });
@@ -2093,7 +2118,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         if pre_ell  { reserve_len += ELLIPSIS.len(); }
         if post_ell { reserve_len += ELLIPSIS.len(); }
         if should_print_color {
-            reserve_len += matches.len() * (COLOR_RED.len() + COLOR_RESET.len());
+            reserve_len += matches.len() * (red.len() + COLOR_RESET.len());
         }
         scratch.reserve(reserve_len);
 
@@ -2117,7 +2142,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             debug_assert!(last <= ds && ds <= display_len);
             scratch.extend_from_slice(unsafe { display.get_unchecked(last..ds) });
 
-            if should_print_color { scratch.extend_from_slice(COLOR_RED.as_bytes()); }
+            if should_print_color { scratch.extend_from_slice(red.as_bytes()); }
 
             debug_assert!(ds <= de && de <= display_len);
             scratch.extend_from_slice(unsafe { display.get_unchecked(ds..de) });
@@ -2138,14 +2163,16 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
     #[inline(always)]
     fn write_file_header(
-        scratch:           &mut Vec<u8>,
-        cli:               &Cli,
-        path:              &[u8],
+        scratch:            &mut Vec<u8>,
+        cli:                &Cli,
+        path:               &[u8],
         should_print_color: bool,
+
+        green: &'static str,
     ) {
         if cli.jump { return }  // Jump mode writes path per-line, not as a header
 
-        if should_print_color { scratch.extend_from_slice(COLOR_GREEN.as_bytes()); }
+        if should_print_color { scratch.extend_from_slice(green.as_bytes()); }
 
         let root = cli.search_root_path.as_bytes();
         let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
@@ -2154,7 +2181,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         {
             let mut len = root.len() + usize::from(!ends_with_slash) + path.len() + 2; // ":\n"
             if should_print_color {
-                len += COLOR_GREEN.len() + COLOR_RESET.len();
+                len += green.len() + COLOR_RESET.len();
             }
             scratch.reserve(len);
         }

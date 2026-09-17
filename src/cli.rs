@@ -10,6 +10,30 @@ pub fn should_enable_ansi_coloring() -> bool {
     SHOULD_ENABLE_ANSI_COLORING.get().copied().unwrap_or(false)
 }
 
+/// When to emit ANSI color codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorMode {
+    Never,
+    Always,
+    #[default]
+    Auto,
+}
+
+impl core::str::FromStr for ColorMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "never"  => Ok(ColorMode::Never),
+            "always" => Ok(ColorMode::Always),
+            "auto"   => Ok(ColorMode::Auto),
+            other    => Err(format!(
+                "invalid value '{other}' for --color (expected: never, always, auto)"
+            )),
+        }
+    }
+}
+
 pub struct BufferConfig {
     pub output_buf: usize,
     pub dir_buf: usize,
@@ -28,8 +52,6 @@ pub struct BufferConfig {
 // TODO(#15): add -o / --only-matching
 // TODO(#14): add -q / --quiet (stop after first match)
 // TODO(#13): add --glob / --glob-case-insensitive / --type / --type-not
-// TODO(#16): add color modes: auto|never|always
-// TODO(#17): detect TTY for default color behavior
 // TODO(#19): add --count (only count matches)
 // TODO(#20): add --max-count N
 // TODO(#21): add --files-with-matches / --files-without-match
@@ -90,9 +112,13 @@ pub struct Cli {
     #[bpaf(short('a'), long("all"))]
     pub all: bool,
 
-    /// Disable colored output (force plain text)
-    #[bpaf(long("no-color"))]
-    pub no_color: bool,
+    /// Control when to emit colored output
+    ///
+    /// never: plain text always
+    /// always: colored output even when piped
+    /// auto: colored output only when stdout is a terminal (default)
+    #[bpaf(long("color"), argument("WHEN"), fallback(ColorMode::Auto))]
+    pub color: ColorMode,
 
     /// Print matches in conventional jumpable format (for VIM, EMACS, etc)
     #[bpaf(short, long)]
@@ -157,11 +183,16 @@ pub struct Cli {
 impl Cli {
     #[inline(always)]
     pub fn parse() -> Self {
-        let cli = cli().run();
+        cli().run()
+    }
 
-        _ = SHOULD_ENABLE_ANSI_COLORING.set(!cli.no_color);
-
-        cli
+    #[inline(always)]
+    pub fn enable_color(&self, is_tty: bool) -> bool {
+        match self.color {
+            ColorMode::Always => true,
+            ColorMode::Never  => false,
+            ColorMode::Auto   => is_tty
+        }
     }
 
     /// Returns true if should search large files

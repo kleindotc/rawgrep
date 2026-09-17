@@ -17,6 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -144,6 +145,8 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         sink: S,
         inspect_before_search: impl FnOnce(&Path, &str, FsType, &str),
     ) -> Result<Self, Error> {
+        _ = cli::SHOULD_ENABLE_ANSI_COLORING.set(config.enable_color(std::io::stdout().is_terminal()));
+
         let (job, work) = build_job_and_initial_work(config, sink, inspect_before_search)?;
         let plumbing = setup_output_plumbing(worker_count);
 
@@ -278,7 +281,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         sink: S,
         inspect_before_search: impl FnOnce(&Path, &str, FsType, &str) // (search root, device, fs, pattern)
     ) -> Result<(), Error> {
-        _ = cli::SHOULD_ENABLE_ANSI_COLORING.set(!config.no_color);
+        _ = cli::SHOULD_ENABLE_ANSI_COLORING.set(config.enable_color(std::io::stdout().is_terminal()));
 
         debug!("[ctx] search() pattern={:?} root={:?}", config.pattern, config.search_root_path);
 
@@ -466,9 +469,13 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     check_mask: 0x001F,
                     chunk_carry:      None, // @Memory: Cache this as well.
 
+                    red:   $crate::color::red::code(),
+                    green: $crate::color::green::code(),
+                    cyan:  $crate::color::cyan::code(),
+
                     pending_file_keys: file_keys,
                     pending_file_metas: file_metas,
-                    pending_fragment_presence: fragment_presence
+                    pending_fragment_presence: fragment_presence,
                 }.start_worker_loop(
                     &ctx.running,
                     &ctx.running_signal,
@@ -540,7 +547,6 @@ fn build_job_and_initial_work<S: MatchSink + 'static>(
     inspect_before_search: impl FnOnce(&Path, &str, FsType, &str),
 ) -> Result<(SearchJob<S>, WorkItem), Error> {
     let cli = config.to_cli();
-    _ = cli::SHOULD_ENABLE_ANSI_COLORING.set(!config.no_color);
 
     //
     // Open device and detect fs
@@ -692,7 +698,6 @@ fn place_output_worker(topology: &crate::topology::CoreTopology, worker_count: u
 
     match free {
         Some(lp) => crate::util::pin_thread_to_core(lp),
-
         None     => crate::topology::pin_thread_to_core_deprioritized(*worker_cores.last().unwrap()),
     }
 }

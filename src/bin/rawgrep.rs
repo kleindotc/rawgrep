@@ -34,9 +34,9 @@ fn main() -> io::Result<()> {
             eprint_blue!("on device ");
             eprint_green!("'{device}' ");
             eprint_blue!("with fs ");
-            eprint_green!("'{fs:?}' ");
-            eprint_blue!("for pattern: ");
-            eprintln_red!("'{pattern}'");
+            eprint_green!("{fs:?} ");
+            eprint_blue!("for pattern ");
+            eprintln_red!("{b}{pattern}", b = rawgrep::color::BOLD);
         }
     ) {
         Ok((stats, cache_stats)) => {

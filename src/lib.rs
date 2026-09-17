@@ -23,6 +23,7 @@ pub mod stats;
 pub mod tracy;
 pub mod stdout;
 pub mod ignore;
+pub mod color;
 pub mod parser;
 pub mod error;
 pub mod worker;
@@ -53,13 +54,7 @@ pub use ctx::RawGrepCtx;
 use grep::FsType;
 use worker::MatchSink;
 
-pub const COLOR_RED: &str = "\x1b[1;31m";
-pub const COLOR_GREEN: &str = "\x1b[1;32m";
-pub const COLOR_BLUE: &str = "\x1b[1;34m";
-pub const COLOR_CYAN: &str = "\x1b[1;36m";
-pub const COLOR_RESET: &str = "\x1b[0m";
-
-pub const CURSOR_HIDE: &str = "\x1b[?25l";
+pub const CURSOR_HIDE:   &str = "\x1b[?25l";
 pub const CURSOR_UNHIDE: &str = "\x1b[?25h";
 
 use std::sync::Arc;
@@ -93,7 +88,7 @@ pub struct RawGrepConfig {
     // ---- output ---------------------------------------------------------
     pub line_numbers:   bool,
     pub no_line_numbers:bool,
-    pub no_color:       bool,
+    pub color:          cli::ColorMode,
     pub jump:           bool,
     pub stats:          bool,
 
@@ -125,7 +120,7 @@ impl RawGrepConfig {
             no_cache_write:   false,
             all:              false,
             unrestricted:     0,
-            no_color:         false,
+            color:            cli::ColorMode::Auto,
             jump:             false,
             stats:            false,
             no_require_git:   false,
@@ -144,7 +139,7 @@ impl RawGrepConfig {
     }
 
     pub fn device(mut self, d: impl Into<Box<str>>)     -> Self { self.device = Some(d.into());    self }
-    pub fn no_color(mut self)                           -> Self { self.no_color      = true;       self }
+    pub fn color(mut self, mode: cli::ColorMode)        -> Self { self.color      = mode;       self }
     pub fn no_require_git(mut self)                     -> Self { self.no_require_git          = true;       self }
     pub fn word_regexp(mut self)                        -> Self { self.word_regexp          = true;       self }
     pub fn jump(mut self)                               -> Self { self.jump          = true;       self }
@@ -184,7 +179,7 @@ impl RawGrepConfig {
             word_regexp:      c.word_regexp,
             no_cache_write:   c.no_cache_write,
             unrestricted:     c.unrestricted,
-            no_color:         c.no_color,
+            color:            c.color,
             jump:             c.jump,
             stats:            c.stats,
             force_literal:    c.force_literal,
@@ -215,7 +210,7 @@ impl RawGrepConfig {
             all:              self.all,
             unrestricted:     self.unrestricted,
             word_regexp:      self.word_regexp,
-            no_color:         self.no_color,
+            color:            self.color,
             jump:             self.jump,
             stats:            self.stats,
             force_literal:    self.force_literal,
@@ -225,6 +220,15 @@ impl RawGrepConfig {
             cache_size_mb:    self.cache_size_mb,
             cache_dir:        self.cache_dir.clone().map(std::path::PathBuf::from),
             rebuild_cache:    self.rebuild_cache,
+        }
+    }
+
+    #[inline(always)]
+    pub fn enable_color(&self, is_tty: bool) -> bool {
+        match self.color {
+            cli::ColorMode::Always => true,
+            cli::ColorMode::Never  => false,
+            cli::ColorMode::Auto   => is_tty
         }
     }
 }
@@ -253,8 +257,7 @@ pub fn run_with_inspect<S: MatchSink + 'static>(
     sink: S,
     inspect_before_search: impl FnOnce(&Path, &str, FsType, &str) // (search root, device, fs, pattern)
 ) -> Result<(Stats, Option<CacheStats>)> {
-    let threads = config.threads.get();
-    let mut ctx = RawGrepCtx::new(threads, running);
+    let mut ctx = RawGrepCtx::new(config.threads.get(), running);
     ctx.search(&config, sink, inspect_before_search)?;
     Ok(ctx.wait_and_save_cache(&config))
 }
@@ -266,8 +269,10 @@ pub fn run_with_inspect_for_single_search<S: MatchSink + 'static>(
     sink: S,
     inspect_before_search: impl FnOnce(&Path, &str, FsType, &str) // (search root, device, fs, pattern)
 ) -> Result<(Stats, Option<CacheStats>)> {
-    let threads = config.threads.get();
-    let mut ctx = RawGrepCtx::new_for_single_search(threads, running, &config, sink, inspect_before_search)?;
+    let mut ctx = RawGrepCtx::new_for_single_search(
+        config.threads.get(), running, &config,
+        sink, inspect_before_search
+    )?;
     Ok(ctx.wait_and_save_cache(&config))
 }
 

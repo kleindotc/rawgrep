@@ -62,6 +62,8 @@ mimalloc          = { version = "=0.1.47", default-features = true,  features = 
 bytemuck          = { version = "1.24",                              features = ["derive"], optional = true }
 tracy-client      = { version = "0.17.3",  default-features = false, features = [],         optional = true }
 
+paste             = "1"
+
 # =======================================================================================================
 # Dependencies only used by src/bin/gitignore_oracle_check.rs
 # =======================================================================================================
