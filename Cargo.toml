@@ -59,7 +59,7 @@ itoa              = { version = "1.0.15",  default-features = false, features = 
 fastrand          = { version = "2.3.0",   default-features = false, features = ["std"] }
 bytemuck          = { version = "1.24",                              features = ["derive"] }
 
-bpaf              = { version = "0.9.27",  default-features = false, features = ["derive"], }
+bpaf              = { version = "0.9.27",  default-features = false, features = ["derive"] }
 nohash-hasher     = { version = "0.2.0",   default-features = false, features = ["std"] }
 parking_lot       = { version =  "0.12.5", default-features = false, features = [] }
 
