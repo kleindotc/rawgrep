@@ -2,23 +2,44 @@
 use std::sync::OnceLock;
 use std::{fs::File, io};
 
+#[cfg(feature = "enable-bytemuck-checks")]
 #[inline(always)]
-pub fn cast_slice<A: bytemuck::NoUninit, B: bytemuck::AnyBitPattern>(a: &[A]) -> &[B] {
-    #[cfg(any(debug_assertions, feature = "enable-bytemuck-checks"))]
-    {
-        bytemuck::cast_slice(a)
-    }
+pub fn try_from_bytes<T: bytemuck::AnyBitPattern>(
+    s: &[u8],
+) -> Result<&T, bytemuck::PodCastError> {
+    bytemuck::try_from_bytes(s)
+}
 
-    #[cfg(not(any(debug_assertions, feature = "enable-bytemuck-checks")))]
+#[cfg(not(feature = "enable-bytemuck-checks"))]
+#[inline(always)]
+#[allow(clippy::result_unit_err)]
+pub fn try_from_bytes<T>(s: &[u8]) -> Result<&T, ()> {
     unsafe {
-        if size_of::<B>() == size_of::<A>() {
-            core::slice::from_raw_parts(a.as_ptr() as *const B, a.len())
-        } else {
-            let new_len =
-                if size_of::<B>() != 0 { size_of_val::<[A]>(a) / size_of::<B>() } else { 0 };
+        Ok(&*(s.as_ptr() as *const T))
+    }
+}
 
-            core::slice::from_raw_parts(a.as_ptr() as *const B, new_len)
-        }
+#[cfg(feature = "enable-bytemuck-checks")]
+#[inline(always)]
+pub fn cast_slice<A: bytemuck::NoUninit, B: bytemuck::AnyBitPattern>(
+    a: &[A],
+) -> &[B] {
+    bytemuck::cast_slice(a)
+}
+
+#[cfg(not(feature = "enable-bytemuck-checks"))]
+#[inline(always)]
+pub fn cast_slice<A, B>(a: &[A]) -> &[B] {
+    if size_of::<B>() == size_of::<A>() {
+        unsafe { core::slice::from_raw_parts(a.as_ptr() as *const B, a.len()) }
+    } else {
+        let new_len = if size_of::<B>() != 0 {
+            size_of_val::<[A]>(a) / size_of::<B>()
+        } else {
+            0
+        };
+
+        unsafe { core::slice::from_raw_parts(a.as_ptr() as *const B, new_len) }
     }
 }
 

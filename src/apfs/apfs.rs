@@ -139,8 +139,6 @@ impl ApfsInode {
 }
 
 pub mod raw {
-    use bytemuck::{Pod, Zeroable};
-
     // -- obj_phys_t ----------------------------------------------------------
     // Every APFS block on-disk starts with this 32-byte header.
     //
@@ -152,7 +150,8 @@ pub mod raw {
     //     uint32_t o_subtype;    // object sub-type
     // };
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[derive(Copy, Clone)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(bytemuck::Pod, bytemuck::Zeroable))]
     pub struct ObjPhys {
         pub o_cksum:   [u8; 8],  // 0x00
         pub o_oid:     u64,      // 0x08
@@ -177,7 +176,8 @@ pub mod raw {
     //
     // nloc_t = { uint16_t off; uint16_t len; }
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[derive(Copy, Clone)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(bytemuck::Pod, bytemuck::Zeroable))]
     pub struct BtreeNodePhys {
         pub btn_o:              ObjPhys,  // 0x00 – 32 bytes
         pub btn_flags:          u16,      // 0x20
@@ -198,7 +198,7 @@ pub mod raw {
     //
     // struct kvoff_t { uint16_t k; uint16_t v; }
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct KvOff {
         pub k: u16,
         pub v: u16,
@@ -208,7 +208,7 @@ pub mod raw {
     //
     // struct kvloc_t { nloc_t k; nloc_t v; }
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct KvLoc {
         pub k_off: u16,
         pub k_len: u16,
@@ -222,7 +222,7 @@ pub mod raw {
     //   bits 63-60 = record type
     //   bits 59-0  = object ID
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct JKey {
         pub obj_id_and_type: u64,
     }
@@ -231,7 +231,7 @@ pub mod raw {
     //
     // (only the fields we actually use; the struct is larger on disk)
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct JInodeVal {
         pub parent_id:   u64,  // 0x00
         pub private_id:  u64,  // 0x08
@@ -261,7 +261,7 @@ pub mod raw {
     //     uint8_t  name[];
     // }
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct JDrecHashedKey {
         pub hdr:               JKey, // 0x00 – 8 bytes
         pub name_len_and_hash: u32,  // 0x08
@@ -278,7 +278,7 @@ pub mod raw {
     //     xf_blob_t xfields[];
     // }
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct JDrecVal {
         pub file_id:    u64,      // 0x00
         pub date_added: u64,      // 0x08
@@ -291,14 +291,14 @@ pub mod raw {
     // struct omap_key_t  { uint64_t ok_oid; uint64_t ok_xid; }
     // struct omap_val_t  { uint32_t ov_flags; uint32_t ov_size; uint64_t ov_paddr; }
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct OmapKey {
         pub ok_oid: u64,
         pub ok_xid: u64,
     }
 
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct OmapVal {
         pub ov_flags: u32,
         pub ov_size:  u32,
@@ -310,14 +310,14 @@ pub mod raw {
     // struct j_phys_ext_key_t { j_key_t hdr; uint64_t logical_addr; }
     // struct j_phys_ext_val_t { uint64_t len_and_flags; uint64_t phys_block_num; uint64_t crypto_id; }
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct JPhysExtKey {
         pub hdr:          JKey,
         pub logical_addr: u64,
     }
 
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct JPhysExtVal {
         pub len_and_flags: u64,  // bits 55-0 = byte length, bits 63-56 = flags
         pub phys_block_num: u64,

@@ -118,8 +118,8 @@ impl NtfsInode {
 }
 
 /// A single run (extent) in an NTFS runlist
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
+#[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
 pub struct NtfsExtent {
     pub lcn: u64,       // logical cluster number on disk (absolute); u64::MAX = sparse
     pub vcn: u64,       // virtual cluster number (offset within file)

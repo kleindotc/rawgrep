@@ -82,8 +82,8 @@ impl Ext4Inode {
     pub const POISONED: Self = unsafe { core::mem::zeroed() };
 }
 
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
+#[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
 pub struct Ext4Extent {
     pub start: u64,
     pub len: u16,
@@ -91,8 +91,6 @@ pub struct Ext4Extent {
 }
 
 pub mod raw {
-    use bytemuck::{Pod, Zeroable};
-
     // Source: Linux kernel: fs/ext4/ext4.h
     // struct ext4_inode {
     //     __le16	i_mode;		/* File mode */
@@ -156,7 +154,7 @@ pub mod raw {
     // };
 
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct Ext4Inode {
         pub mode: u16,              // 0x00
         pub uid: u16,               // 0x02
@@ -197,7 +195,7 @@ pub mod raw {
     // };
 
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct Ext4DirEntry2 {
         pub inode: u32,        // 0x00
         pub rec_len: u16,      // 0x04
@@ -216,7 +214,7 @@ pub mod raw {
     // };
 
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct Ext4ExtentHeader {
         pub eh_magic: u16,          // 0x00 - must be 0xF30A
         pub eh_entries: u16,        // 0x02 - number of valid entries
@@ -234,7 +232,7 @@ pub mod raw {
     // };
 
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct Ext4Extent {
         pub ee_block: u32,          // 0x00 - first logical block extent covers
         pub ee_len: u16,            // 0x04 - number of blocks covered
@@ -252,7 +250,7 @@ pub mod raw {
     // };
 
     #[repr(C)]
-    #[derive(Copy, Clone, Pod, Zeroable)]
+    #[cfg_attr(feature = "enable-bytemuck-checks", derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable))]
     pub struct Ext4ExtentIdx {
         pub ei_block: u32,          // 0x00 - index covers logical blocks from 'block'
         pub ei_leaf_lo: u32,        // 0x04 - low 32 bits of physical block pointer

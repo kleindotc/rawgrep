@@ -15,8 +15,8 @@
 //!   - Encryption (wrapped keys)
 
 use crate::tracy;
+use crate::util::{self, read_at_offset};
 use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
-use crate::util::read_at_offset;
 
 use super::{
     raw, ApfsInode, ApfsSuperBlock, ApfsVolume,
@@ -350,7 +350,7 @@ impl ApfsFs {
                 let toc_off = toc_start + i * kvloc_size;
                 if toc_off + kvloc_size > block.len() { break; }
 
-                let kvloc = bytemuck::try_from_bytes::<raw::KvLoc>(
+                let kvloc = util::try_from_bytes::<raw::KvLoc>(
                     &block[toc_off..toc_off + kvloc_size]
                 ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Bad KvLoc"))?;
 
@@ -360,7 +360,7 @@ impl ApfsFs {
                 if k_off + mem::size_of::<raw::OmapKey>() > block.len() { continue; }
                 if v_off + mem::size_of::<raw::OmapVal>() > block.len() { continue; }
 
-                let key = bytemuck::try_from_bytes::<raw::OmapKey>(
+                let key = util::try_from_bytes::<raw::OmapKey>(
                     &block[k_off..k_off + mem::size_of::<raw::OmapKey>()]
                 ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Bad OmapKey"))?;
 
@@ -368,7 +368,7 @@ impl ApfsFs {
 
                 if is_leaf {
                     if entry_oid == oid {
-                        let val = bytemuck::try_from_bytes::<raw::OmapVal>(
+                        let val = util::try_from_bytes::<raw::OmapVal>(
                             &block[v_off..v_off + mem::size_of::<raw::OmapVal>()]
                         ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Bad OmapVal"))?;
                         found_paddr = Some(u64::from_le(val.ov_paddr));
@@ -377,7 +377,7 @@ impl ApfsFs {
                 } else {
                     // Interior node: keep the largest key ≤ oid
                     if entry_oid <= oid {
-                        let val = bytemuck::try_from_bytes::<raw::OmapVal>(
+                        let val = util::try_from_bytes::<raw::OmapVal>(
                             &block[v_off..v_off + mem::size_of::<raw::OmapVal>()]
                         ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Bad OmapVal (interior)"))?;
                         best_child_paddr = Some(u64::from_le(val.ov_paddr));
@@ -414,7 +414,7 @@ impl ApfsFs {
         if block.len() < sz {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Block too small for btree node"));
         }
-        bytemuck::try_from_bytes::<raw::BtreeNodePhys>(&block[..sz])
+        util::try_from_bytes::<raw::BtreeNodePhys>(&block[..sz])
             .copied()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Corrupt btree node header"))
     }
@@ -460,7 +460,7 @@ impl ApfsFs {
                 let toc_entry_off = toc_off_base + i * kvoff_size;
                 if toc_entry_off + kvoff_size > block.len() { break; }
 
-                let kvoff = bytemuck::try_from_bytes::<raw::KvOff>(
+                let kvoff = util::try_from_bytes::<raw::KvOff>(
                     &block[toc_entry_off..toc_entry_off + kvoff_size]
                 ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Bad KvOff"))?;
 
@@ -470,7 +470,7 @@ impl ApfsFs {
 
                 if k_abs + mem::size_of::<raw::JKey>() > block.len() { continue; }
 
-                let jkey = bytemuck::try_from_bytes::<raw::JKey>(
+                let jkey = util::try_from_bytes::<raw::JKey>(
                     &block[k_abs..k_abs + mem::size_of::<raw::JKey>()]
                 ).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Bad JKey"))?;
 
@@ -534,7 +534,7 @@ impl ApfsFs {
             if val.len() < mem::size_of::<raw::JInodeVal>() {
                 return ControlFlow::Continue(());
             }
-            let raw = match bytemuck::try_from_bytes::<raw::JInodeVal>(
+            let raw = match util::try_from_bytes::<raw::JInodeVal>(
                 &val[..mem::size_of::<raw::JInodeVal>()]
             ) {
                 Ok(r) => r,
@@ -570,13 +570,14 @@ impl ApfsFs {
         self.walk_fs_tree(dir_ino, APFS_TYPE_DIR_REC, |key, val| {
             // key: JDrecHashedKey (16 bytes: JKey(8) + name_len_and_hash(4) + _pad(4)) + name
             let hdr_size = mem::size_of::<raw::JDrecHashedKey>(); // 16
+
             // The actual name starts at hdr_size - 4 because _pad is not on-disk data;
             // however since we use bytemuck on the raw block bytes directly and the
             // on-disk key layout is JKey(8)+u32(4)+name[], we read the name at offset 12.
             let name_offset_in_key = 12usize; // JKey(8) + name_len_and_hash(4)
             if key.len() < hdr_size { return ControlFlow::Continue(()); }
 
-            let hdr = match bytemuck::try_from_bytes::<raw::JDrecHashedKey>(
+            let hdr = match util::try_from_bytes::<raw::JDrecHashedKey>(
                 &key[..hdr_size]
             ) {
                 Ok(h) => h,
@@ -597,7 +598,7 @@ impl ApfsFs {
             let val_size = mem::size_of::<raw::JDrecVal>(); // 18
             if val.len() < val_size { return ControlFlow::Continue(()); }
 
-            let drec = match bytemuck::try_from_bytes::<raw::JDrecVal>(&val[..val_size]) {
+            let drec = match util::try_from_bytes::<raw::JDrecVal>(&val[..val_size]) {
                 Ok(d) => d,
                 Err(_) => return ControlFlow::Continue(()),
             };
@@ -634,7 +635,7 @@ impl ApfsFs {
                 return ControlFlow::Continue(());
             }
 
-            let v = match bytemuck::try_from_bytes::<JPhysExtVal>(&val[..v_sz]) {
+            let v = match util::try_from_bytes::<JPhysExtVal>(&val[..v_sz]) {
                 Ok(v) => v,
                 Err(_) => return ControlFlow::Continue(()),
             };

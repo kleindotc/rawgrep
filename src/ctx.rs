@@ -55,8 +55,8 @@ pub struct RawGrepCtx<S: MatchSink> {
     running:        Arc<AtomicBool>,
     active_workers: Arc<AtomicUsize>,
 
-    running_signal: Arc<(Mutex<()>, Condvar)>,    // notified when `running` flips false
-    job_done:       Arc<(Mutex<usize>, Condvar)>, // counts workers still owing a finish for this job
+    running_signal: Arc<(Mutex<()>, Condvar)>,    // Notified when `running` flips false
+    job_done:       Arc<(Mutex<usize>, Condvar)>, // Counts workers still owing a finish for this job
 
     wake:           Arc<(Mutex<u64>, Condvar)>,
     current_job:    Arc<RwLock<Option<Arc<SearchJob<S>>>>>,
