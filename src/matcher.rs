@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::{cli::Cli, tracy};
+use crate::{cli::Cli, tracy, Error};
 use crate::extractor::{extract_regex_literals, literal_bytes, as_exact_alternation};
 
 use std::io;
@@ -157,7 +157,7 @@ pub enum Matcher {
 }
 
 impl Matcher {
-    pub fn new(cli: &Cli) -> io::Result<Self> {
+    pub fn new(cli: &Cli) -> crate::Result<Self> {
         let _span = tracy::span!("Matcher::new");
 
         let pattern = &cli.pattern;
@@ -182,7 +182,15 @@ impl Matcher {
             return Self::regex_fallback(&escaped, cli.ignore_case);
         }
 
-        if !cli.word_regexp && let Ok(hir) = regex_syntax::Parser::new().parse(pattern) {
+        // Parse the pattern exactly as the user typed it, once, up front.
+        // This is what makes the caret/span in the error line up with their
+        // actual input rather than with \b(?:...)\b wrapping we might add
+        // below for -w, or with a second, redundant parse inside regex_fallback.
+        let hir = regex_syntax::Parser::new()
+            .parse(pattern)
+            .map_err(|e| Error::InvalidPattern(e.to_string().into_boxed_str()))?;
+
+        if !cli.word_regexp {
             if let Some(literal) = literal_bytes(&hir) {
                 if let Some(m) = Self::literal_matcher(&literal, cli.ignore_case)? {
                     return Ok(m);
@@ -222,7 +230,7 @@ impl Matcher {
     ///
     /// `pattern` is used as-is -- callers wanting literal semantics (e.g. `force_literal`) must
     /// pre-escape it themselves.
-    fn regex_fallback(pattern: &str, ignore_case: bool) -> io::Result<Self> {
+    fn regex_fallback(pattern: &str, ignore_case: bool) -> crate::Result<Self> {
         #[cfg(feature = "hyperscan")]
         if let Ok(matcher) = Self::try_hyperscan(pattern, ignore_case) {
             return Ok(matcher);
@@ -240,10 +248,7 @@ impl Matcher {
             )
             .syntax(util::syntax::Config::new().case_insensitive(ignore_case))
             .build(pattern)
-            .map_err(|e| io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid regex '{pattern}': {e}"),
-            ))?;
+            .map_err(|e| Error::InvalidPattern(e.to_string().into_boxed_str()))?;
 
         Ok(Matcher::Regex { re, pattern: pattern.to_owned().into_boxed_str(), case_insensitive: ignore_case })
     }
@@ -309,7 +314,7 @@ impl Matcher {
             .ascii_case_insensitive(true)
             .match_kind(aho_corasick::MatchKind::LeftmostFirst)
             .build([literal])
-            .expect("single nonempty pattern always builds");
+            .expect("Single nonempty pattern always builds");
 
         Ok(Some(Matcher::MultiLiteral {
             ac,

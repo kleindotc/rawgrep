@@ -7,6 +7,9 @@ pub enum Error {
     /// The regex / literal pattern supplied by the caller is not valid.
     InvalidPattern(Box<str>),
 
+    /// The filesystem was identified, but rawgrep doesn't support searching it yet.
+    UnsupportedFilesystem { device: Box<str>, fs: Box<str> },
+
     /// The requested path could not be canonicalized (doesn't exist, bad
     /// symlink, etc.).
     PathNotFound { path: Box<str>, source: io::Error },
@@ -42,44 +45,52 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::InvalidPattern(p) => {
-                writeln!(f, "invalid pattern '{p}'")?;
-                writeln!(f, "tip: test your regex with `grep -E` or a regex tester before running")?;
-                write!(f, "patterns must be valid regex or a literal/alternation extractable form")
+            Error::InvalidPattern(msg) => {
+                write!(f, "{msg}")
             }
             Error::PathNotFound { path, source } => {
-                write!(f, "couldn't canonicalize '{path}': {source}")
+                write!(f, "Couldn't canonicalize '{path}': {source}")
             }
             Error::DeviceDetectionFailed(e) => {
-                write!(f, "couldn't auto-detect partition: {e}")
+                write!(f, "Couldn't auto-detect partition: {e}")
             }
             Error::DeviceNotFound(dev) => {
-                write!(f, "device or partition not found: '{dev}'")
+                write!(f, "Device or partition not found: '{dev}'")
             }
             Error::PermissionDenied(dev) => {
                 write!(
                     f,
-                    "permission denied opening '{dev}'\n\
+                    "Permission denied opening '{dev}'\n\
                      help: try running with sudo/root, or grant the binary \
                      CAP_DAC_READ_SEARCH:\n  \
                      sudo setcap cap_dac_read_search=eip <path-to-binary>"
                 )
             }
+            Error::UnsupportedFilesystem { device, fs } => {
+                write!(f, "'{device}' has a {fs} filesystem, which rawgrep doesn't support yet")?;
+                write!(f, "\nsupported filesystems: ext4, NTFS, APFS")
+            }
             Error::UnknownFilesystem(dev) => {
-                write!(f, "unrecognised filesystem on '{dev}' (not ext4, APFS, or NTFS)")
+                write!(f, "Couldn't identify a filesystem on '{dev}'")?;
+                write!(
+                    f,
+                    "\nhint: Double-check this is the right partition (try `lsblk` or `sudo fdisk -l`) -- \
+                     an unpartitioned disk, the wrong partition, or a filesystem rawgrep has no signature \
+                     for will all land here"
+                )
             }
             Error::InvalidFilesystem { fs, source, hint } => {
-                write!(f, "invalid {fs} filesystem: {source}")?;
+                write!(f, "Invalid {fs} filesystem: {source}")?;
                 if let Some(h) = hint {
                     write!(f, "\n{h}")?;
                 }
                 Ok(())
             }
             Error::RootNotFound { path, device, source } => {
-                write!(f, "couldn't find '{path}' in '{device}': {source}")
+                write!(f, "Couldn't find '{path}' in '{device}': {source}")
             }
             Error::MatcherInit(e) => {
-                write!(f, "failed to build matcher: {e}")
+                write!(f, "Failed to build matcher: {e}")
             }
             Error::Io(e) => write!(f, "{e}"),
         }

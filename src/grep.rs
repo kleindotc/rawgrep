@@ -38,7 +38,7 @@ pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
 /// impl block for generic RawFs
 impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
     pub fn new_with_fs(cli: &Cli, fs: F, sink: S) -> Result<Self> {
-        let matcher = make_matcher(cli)?;
+        let matcher = Matcher::new(cli)?;
 
         // `None` means the pattern is too short for any window to be useful -- treat that the same as "no fragments".
         let (fragment_hashes, selected_fragment_hash_len, ignore_case) = match matcher.extract_fragment_hashes() {
@@ -246,8 +246,12 @@ pub fn open_device_impl(path: &str) -> io::Result<File> {
 }
 
 #[inline]
-pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)> {
-    let file = open_device(device_path)?;
+pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FsType)> {
+    let file = open_device(device_path).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound         => Error::DeviceNotFound(device_path.into()),
+        io::ErrorKind::PermissionDenied => Error::PermissionDenied(device_path.into()),
+        _                               => Error::Io(e),
+    })?;
 
     {
         let t = std::time::Instant::now();
@@ -340,17 +344,14 @@ pub fn open_device_and_detect_fs(device_path: &str) -> io::Result<(File, FsType)
     let mut probe = [0u8; 2048];
     read_at_offset(&file, &mut probe, 0)?;
 
-    let fs = detect_fs_type(&probe).expect("unexpected filesystem");
-
-    Ok((file, fs))
-}
-
-#[inline]
-pub fn make_matcher(cli: &Cli) -> Result<Matcher> {
-    Matcher::new(cli).map_err(|e| match e.kind() {
-        io::ErrorKind::InvalidInput => Error::InvalidPattern(cli.pattern.clone().into_boxed_str()),
-        _ => Error::Io(e),
-    })
+    match detect_fs_type(&file, &probe) {
+        FsProbe::Supported(fs) => Ok((file, fs)),
+        FsProbe::Recognized(name) => Err(Error::UnsupportedFilesystem {
+            device: device_path.into(),
+            fs: name.into(),
+        }),
+        FsProbe::Unknown => Err(Error::UnknownFilesystem(device_path.into())),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,34 +359,96 @@ pub enum FsType {
     Ext4, Apfs, Ntfs
 }
 
+/// Result of probing a device's boot sector / superblock region.
+pub enum FsProbe {
+    /// A filesystem rawgrep knows how to search.
+    Supported(FsType),
+    /// A filesystem we recognized the magic for, but don't support searching yet.
+    Recognized(&'static str),
+    /// Nothing we recognize -- probably the wrong partition, an unpartitioned
+    /// disk, or a filesystem we've never added a signature for.
+    Unknown,
+}
+
 /// Peek at raw bytes to identify the filesystem type.
-/// `block0` should be at least 2048 bytes (to cover the ext4 superblock at offset 1024).
-pub fn detect_fs_type(block0: &[u8]) -> Option<FsType> {
-    // NTFS: OEM ID at offset 3, 8 bytes: "NTFS    "
-    if block0.len() >= 11 {
-        if &block0[3..11] == b"NTFS    " {
-            return Some(FsType::Ntfs);
+///
+/// `block0` should be at least 2048 bytes -- enough to cover ext4's
+/// superblock (offset 1024), HFS+'s magic (also 1024), the FAT/exFAT
+/// boot-sector fields, and XFS's magic at offset 0. Btrfs' magic sits
+/// much further in, so if nothing in `block0` matches, this does one
+/// extra small read via `file` before giving up.
+pub fn detect_fs_type(file: &File, block0: &[u8]) -> FsProbe {
+    const XFS_MAGIC: [u8; 4]      = *b"XFSB";
+    const EXFAT_OEM_ID: [u8; 8]   = *b"EXFAT   ";
+    const BTRFS_MAGIC: [u8; 8]    = *b"_BHRfS_M";
+    const BTRFS_MAGIC_OFFSET: u64 = 0x10040; // 65600
+    const HFSPLUS_MAGIC: u16      = 0x482B; // "H+"
+    const HFSX_MAGIC: u16         = 0x4858;    // "HX"
+
+    // ext4 (and ext2/ext3, which share the same magic): offset 1024 + 56
+    if block0.len() >= EXT4_SUPERBLOCK_OFFSET as usize + EXT4_MAGIC_OFFSET + 2 {
+        let off = EXT4_SUPERBLOCK_OFFSET as usize + EXT4_MAGIC_OFFSET;
+        let magic = u16::from_le_bytes(block0[off..off + 2].try_into().unwrap());
+        if magic == EXT4_SUPER_MAGIC {
+            return FsProbe::Supported(FsType::Ext4);
         }
+    }
+
+    // NTFS: OEM ID at offset 3, 8 bytes: "NTFS    "
+    if block0.len() >= 11 && &block0[3..11] == b"NTFS    " {
+        return FsProbe::Supported(FsType::Ntfs);
     }
 
     // APFS: NX magic at offset 32 in block 0
     if block0.len() >= 36 {
         let magic = u32::from_le_bytes(block0[32..36].try_into().unwrap());
         if magic == APFS_NX_MAGIC {
-            return Some(FsType::Apfs);
+            return FsProbe::Supported(FsType::Apfs);
         }
     }
 
-    // ext4: magic at offset 1024 + 56 = 1080
-    if block0.len() >= EXT4_SUPERBLOCK_OFFSET as usize + EXT4_MAGIC_OFFSET + 2 {
-        let off = EXT4_SUPERBLOCK_OFFSET as usize + EXT4_MAGIC_OFFSET;
-        let magic = u16::from_le_bytes(block0[off..off + 2].try_into().unwrap());
-        if magic == EXT4_SUPER_MAGIC {
-            return Some(FsType::Ext4);
+    // --- recognized, but unsupported, from here down ---
+
+    // XFS: "XFSB" at offset 0
+    if block0.len() >= 4 && block0[0..4] == XFS_MAGIC {
+        return FsProbe::Recognized("XFS");
+    }
+
+    // exFAT: OEM ID at offset 3, 8 bytes: "EXFAT   "
+    if block0.len() >= 11 && block0[3..11] == EXFAT_OEM_ID {
+        return FsProbe::Recognized("exFAT");
+    }
+
+    // FAT12/16/32: 0x55AA boot signature at 510..512, plus a FAT-ish label
+    // in the BPB so we don't false-positive on any old boot-sectored disk.
+    if block0.len() >= 512
+        && block0[510] == 0x55
+        && block0[511] == 0xAA
+        && (block0.get(54..62) == Some(b"FAT12   ".as_slice())
+            || block0.get(54..62) == Some(b"FAT16   ".as_slice())
+            || block0.get(82..90) == Some(b"FAT32   ".as_slice()))
+    {
+        return FsProbe::Recognized("FAT");
+    }
+
+    // HFS+ / HFSX: "H+" or "HX" at offset 1024
+    if block0.len() >= 1026 {
+        let magic = u16::from_be_bytes(block0[1024..1026].try_into().unwrap());
+        if magic == HFSPLUS_MAGIC || magic == HFSX_MAGIC {
+            return FsProbe::Recognized("HFS+");
         }
     }
 
-    None
+    // Btrfs: fixed absolute offset far past block0, so only reach for it
+    // once everything cheaper has failed.
+    let mut btrfs_magic = [0u8; 8];
+    if read_at_offset(file, &mut btrfs_magic, BTRFS_MAGIC_OFFSET).is_ok()
+        && btrfs_magic == BTRFS_MAGIC
+    {
+        return FsProbe::Recognized("Btrfs");
+    }
+
+    FsProbe::Unknown
 }
 
 #[derive(Default, Clone, Copy)]

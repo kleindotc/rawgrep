@@ -29,7 +29,7 @@ unsafe impl Sync for ThinPathArc {}
 impl ThinPathArc {
     #[inline]
     pub fn new(depth: u16, bytes: &[u8]) -> Self {
-        let len = u32::try_from(bytes.len()).expect("path longer than 4 GiB");
+        let len = u32::try_from(bytes.len()).expect("path longer than 4 GiB...?");
         let layout = Self::layout(bytes.len());
 
         unsafe {

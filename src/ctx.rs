@@ -16,7 +16,6 @@ use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, Worker
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::io::{self};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -347,8 +346,6 @@ fn worker_thread_main<S: MatchSink + 'static>(
 ) {
     debug!("[ctx] worker {worker_id} started, waiting on condvar");
 
-    // Parser buffers are owned by the thread and reused across searches,
-    // saving allocations on every search restart.
     let mut parser                    = Parser::new(false);
     let mut path_buf                  = Box::new(SmallPathBuf::new());
     let mut swap_path_buf             = Box::new(SmallPathBuf::new());
@@ -488,18 +485,18 @@ fn worker_thread_main<S: MatchSink + 'static>(
             AnyGrepper::Ntfs(g) => dispatch!(g),
         };
 
-        parser = result.parser;
-        file_entries_arena = result.file_entries_arena;
-        subdirs_arena = result.subdirs_arena;
-        entries_arena = result.entries_arena;
-        path_arena = result.path_arena;
-        newlines_scratch = result.newlines_scratch;
-        ranges_scratch = result.ranges_scratch;
-        line_ranges_scratch = result.line_ranges_scratch;
+        parser                    = result.parser;
+        file_entries_arena        = result.file_entries_arena;
+        subdirs_arena             = result.subdirs_arena;
+        entries_arena             = result.entries_arena;
+        path_arena                = result.path_arena;
+        newlines_scratch          = result.newlines_scratch;
+        ranges_scratch            = result.ranges_scratch;
+        line_ranges_scratch       = result.line_ranges_scratch;
         fragment_presence_scratch = result.fragment_presence_scratch;
-        path_buf = result.path_buf;
-        swap_path_buf = result.swap_path_buf;
-        output = result.output;
+        path_buf                  = result.path_buf;
+        swap_path_buf             = result.swap_path_buf;
+        output                    = result.output;
         result.stats.merge_into(&job.stats);
 
         debug!(
@@ -569,12 +566,7 @@ fn build_job_and_initial_work<S: MatchSink + 'static>(
     #[cfg(target_os = "macos")]
     let device = crate::util::resolve_apfs_physical_store(&device)?;
 
-    let (file, fs_type) = open_device_and_detect_fs(&device)
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound         => Error::DeviceNotFound(device.clone()),
-            io::ErrorKind::PermissionDenied => Error::PermissionDenied(device.clone()),
-            _                               => Error::Io(e),
-        })?;
+    let (file, fs_type) = open_device_and_detect_fs(&device)?;
 
     debug!("[ctx] device={device:?} fs_type={fs_type:?}");
 
