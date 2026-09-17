@@ -6,7 +6,7 @@ set -uo pipefail
 
 THREADS=16
 RUNS=10
-WARM_RUNS=50
+WARM_RUNS=75
 WARMUP=5
 RESULTS_DIR="./benchmark_results"
 DO_CORRECTNESS_CHECK=true
@@ -15,6 +15,13 @@ DEVICE="/dev/nvme0n1p2"
 NVME_CTRL="nvme0"
 
 HYPERGREP_BIN="hgrep"
+
+# rawgrep's on-disk fragment cache. Each suite gets a clean slate: whatever
+# is there when a suite starts gets moved aside, the suite runs (writing
+# and reading its own fresh cache), and the original is restored afterward
+# -- including on ^C or any other exit, via the trap below.
+RAWGREP_CACHE_FILE="$HOME/.cache/rawgrep/fragment_cache.bin"
+RAWGREP_CACHE_BACKUP=""
 
 # search trees + patterns we benchmark against.
 CHROMIUM_DIR="../chromium"
@@ -69,7 +76,44 @@ restore_power_settings() {
     echo "$ORIG_APST" | sudo tee "/sys/class/nvme/${NVME_CTRL}/power/control" > /dev/null
     echo "nvme power control restored to: $ORIG_APST"
 }
-trap restore_power_settings EXIT
+
+# --- rawgrep fragment-cache isolation ---
+# Called at the start/end of each run_search_benchmarks suite so suites
+# don't inherit each other's warmed fragment cache. restore_fragment_cache
+# is also invoked from the exit trap below so a ^C mid-suite still puts
+# the user's real cache back rather than leaving it swapped out or
+# clobbered by whatever the interrupted suite had written.
+
+isolate_fragment_cache() {
+    if [ -f "$RAWGREP_CACHE_FILE" ]; then
+        RAWGREP_CACHE_BACKUP="${RAWGREP_CACHE_FILE}.bak.$$"
+        mv "$RAWGREP_CACHE_FILE" "$RAWGREP_CACHE_BACKUP"
+    else
+        RAWGREP_CACHE_BACKUP=""
+    fi
+}
+
+restore_fragment_cache() {
+    # Drop whatever this suite wrote, then put the original back if there
+    # was one. Safe to call more than once: once restored, the backup
+    # var is cleared, so a second call (e.g. suite-end then exit trap)
+    # is a no-op beyond the redundant rm.
+    rm -f "$RAWGREP_CACHE_FILE"
+    if [ -n "$RAWGREP_CACHE_BACKUP" ] && [ -f "$RAWGREP_CACHE_BACKUP" ]; then
+        mv "$RAWGREP_CACHE_BACKUP" "$RAWGREP_CACHE_FILE"
+        RAWGREP_CACHE_BACKUP=""
+    fi
+}
+
+cleanup() {
+    restore_power_settings
+    restore_fragment_cache
+}
+trap cleanup EXIT
+# EXIT alone won't fire on ^C/SIGTERM unless the signal actually ends the
+# process, so route both into an explicit exit -- that trips the EXIT trap.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "=== pinning cpu governor to performance ==="
 echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null
@@ -205,6 +249,10 @@ run_search_benchmarks() {
     local out_dir="$RESULTS_DIR/$suite_label"
     mkdir -p "$out_dir"
 
+    # give this suite its own clean fragment cache, isolated from whatever
+    # the previous suite (or the user's normal usage) left behind.
+    isolate_fragment_cache
+
     local cmd_rawgrep="rawgrep '$pattern' '$search_dir' --jump --no-color --reserved-tool-dirs --large --threads $THREADS"
     local cmd_rawgrep_nocache="rawgrep '$pattern' '$search_dir' --jump --no-color --threads $THREADS --reserved-tool-dirs --large --no-cache --no-cache-write"
     local cmd_rg="rg '$pattern' '$search_dir' --no-heading --color=never -n --threads $THREADS"
@@ -277,6 +325,10 @@ run_search_benchmarks() {
         --command-name "ripgrep" "$cmd_rg" \
         --command-name "hypergrep" "$cmd_hypergrep"
 
+    # suite done -- put the previous fragment cache back before the next
+    # suite starts (also covered by the exit trap if we never get here).
+    restore_fragment_cache
+
     SUITES+=("$suite_label")
 }
 
@@ -306,6 +358,8 @@ run_fff_benchmark() {
     local out_dir="$RESULTS_DIR/$suite_label"
     mkdir -p "$out_dir"
 
+    isolate_fragment_cache
+
     # fff has no positional search-dir arg on `grep`, it resolves the
     # project root from cwd via git discovery, so this runs in a subshell
     # that cd's into search_dir first.
@@ -333,18 +387,18 @@ run_fff_benchmark() {
         --prepare "sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null && sleep 1" \
         --command-name "fff (cache built once)" "$cmd_fff_grep" \
         --command-name "rawgrep" "$cmd_rawgrep"
+
+    restore_fragment_cache
 }
 
 # --- run everything ---
 
 SUITES=()
 
-# chromium: literal TODO pattern, same as the original script
+# chromium: literal TODO pattern
 run_search_benchmarks "chromium_todo" "$CHROMIUM_DIR" "$PATTERN_TODO"
 
-# chromium: the TODO(...) convention regex, to see how the two engines
-# compare on something with a literal anchor plus real branching, not just
-# a flat literal scan
+# chromium: the TODO(...) convention regex
 run_search_benchmarks "chromium_regex" "$CHROMIUM_DIR" "$PATTERN_TODO_REGEX"
 
 # same two patterns, now against the linux tree ($LINUX_VERSION)
@@ -352,10 +406,10 @@ run_search_benchmarks "linux_todo" "$LINUX_DIR" "$PATTERN_TODO"
 run_search_benchmarks "linux_regex" "$LINUX_DIR" "$PATTERN_REGEX"
 
 # fff comparison -- not run right now, uncomment to bring it back. Needs
-# build_fff_cache called once up front for whichever tree you point it at.
+# build_fff_cache called once up front for whichever tree.
 # build_fff_cache "$CHROMIUM_DIR"
 # run_fff_benchmark "chromium_fff" "$CHROMIUM_DIR" "$PATTERN_TODO" \
-#     "rawgrep '$PATTERN_TODO' '$CHROMIUM_DIR' --jump --no-color --reserved-tool-dirs --large --threads $THREADS"
+    "rawgrep '$PATTERN_TODO' '$CHROMIUM_DIR' --jump --no-color --reserved-tool-dirs --large --threads $THREADS"
 
 # --- ram usage ---
 # hyperfine's --export-json already captured peak RSS per run in
