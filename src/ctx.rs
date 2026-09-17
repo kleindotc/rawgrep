@@ -435,6 +435,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     cache:            $g.cache(),
                     stdout_is_being_redirected_to_dev_null: ctx.stdout_is_being_redirected_to_dev_null,
                     fragment_hashes:  $g.fragment_hashes(),
+                    fragment_indexes: $g.fragment_indexes(),
                     fs:               $g.fs(),
                     matcher:          $g.matcher(),
                     fragment_index:   $g.fragment_index(),

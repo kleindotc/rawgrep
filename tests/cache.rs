@@ -23,7 +23,7 @@ fn absent_fragment_allows_skip() {
         vec![vec![true, false]], // A present, B absent
     );
 
-    assert!(cache.can_skip_file(key(1), meta(100, 200), &[hash_b]));
+    assert!(cache.can_skip_file_for_tests(key(1), meta(100, 200), &[hash_b]));
 }
 
 #[test]
@@ -37,13 +37,13 @@ fn present_fragment_prevents_skip() {
         vec![present_presence(1)],
     );
 
-    assert!(!cache.can_skip_file(key(1), meta(100, 200), &[hash_a]));
+    assert!(!cache.can_skip_file_for_tests(key(1), meta(100, 200), &[hash_a]));
 }
 
 #[test]
 fn unknown_file_is_not_skipped() {
     let cache = FragmentCache::new_in_memory(64, 64);
-    assert!(!cache.can_skip_file(key(999), meta(1, 1), &[0xDEAD]));
+    assert!(!cache.can_skip_file_for_tests(key(999), meta(1, 1), &[0xDEAD]));
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn stale_metadata_invalidates() {
         vec![absent_presence(1)],
     );
 
-    assert!(!cache.can_skip_file(key(1), meta(999, 200), &[hash]));
+    assert!(!cache.can_skip_file_for_tests(key(1), meta(999, 200), &[hash]));
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn unknown_fragment_does_not_skip() {
         vec![absent_presence(1)],
     );
 
-    assert!(!cache.can_skip_file(key(1), meta(1, 1), &[0x9999_9999]));
+    assert!(!cache.can_skip_file_for_tests(key(1), meta(1, 1), &[0x9999_9999]));
 }
 
 // --- merge_updates --------------------------------------------------------
@@ -79,14 +79,14 @@ fn merge_updates_absent_fragment_skippable() {
     let mut cache = FragmentCache::new_in_memory(64, 64);
     let hash = 0xCAFE_BABE_u32;
 
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![key(42)],
         vec![meta(1234, 5678)],
         &[hash],
         vec![false],
     ).unwrap();
 
-    assert!(cache.can_skip_file(key(42), meta(1234, 5678), &[hash]));
+    assert!(cache.can_skip_file_for_tests(key(42), meta(1234, 5678), &[hash]));
 }
 
 #[test]
@@ -94,14 +94,14 @@ fn merge_updates_present_fragment_not_skippable() {
     let mut cache = FragmentCache::new_in_memory(64, 64);
     let hash = 0x1234_5678_u32;
 
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![key(1)],
         vec![meta(1, 1)],
         &[hash],
         vec![true],
     ).unwrap();
 
-    assert!(!cache.can_skip_file(key(1), meta(1, 1), &[hash]));
+    assert!(!cache.can_skip_file_for_tests(key(1), meta(1, 1), &[hash]));
 }
 
 #[test]
@@ -113,11 +113,11 @@ fn lookup_table_consistent_after_many_inserts() {
     let file_metas: Vec<FileMeta> = (0..500).map(|i| meta(i, i as u64)).collect();
     let presences: Vec<bool> = (0..500).map(|_| false).collect();
 
-    cache.merge_updates_bool(file_keys.clone(), file_metas.clone(), &[hash], presences).unwrap();
+    cache.merge_updates_for_tests(file_keys.clone(), file_metas.clone(), &[hash], presences).unwrap();
 
     for (i, &k) in file_keys.iter().enumerate() {
         assert!(
-            cache.can_skip_file(k, file_metas[i], &[hash]),
+            cache.can_skip_file_for_tests(k, file_metas[i], &[hash]),
             "file {i} not skippable after bulk insert"
         );
     }
@@ -132,22 +132,22 @@ fn ring_buffer_eviction_clears_evicted_slot() {
     let m = meta(1, 1);
 
     let hashes: Vec<u32> = (0..4).map(|i| i as u32 * 0x1111).collect();
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &hashes,
         vec![false, false, false, false],
     ).unwrap();
 
     // 5th fragment evicts slot 0
     let new_hash = 0xDEAD_DEAD_u32;
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[new_hash],
         vec![false],
     ).unwrap();
 
     // evicted fragment -> unknown -> cannot skip
-    assert!(!cache.can_skip_file(k, m, &[hashes[0]]));
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hashes[0]]));
     // new fragment -> absent -> can skip
-    assert!(cache.can_skip_file(k, m, &[new_hash]));
+    assert!(cache.can_skip_file_for_tests(k, m, &[new_hash]));
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn ring_buffer_wrap_does_not_panic() {
         let hashes: Vec<u32> = (0..MAX).map(|i| round * 100 + i as u32).collect();
         let presence: Vec<bool> = hashes.iter().map(|_| false).collect();
 
-        cache.merge_updates_bool(vec![k], vec![m], &hashes, presence).unwrap();
+        cache.merge_updates_for_tests(vec![k], vec![m], &hashes, presence).unwrap();
     }
 
     let _ = cache.memory_usage(); // just assert no corruption
@@ -182,7 +182,7 @@ proptest! {
 
         for _ in 0..num_rounds {
             let presence: Vec<bool> = hashes.iter().map(|_| false).collect();
-            cache.merge_updates_bool(vec![k], vec![m], &hashes, presence).unwrap();
+            cache.merge_updates_for_tests(vec![k], vec![m], &hashes, presence).unwrap();
         }
 
         let _ = cache.memory_usage();
@@ -200,11 +200,11 @@ proptest! {
         let metas:  Vec<FileMeta> = (0..num_files).map(|i| meta(i as i64, i as u64)).collect();
         let presences: Vec<bool> = (0..num_files).map(|_| false).collect();
 
-        cache.merge_updates_bool(keys.clone(), metas.clone(), &[hash], presences).unwrap();
+        cache.merge_updates_for_tests(keys.clone(), metas.clone(), &[hash], presences).unwrap();
 
         for i in 0..num_files {
             prop_assert!(
-                cache.can_skip_file(keys[i], metas[i], &[hash]),
+                cache.can_skip_file_for_tests(keys[i], metas[i], &[hash]),
                 "file {i} missing from lookup"
             );
         }
@@ -229,7 +229,7 @@ proptest! {
 
         for (i, &hash) in hashes.iter().enumerate() {
             let is_absent  = !presence[i];
-            let skippable  = cache.can_skip_file(key(1), meta(1, 1), &[hash]);
+            let skippable  = cache.can_skip_file_for_tests(key(1), meta(1, 1), &[hash]);
             prop_assert_eq!(
                 skippable, is_absent,
                 "frag {}: absent={} skippable={}", i, is_absent, skippable
@@ -256,7 +256,7 @@ fn disk_roundtrip_preserves_data() {
 
     {
         let mut cache = FragmentCache::new(&config).unwrap();
-        cache.merge_updates_bool(
+        cache.merge_updates_for_tests(
             vec![k], vec![m], &[hash],
             vec![false],
         ).unwrap();
@@ -265,7 +265,7 @@ fn disk_roundtrip_preserves_data() {
 
     {
         let cache = FragmentCache::new(&config).unwrap();
-        assert!(cache.can_skip_file(k, m, &[hash]));
+        assert!(cache.can_skip_file_for_tests(k, m, &[hash]));
     }
 }
 
@@ -287,14 +287,14 @@ fn disk_roundtrip_alignment_odd_fragment_counts() {
         {
             let mut cache = FragmentCache::new(&config).unwrap();
             let presence: Vec<bool> = hashes.iter().map(|_| false).collect();
-            cache.merge_updates_bool(vec![k], vec![m], &hashes, presence).unwrap();
+            cache.merge_updates_for_tests(vec![k], vec![m], &hashes, presence).unwrap();
             cache.save_to_disk().unwrap();
         }
 
         {
             let cache = FragmentCache::new(&config).unwrap();
             assert!(
-                cache.can_skip_file(k, m, &[hashes[0]]),
+                cache.can_skip_file_for_tests(k, m, &[hashes[0]]),
                 "round-trip failed for num_frags={num_frags}"
             );
         }
@@ -317,7 +317,7 @@ fn disk_roundtrip_cow_preserves_old_data() {
 
     {
         let mut cache = FragmentCache::new(&config).unwrap();
-        cache.merge_updates_bool(
+        cache.merge_updates_for_tests(
             vec![k1], vec![m1], &[hash1],
             vec![false],
         ).unwrap();
@@ -331,13 +331,13 @@ fn disk_roundtrip_cow_preserves_old_data() {
         let hash2 = 0xBBBB_BBBB_u32;
         let k2    = key(2);
         let m2    = meta(2, 2);
-        cache.merge_updates_bool(
+        cache.merge_updates_for_tests(
             vec![k2], vec![m2], &[hash2],
             vec![false],
         ).unwrap();
 
-        assert!(cache.can_skip_file(k1, m1, &[hash1]), "old file lost after CoW");
-        assert!(cache.can_skip_file(k2, m2, &[hash2]), "new file missing after CoW");
+        assert!(cache.can_skip_file_for_tests(k1, m1, &[hash1]), "old file lost after CoW");
+        assert!(cache.can_skip_file_for_tests(k2, m2, &[hash2]), "new file missing after CoW");
     }
 }
 
@@ -351,12 +351,12 @@ fn no_false_absent_basic() {
     let m = meta(1, 1);
 
     let mut cache = FragmentCache::new_in_memory(64, 64);
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash],
         vec![true], // PRESENT
     ).unwrap();
 
-    assert!(!cache.can_skip_file(k, m, &[hash]),
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash]),
             "false absent: fragment is present but cache says skip");
 }
 
@@ -372,20 +372,20 @@ fn no_false_absent_after_second_merge() {
     let mut cache = FragmentCache::new_in_memory(64, 64);
 
     // First scan: absent
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m1], &[hash],
         vec![false],
     ).unwrap();
 
-    assert!(cache.can_skip_file(k, m1, &[hash]), "should be skippable after absent");
+    assert!(cache.can_skip_file_for_tests(k, m1, &[hash]), "should be skippable after absent");
 
     // Second scan: present (file was modified)
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m2], &[hash],
         vec![true],
     ).unwrap();
 
-    assert!(!cache.can_skip_file(k, m2, &[hash]),
+    assert!(!cache.can_skip_file_for_tests(k, m2, &[hash]),
             "false absent: fragment became present but cache still skips");
 }
 
@@ -401,23 +401,23 @@ fn no_false_absent_stride_consistency_across_fragment_additions() {
     let mut cache = FragmentCache::new_in_memory(64, 64);
 
     // Register file with fragment A present
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash_a],
         vec![true],
     ).unwrap();
 
-    assert!(!cache.can_skip_file(k, m, &[hash_a]),
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_a]),
             "false absent before adding fragment B");
 
     // Now add fragment B in a second merge (different search pattern)
     // This changes num_fragments and potentially bits_per_file_u64
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![key(99)], vec![meta(99, 99)], &[hash_b],
         vec![false],
     ).unwrap();
 
     // File 1 still has fragment A present - must NOT be skippable
-    assert!(!cache.can_skip_file(k, m, &[hash_a]),
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_a]),
             "false absent after adding unrelated fragment B: stride corruption?");
 }
 
@@ -432,25 +432,25 @@ fn no_false_absent_when_fragment_index_crosses_u64_boundary() {
     // Fill 63 fragments as absent to push indexes to boundary
     let filler: Vec<u32> = (0u32..63).map(|i| i * 7 + 1).collect();
     let filler_presence: Vec<bool> = filler.iter().map(|_| false).collect();
-    cache.merge_updates_bool(vec![k], vec![m], &filler, filler_presence).unwrap();
+    cache.merge_updates_for_tests(vec![k], vec![m], &filler, filler_presence).unwrap();
 
     // Fragment at index 63 (last bit of first u64) - present
     let hash_63 = 0xBEEF_0063_u32;
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash_63],
         vec![true],
     ).unwrap();
 
     // Fragment at index 64 (first bit of second u64) - present
     let hash_64 = 0xBEEF_0064_u32;
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash_64],
         vec![true],
     ).unwrap();
 
-    assert!(!cache.can_skip_file(k, m, &[hash_63]),
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_63]),
             "false absent at bit 63 (u64 boundary)");
-    assert!(!cache.can_skip_file(k, m, &[hash_64]),
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_64]),
             "false absent at bit 64 (start of second u64)");
 }
 
@@ -468,10 +468,10 @@ fn no_false_absent_after_capacity_growth() {
     // All files have fragment present
     let presences: Vec<bool> = (0..file_count).map(|_| true).collect();
 
-    cache.merge_updates_bool(keys.clone(), metas.clone(), &[hash], presences).unwrap();
+    cache.merge_updates_for_tests(keys.clone(), metas.clone(), &[hash], presences).unwrap();
 
     for i in 0..file_count {
-        assert!(!cache.can_skip_file(keys[i], metas[i], &[hash]),
+        assert!(!cache.can_skip_file_for_tests(keys[i], metas[i], &[hash]),
                 "false absent for file {i} after capacity growth");
     }
 }
@@ -489,7 +489,7 @@ fn no_false_absent_ring_buffer_does_not_corrupt_present_bits() {
     let target_meta = meta(1, 1);
 
     // Register target file with target fragment PRESENT
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![target_key], vec![target_meta], &[target_hash],
         vec![true],
     ).unwrap();
@@ -499,7 +499,7 @@ fn no_false_absent_ring_buffer_does_not_corrupt_present_bits() {
         let filler_hash = 0xF000_0000 + i;
         let filler_key  = key(100 + i as u64);
         let filler_meta = meta(i as i64, i as u64);
-        cache.merge_updates_bool(
+        cache.merge_updates_for_tests(
             vec![filler_key], vec![filler_meta], &[filler_hash],
             vec![false],
         ).unwrap();
@@ -507,7 +507,7 @@ fn no_false_absent_ring_buffer_does_not_corrupt_present_bits() {
 
     // target_hash was evicted from the ring buffer, so it's "unknown" now -
     // can_skip_file should return FALSE (can't prove absent) not TRUE (false absent)
-    assert!(!cache.can_skip_file(target_key, target_meta, &[target_hash]),
+    assert!(!cache.can_skip_file_for_tests(target_key, target_meta, &[target_hash]),
             "false absent after ring buffer evicted the fragment: \
              eviction should make result unknown (no-skip), not absent (skip)");
 }
@@ -528,7 +528,7 @@ fn no_false_absent_multiple_fragments_one_present() {
     let m = meta(1, 1);
 
     let mut cache = FragmentCache::new_in_memory(64, 64);
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash_a, hash_b, hash_c],
         vec![false, true, false], // A absent, B present, C absent
     ).unwrap();
@@ -536,16 +536,16 @@ fn no_false_absent_multiple_fragments_one_present() {
     // A is absent -> can_skip returns true (skip because A definitely not in file)
     // This is correct for literal pattern fragments: if fragment A (part of pattern)
     // is absent, the full pattern can't match
-    assert!(cache.can_skip_file(k, m, &[hash_a]),
+    assert!(cache.can_skip_file_for_tests(k, m, &[hash_a]),
             "should skip: fragment A is absent");
 
     // B is present -> cannot skip
-    assert!(!cache.can_skip_file(k, m, &[hash_b]),
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_b]),
             "false absent: fragment B is present");
 
     // Querying [A, B] together: A is absent so should return true (skip)
     // because finding ANY absent fragment is enough to skip
-    assert!(cache.can_skip_file(k, m, &[hash_a, hash_b]),
+    assert!(cache.can_skip_file_for_tests(k, m, &[hash_a, hash_b]),
             "should skip when at least one required fragment is absent");
 }
 
@@ -579,13 +579,13 @@ proptest! {
 
         let presences: Vec<bool> = presence_table.iter().flat_map(|p| p.iter().copied()).collect();
 
-        cache.merge_updates_bool(keys.clone(), metas.clone(), &hashes, presences).unwrap();
+        cache.merge_updates_for_tests(keys.clone(), metas.clone(), &hashes, presences).unwrap();
 
         // For every file+fragment that is PRESENT, can_skip must be false
         for fi in 0..num_files {
             for fr in 0..num_frags {
                 if presence_table[fi][fr] {
-                    let skippable = cache.can_skip_file(keys[fi], metas[fi], &[hashes[fr]]);
+                    let skippable = cache.can_skip_file_for_tests(keys[fi], metas[fi], &[hashes[fr]]);
                     prop_assert!(
                         !skippable,
                         "false absent: file {} frag {} is present but can_skip=true",
@@ -619,7 +619,7 @@ proptest! {
             let present = round % 2 == 0;
             let presences: Vec<bool> = round_hashes.iter().map(|_| present).collect();
 
-            cache.merge_updates_bool(vec![k], vec![m], &round_hashes, presences).unwrap();
+            cache.merge_updates_for_tests(vec![k], vec![m], &round_hashes, presences).unwrap();
 
             let entry = ground_truth.entry(round as u64).or_default();
             for &h in &round_hashes {
@@ -634,7 +634,7 @@ proptest! {
             for (&hash, &present) in frags {
                 if present {
                     prop_assert!(
-                        !cache.can_skip_file(k, m, &[hash]),
+                        !cache.can_skip_file_for_tests(k, m, &[hash]),
                         "false absent: file {} hash {:#x} is present but skipped",
                         file_id, hash
                     );
@@ -659,7 +659,7 @@ fn no_false_absent_stride_jumps_at_64_boundary() {
     // Register all files with a known present fragment
     let anchor_hash = 0xA1C4_0000_u32;
     let anchor_presence: Vec<bool> = (0..num_files).map(|_| true).collect();
-    cache.merge_updates_bool(keys.clone(), metas.clone(), &[anchor_hash], anchor_presence).unwrap();
+    cache.merge_updates_for_tests(keys.clone(), metas.clone(), &[anchor_hash], anchor_presence).unwrap();
 
     // Add fragments one at a time, crossing the 64-boundary
     // Each addition must not corrupt the anchor_hash present bits
@@ -668,7 +668,7 @@ fn no_false_absent_stride_jumps_at_64_boundary() {
         // use a different file for each filler so we don't affect the anchor
         let filler_key  = key(1000 + i as u64);
         let filler_meta = meta(1000 + i as i64, 1000 + i as u64);
-        cache.merge_updates_bool(
+        cache.merge_updates_for_tests(
             vec![filler_key], vec![filler_meta], &[filler_hash],
             vec![false],
         ).unwrap();
@@ -676,7 +676,7 @@ fn no_false_absent_stride_jumps_at_64_boundary() {
         // After every addition, all original files must still report anchor present
         for fi in 0..num_files {
             assert!(
-                !cache.can_skip_file(keys[fi], metas[fi], &[anchor_hash]),
+                !cache.can_skip_file_for_tests(keys[fi], metas[fi], &[anchor_hash]),
                 "false absent after adding filler fragment {i}: \
                  file {fi} anchor present but can_skip=true \
                  (num_fragments now ~{})", i + 2
@@ -702,7 +702,7 @@ fn no_false_absent_all_files_all_fragments_present_at_each_boundary() {
             let h = 0x0100_0000u32.wrapping_add(boundary as u32 * 1000).wrapping_add(i);
             let filler_key  = key(5000 + boundary as u64 * 1000 + i as u64);
             let filler_meta = meta(i as i64, i as u64);
-            cache.merge_updates_bool(
+            cache.merge_updates_for_tests(
                 vec![filler_key], vec![filler_meta], &[h],
                 vec![false],
             ).unwrap();
@@ -713,13 +713,13 @@ fn no_false_absent_all_files_all_fragments_present_at_each_boundary() {
             let h = 0xBEEF_0000u32.wrapping_add(boundary as u32).wrapping_add(offset);
             present_hashes.push(h);
             let presences: Vec<bool> = (0..num_files).map(|_| true).collect();
-            cache.merge_updates_bool(keys.clone(), metas.clone(), &[h], presences).unwrap();
+            cache.merge_updates_for_tests(keys.clone(), metas.clone(), &[h], presences).unwrap();
 
             // Immediately verify all previously-added present hashes still not skippable
             for &ph in &present_hashes {
                 for fi in 0..num_files {
                     assert!(
-                        !cache.can_skip_file(keys[fi], metas[fi], &[ph]),
+                        !cache.can_skip_file_for_tests(keys[fi], metas[fi], &[ph]),
                         "false absent at boundary {boundary}+{offset}: \
                          file {fi} hash {ph:#010x} present but skipped"
                     );
@@ -746,14 +746,14 @@ fn no_false_absent_interleaved_files_and_fragments() {
         let present = step % 3 != 0; // every 3rd file has it absent
 
         let presences = vec![present];
-        cache.merge_updates_bool(vec![k], vec![m], &[h], presences).unwrap();
+        cache.merge_updates_for_tests(vec![k], vec![m], &[h], presences).unwrap();
         ground_truth.push((k, m, h, present));
 
         // After every step, verify ALL ground truth entries
         for &(gk, gm, gh, gpresent) in &ground_truth {
             if gpresent {
                 assert!(
-                    !cache.can_skip_file(gk, gm, &[gh]),
+                    !cache.can_skip_file_for_tests(gk, gm, &[gh]),
                     "false absent at step {step}: previously present fragment {gh:#x} \
                      became skippable"
                 );
@@ -772,7 +772,7 @@ fn no_false_absent_same_file_updated_across_stride_boundary() {
 
     // Round 1: register file with hash_a present (stride=1, num_frags < 64)
     let hash_a = 0xAAAA_u32;
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash_a],
         vec![true],
     ).unwrap();
@@ -782,7 +782,7 @@ fn no_false_absent_same_file_updated_across_stride_boundary() {
         let fk = key(100 + i as u64);
         let fm = meta(i as i64, i as u64);
         let fh = 0xF000u32.wrapping_add(i);
-        cache.merge_updates_bool(
+        cache.merge_updates_for_tests(
             vec![fk], vec![fm], &[fh],
             vec![false],
         ).unwrap();
@@ -790,14 +790,14 @@ fn no_false_absent_same_file_updated_across_stride_boundary() {
 
     // Now stride=2. Re-register the same file with hash_a still present
     let hash_b = 0xBBBB_u32;
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash_a, hash_b],
         vec![true, true],
     ).unwrap();
 
-    assert!(!cache.can_skip_file(k, m, &[hash_a]),
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_a]),
             "false absent: hash_a present across stride boundary");
-    assert!(!cache.can_skip_file(k, m, &[hash_b]),
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_b]),
             "false absent: hash_b present after stride boundary");
 }
 
@@ -842,7 +842,7 @@ proptest! {
                 })
                 .collect();
 
-            cache.merge_updates_bool(keys.clone(), metas.clone(), &hashes, presences).unwrap();
+            cache.merge_updates_for_tests(keys.clone(), metas.clone(), &hashes, presences).unwrap();
 
             for (file_index, file) in ground_truth.iter_mut().enumerate().take(num_files) {
                 let present = (present_mask >> (file_index % 32)) & 1 == 1;
@@ -856,7 +856,7 @@ proptest! {
                 for (&h, &present) in &ground_truth[fi] {
                     if present {
                         prop_assert!(
-                            !cache.can_skip_file(keys[fi], metas[fi], &[h]),
+                            !cache.can_skip_file_for_tests(keys[fi], metas[fi], &[h]),
                             "false absent: round={round} file={fi} hash={h:#010x} \
                              present but skipped (num_fragments may have crossed 64-boundary)"
                         );
@@ -883,7 +883,7 @@ proptest! {
             let fk = key(9000 + i as u64);
             let fm = meta(i as i64, i as u64);
             let fh = 0xDEAD_0000u32.wrapping_add(seed as u32).wrapping_add(i);
-            cache.merge_updates_bool(
+            cache.merge_updates_for_tests(
                 vec![fk], vec![fm], &[fh],
                 vec![false],
             ).unwrap();
@@ -900,7 +900,7 @@ proptest! {
         let before_metas: Vec<FileMeta> = (0..files_before_boundary).map(|i| meta(200 + i as i64, 200)).collect();
         let before_presences: Vec<bool> =
             (0..files_before_boundary).map(|_| true).collect();
-        cache.merge_updates_bool(before_keys.clone(), before_metas.clone(), &[hash_62], before_presences).unwrap();
+        cache.merge_updates_for_tests(before_keys.clone(), before_metas.clone(), &[hash_62], before_presences).unwrap();
 
         // This pushes num_fragments to 63. Now add hash at index 63 (crosses u64 boundary)
         let hash_63 = 0xB063u32.wrapping_add(seed as u32);
@@ -908,12 +908,12 @@ proptest! {
         let after_metas: Vec<FileMeta> = (0..files_after_boundary).map(|i| meta(300 + i as i64, 300)).collect();
         let after_presences: Vec<bool> =
             (0..files_after_boundary).map(|_| true).collect();
-        cache.merge_updates_bool(after_keys.clone(), after_metas.clone(), &[hash_63], after_presences).unwrap();
+        cache.merge_updates_for_tests(after_keys.clone(), after_metas.clone(), &[hash_63], after_presences).unwrap();
 
         // Verify before-boundary files still not skippable on hash_62
         for fi in 0..files_before_boundary {
             prop_assert!(
-                !cache.can_skip_file(before_keys[fi], before_metas[fi], &[hash_62]),
+                !cache.can_skip_file_for_tests(before_keys[fi], before_metas[fi], &[hash_62]),
                 "false absent: before-boundary file {fi} hash_62 present but skipped \
                  after stride crossed 64"
             );
@@ -922,7 +922,7 @@ proptest! {
         // Verify after-boundary files not skippable on hash_63
         for fi in 0..files_after_boundary {
             prop_assert!(
-                !cache.can_skip_file(after_keys[fi], after_metas[fi], &[hash_63]),
+                !cache.can_skip_file_for_tests(after_keys[fi], after_metas[fi], &[hash_63]),
                 "false absent: after-boundary file {fi} hash_63 present but skipped"
             );
         }
@@ -938,12 +938,12 @@ fn absent_fragment_skips_correctly_basic() {
     let m = meta(1, 1);
 
     let mut cache = FragmentCache::new_in_memory(64, 64);
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash],
         vec![false], // explicitly absent
     ).unwrap();
 
-    assert!(cache.can_skip_file(k, m, &[hash]),
+    assert!(cache.can_skip_file_for_tests(k, m, &[hash]),
             "fragment is absent but cache failed to skip");
 }
 
@@ -960,14 +960,14 @@ fn absent_verified_independently_for_each_file() {
         .collect();
 
     let mut cache = FragmentCache::new_in_memory(64, 64);
-    cache.merge_updates_bool(keys.clone(), metas.clone(), &[hash], presences).unwrap();
+    cache.merge_updates_for_tests(keys.clone(), metas.clone(), &[hash], presences).unwrap();
 
     for i in 0..num_files {
         if i % 2 == 0 {
-            assert!(!cache.can_skip_file(keys[i], metas[i], &[hash]),
+            assert!(!cache.can_skip_file_for_tests(keys[i], metas[i], &[hash]),
                     "file {i}: present fragment falsely skipped");
         } else {
-            assert!(cache.can_skip_file(keys[i], metas[i], &[hash]),
+            assert!(cache.can_skip_file_for_tests(keys[i], metas[i], &[hash]),
                     "file {i}: absent fragment not skipped");
         }
     }
@@ -984,21 +984,21 @@ fn absent_only_for_specific_fragment_not_others() {
     let m = meta(1, 1);
 
     let mut cache = FragmentCache::new_in_memory(64, 64);
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash_a, hash_b, hash_c],
         vec![true, false, true],
     ).unwrap();
 
-    assert!(!cache.can_skip_file(k, m, &[hash_a]), "A is present, must not skip");
-    assert!( cache.can_skip_file(k, m, &[hash_b]), "B is absent, must skip");
-    assert!(!cache.can_skip_file(k, m, &[hash_c]), "C is present, must not skip");
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_a]), "A is present, must not skip");
+    assert!( cache.can_skip_file_for_tests(k, m, &[hash_b]), "B is absent, must skip");
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_c]), "C is present, must not skip");
 
     // Query with all three: B is absent so should skip
-    assert!( cache.can_skip_file(k, m, &[hash_a, hash_b, hash_c]),
+    assert!( cache.can_skip_file_for_tests(k, m, &[hash_a, hash_b, hash_c]),
              "B absent in multi-fragment query, must skip");
 
     // Query with only present fragments: must not skip
-    assert!(!cache.can_skip_file(k, m, &[hash_a, hash_c]),
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_a, hash_c]),
             "all queried fragments present, must not skip");
 }
 
@@ -1016,10 +1016,10 @@ fn absent_bits_survive_capacity_growth() {
     let presences: Vec<bool> =
         (0..num_files).map(|_| false).collect();
 
-    cache.merge_updates_bool(keys.clone(), metas.clone(), &[hash], presences).unwrap();
+    cache.merge_updates_for_tests(keys.clone(), metas.clone(), &[hash], presences).unwrap();
 
     for i in 0..num_files {
-        assert!(cache.can_skip_file(keys[i], metas[i], &[hash]),
+        assert!(cache.can_skip_file_for_tests(keys[i], metas[i], &[hash]),
                 "file {i}: absent bit lost after capacity growth");
     }
 }
@@ -1034,25 +1034,25 @@ fn absent_bits_survive_stride_boundary_crossing() {
     let k = key(1);
     let m = meta(1, 1);
 
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash],
         vec![false],
     ).unwrap();
 
-    assert!(cache.can_skip_file(k, m, &[hash]), "absent before boundary crossing");
+    assert!(cache.can_skip_file_for_tests(k, m, &[hash]), "absent before boundary crossing");
 
     // Push past 64-fragment boundary
     for i in 0u32..70 {
         let fk = key(100 + i as u64);
         let fm = meta(i as i64, i as u64);
         let fh = 0xF000_0000u32.wrapping_add(i);
-        cache.merge_updates_bool(
+        cache.merge_updates_for_tests(
             vec![fk], vec![fm], &[fh],
             vec![false],
         ).unwrap();
     }
 
-    assert!(cache.can_skip_file(k, m, &[hash]),
+    assert!(cache.can_skip_file_for_tests(k, m, &[hash]),
             "absent bit lost after stride crossed 64-fragment boundary");
 }
 
@@ -1075,7 +1075,7 @@ fn absent_bits_correct_at_each_u64_boundary_position() {
             let fh = 0xF100_0000u32
                 .wrapping_add(target_index as u32 * 1000)
                 .wrapping_add(i);
-            cache.merge_updates_bool(
+            cache.merge_updates_for_tests(
                 vec![fk], vec![fm], &[fh],
                 vec![false],
             ).unwrap();
@@ -1084,13 +1084,13 @@ fn absent_bits_correct_at_each_u64_boundary_position() {
         // Now add the target fragment as ABSENT for our file
         let target_hash = 0x7670_0000u32
             .wrapping_add(target_index as u32);
-        cache.merge_updates_bool(
+        cache.merge_updates_for_tests(
             vec![k], vec![m], &[target_hash],
             vec![false],
         ).unwrap();
 
         assert!(
-            cache.can_skip_file(k, m, &[target_hash]),
+            cache.can_skip_file_for_tests(k, m, &[target_hash]),
             "absent bit wrong at fragment index {target_index} (u64 boundary position)"
         );
     }
@@ -1106,20 +1106,20 @@ fn absent_preserved_after_same_file_re_registered() {
 
     let mut cache = FragmentCache::new_in_memory(64, 64);
 
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash],
         vec![false],
     ).unwrap();
 
-    assert!(cache.can_skip_file(k, m, &[hash]), "absent after first registration");
+    assert!(cache.can_skip_file_for_tests(k, m, &[hash]), "absent after first registration");
 
     // Re-register same file, same meta, same fragment absent
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash],
         vec![false],
     ).unwrap();
 
-    assert!(cache.can_skip_file(k, m, &[hash]),
+    assert!(cache.can_skip_file_for_tests(k, m, &[hash]),
             "absent bit cleared after re-registration of same file");
 }
 
@@ -1134,7 +1134,7 @@ fn absent_not_confused_between_adjacent_files() {
     let mb = meta(2, 2);
 
     let mut cache = FragmentCache::new_in_memory(64, 64);
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![ka, kb], vec![ma, mb], &[hash],
         vec![
             false, // A: absent
@@ -1142,8 +1142,8 @@ fn absent_not_confused_between_adjacent_files() {
         ],
     ).unwrap();
 
-    assert!( cache.can_skip_file(ka, ma, &[hash]), "file A: absent, must skip");
-    assert!(!cache.can_skip_file(kb, mb, &[hash]), "file B: present, must not skip");
+    assert!( cache.can_skip_file_for_tests(ka, ma, &[hash]), "file A: absent, must skip");
+    assert!(!cache.can_skip_file_for_tests(kb, mb, &[hash]), "file B: present, must not skip");
 }
 
 #[test]
@@ -1157,14 +1157,14 @@ fn absent_not_confused_between_adjacent_fragments() {
     let m = meta(1, 1);
 
     let mut cache = FragmentCache::new_in_memory(64, 64);
-    cache.merge_updates_bool(
+    cache.merge_updates_for_tests(
         vec![k], vec![m], &[hash_prev, hash_mid, hash_next],
         vec![true, false, true], // mid absent
     ).unwrap();
 
-    assert!(!cache.can_skip_file(k, m, &[hash_prev]), "prev present, must not skip");
-    assert!( cache.can_skip_file(k, m, &[hash_mid]),  "mid absent, must skip");
-    assert!(!cache.can_skip_file(k, m, &[hash_next]), "next present, must not skip");
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_prev]), "prev present, must not skip");
+    assert!( cache.can_skip_file_for_tests(k, m, &[hash_mid]),  "mid absent, must skip");
+    assert!(!cache.can_skip_file_for_tests(k, m, &[hash_next]), "next present, must not skip");
 }
 
 // --- Proptest: absent correctness -----------------------------------------
@@ -1196,12 +1196,12 @@ proptest! {
             .flat_map(|p| p.iter().copied())
             .collect();
 
-        cache.merge_updates_bool(keys.clone(), metas.clone(), &hashes, presences).unwrap();
+        cache.merge_updates_for_tests(keys.clone(), metas.clone(), &hashes, presences).unwrap();
 
         for fi in 0..num_files {
             for fr in 0..num_frags {
                 let absent  = !presence_table[fi][fr];
-                let skipped = cache.can_skip_file(keys[fi], metas[fi], &[hashes[fr]]);
+                let skipped = cache.can_skip_file_for_tests(keys[fi], metas[fi], &[hashes[fr]]);
                 if absent {
                     prop_assert!(skipped,
                                  "false present: file={fi} frag={fr} absent but can_skip=false \
@@ -1247,7 +1247,7 @@ proptest! {
                 })
                 .collect();
 
-            cache.merge_updates_bool(keys.clone(), metas.clone(), &hashes, presences).unwrap();
+            cache.merge_updates_for_tests(keys.clone(), metas.clone(), &hashes, presences).unwrap();
 
             for fi in 0..num_files {
                 let present = (round + fi) % 2 == 0;
@@ -1258,7 +1258,7 @@ proptest! {
 
             // Verify after every round
             for &(fi, h, absent) in &ground_truth {
-                let skipped = cache.can_skip_file(keys[fi], metas[fi], &[h]);
+                let skipped = cache.can_skip_file_for_tests(keys[fi], metas[fi], &[h]);
                 if absent {
                     prop_assert!(skipped,
                                  "round={round} file={fi} hash={h:#x}: absent but not skipped");

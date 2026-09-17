@@ -1123,7 +1123,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         &self,
         file_key: FileKey,
         file_meta: FileMeta,
-        required_fragment_hashes: &[u32],
+        fragment_indexes: &[u32],
     ) -> bool {
         let Some(file_id) = self.lookup_file_id(file_key) else {
             // ----- Fast path
@@ -1139,13 +1139,13 @@ impl<S: CacheStorage> FragmentCache<S> {
         let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
         let offset            = (file_id as usize) * bits_per_file_u64;  // Start of this file's bitset
 
+        //
         // Computable from file_id alone -- no dependency on the metadata check
         // below. Fire it now so it has the width of stored_meta.matches() to
         // land before the fragment loop actually needs it.
-        if let Some(&first_hash) = required_fragment_hashes.first() {
-            if let Some(frag_index) = self.find_fragment_index(first_hash, num_fragments) {
-                prefetch_read(unsafe { self.file_bitsets.ptr.add(offset + (frag_index >> 6)) });
-            }
+        //
+        if let Some(&frag_index) = fragment_indexes.first() {
+            prefetch_read(unsafe { self.file_bitsets.ptr.add(offset + (frag_index as usize >> 6)) });
         }
 
         // ------- Validate metadata
@@ -1159,10 +1159,8 @@ impl<S: CacheStorage> FragmentCache<S> {
             return false;
         }
 
-        for &frag_hash in required_fragment_hashes {
-            let Some(frag_index) = self.find_fragment_index(frag_hash, num_fragments) else {
-                continue;
-            };
+        for &frag_index in fragment_indexes {
+            let frag_index = frag_index as usize;
 
             let u64_index = offset + (frag_index >> 6); // Which u64 contains the bit
             let bit_index = frag_index & 63;            // Which bit contains the info
@@ -1190,6 +1188,21 @@ impl<S: CacheStorage> FragmentCache<S> {
     fn find_fragment_index(&self, frag_hash: u32, num_fragments: usize) -> Option<usize> {
         // small arrays (2-10 fragments) so linear is fastest
         (0..num_fragments).find(|&i| self.fragment_hashes.get(i) == frag_hash)
+    }
+
+    /// Resolve each hash in `required_fragment_hashes` to its current
+    /// ring-buffer index, pushing results onto `out`.
+    ///
+    /// A hash that isn't currently tracked (evicted, or never added) is simply
+    /// omitted -- same as the continue in can_skip_file's fragment loop.
+    #[inline]
+    pub fn resolve_fragment_indexes(&self, required_fragment_hashes: &[u32], out: &mut Vec<u32>) {
+        let num_fragments = self.num_fragments as usize;
+        for &hash in required_fragment_hashes {
+            if let Some(index) = self.find_fragment_index(hash, num_fragments) {
+                out.push(index as u32);
+            }
+        }
     }
 
     #[inline(always)]
@@ -1554,7 +1567,9 @@ impl<S: CacheStorage> FragmentCache<S> {
                     let mut cached_word = 0u64;
 
                     for (frag_i, frag_plan) in frags.iter().enumerate() {
+                        //
                         // has_new_fragment is false here, so this is always Some.
+                        //
                         let frag_index     = unsafe { frag_plan.existing_index.unwrap_unchecked() } as usize;
 
                         let presence       = unsafe { *presence.get_unchecked(frag_i / 64) };
@@ -1698,13 +1713,9 @@ impl<S: CacheStorage> FragmentCache<S> {
                 )
             };
 
-            //
-            // Add fragments and collect indexes with their presence status
-            //
             let mut fragment_data = Vec::with_capacity(frag_indexes.len());
             for (frag_i, &frag_index) in frag_indexes.iter().enumerate() {
                 let presence = unsafe { *presence.get_unchecked(frag_i / 64) };
-
                 let is_present = (presence & (1 << (frag_i % 64))) != 0;
                 fragment_data.push((frag_index, is_present));
             }
@@ -1731,8 +1742,19 @@ impl<S: CacheStorage> FragmentCache<S> {
         let bits_per_file_u64  = num_fragments.div_ceil(64).max(1);
         let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap();
 
-        for (file_id, fragment_data, needs_full_reset) in file_updates {
+        for i in 0..file_updates.len() {
+            let (file_id, ref fragment_data, needs_full_reset) = file_updates[i];
             let offset = file_id * bits_per_file_u64;
+
+            // Prefetch the next file's bitset region one iteration ahead,
+            // files aren't guaranteed contiguous in memory (file_id order here
+            // isn't necessarily sequential), so this is a nice cache-miss hide...
+            if let Some((next_file_id, ..)) = file_updates.get(i + 1) {
+                let next_offset = next_file_id * bits_per_file_u64;
+                if next_offset < owned_file_bitsets.len() {
+                    prefetch_read(unsafe { owned_file_bitsets.as_ptr().add(next_offset) });
+                }
+            }
 
             if needs_full_reset {
                 //
@@ -1744,7 +1766,7 @@ impl<S: CacheStorage> FragmentCache<S> {
                 }
             }
 
-            for (frag_index, is_present) in fragment_data {
+            for &(frag_index, is_present) in fragment_data {
                 let frag_index = frag_index as usize;
 
                 let u64_index = offset + (frag_index / 64);
@@ -1810,12 +1832,27 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         Ok(true)
     }
+}
+
+#[allow(dead_code, reason = "tests")]
+impl<S: CacheStorage> FragmentCache<S> {
+    /// Check if file can be skipped
+    #[inline]
+    pub fn can_skip_file_for_tests(
+        &self,
+        file_key: FileKey,
+        file_meta: FileMeta,
+        fragment_hashes: &[u32],
+    ) -> bool {
+        let mut fragment_indexes = Vec::new();
+        self.resolve_fragment_indexes(fragment_hashes, &mut fragment_indexes);
+
+        self.can_skip_file(file_key, file_meta, &fragment_indexes)
+    }
 
     /// Adapter for `merge_updates` that accepts presence as a flat `Vec<bool>`
     /// (`fragment_presence[file_index * fragment_count + frag_index]`) instead of packed bits.
-    ///
-    /// Used only in tests.
-    pub fn merge_updates_bool(
+    pub fn merge_updates_for_tests(
         &mut self,
         file_keys: Vec<FileKey>,
         file_metas: Vec<FileMeta>,

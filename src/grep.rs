@@ -27,6 +27,7 @@ pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
     cache: Option<FragmentCache>,
 
     fragment_hashes: Vec<u32>,
+    fragment_indexes: Vec<u32>,
     fragment_index: IntSet<u32>,
     selected_fragment_hash_len: FragmentLen,
 
@@ -47,13 +48,18 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
 
         let fragment_index = fragment_hashes.iter().copied().collect();
 
+        let mut fragment_indexes = Vec::new();
+
         let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
             let mut config = CacheConfig::from_memory_mb(cli.cache_size_mb);
             config.cache_dir = cli.cache_dir.clone().map(Into::into);
             config.ignore_cache = cli.rebuild_cache;
 
             match FragmentCache::new(&config) {
-                Ok(cache) => Some(cache),
+                Ok(cache) => {
+                    cache.resolve_fragment_indexes(&fragment_hashes, &mut fragment_indexes);
+                    Some(cache)
+                }
 
                 Err(e) => {
                     eprintln!("Warning: Failed to initialize cache: {e}");
@@ -71,6 +77,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             ignore_case,
             cache,
             fragment_hashes,
+            fragment_indexes,
             sink,
             selected_fragment_hash_len,
             fragment_index
@@ -470,6 +477,11 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
     }
 
     #[inline]
+    pub fn fragment_indexes(&self) -> &[u32] {
+        &self.fragment_indexes
+    }
+
+    #[inline]
     pub fn cache(&self) -> Option<&FragmentCache> {
         self.cache.as_ref()
     }
@@ -505,6 +517,15 @@ impl<S: MatchSink> AnyGrepper<S> {
             AnyGrepper::Ext4(g) => g.fragment_hashes(),
             AnyGrepper::Apfs(g) => g.fragment_hashes(),
             AnyGrepper::Ntfs(g) => g.fragment_hashes(),
+        }
+    }
+
+    #[inline]
+    pub fn fragment_indexes(&self) -> &[u32] {
+        match self {
+            AnyGrepper::Ext4(g) => g.fragment_indexes(),
+            AnyGrepper::Apfs(g) => g.fragment_indexes(),
+            AnyGrepper::Ntfs(g) => g.fragment_indexes(),
         }
     }
 

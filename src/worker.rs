@@ -485,13 +485,14 @@ pub struct WorkerResult {
 
 pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     // ----- Setup-once
-    pub fs:              &'a F,
-    pub cache:    Option<&'a FragmentCache>,
-    pub fragment_hashes: &'a [u32],
-    pub matcher:         &'a Matcher,
-    pub cli:             &'a Cli,
-    pub fragment_index:  &'a IntSet<u32>,
-    pub pacer:           &'a FlushPacer,
+    pub fs:               &'a F,
+    pub cache:     Option<&'a FragmentCache>,
+    pub fragment_hashes:  &'a [u32],
+    pub fragment_indexes: &'a [u32],
+    pub matcher:          &'a Matcher,
+    pub cli:              &'a Cli,
+    pub fragment_index:   &'a IntSet<u32>,
+    pub pacer:            &'a FlushPacer,
 
     pub selected_fragment_hash_len: FragmentLen,
 
@@ -1015,7 +1016,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         if let Some(cache) = self.cache {
             let (file_key, file_meta) = unsafe { cache_key.unwrap_unchecked() };
-            if cache.can_skip_file(file_key, file_meta, self.fragment_hashes) {
+            if cache.can_skip_file(file_key, file_meta, self.fragment_indexes) {
                 self.stats.files_skipped_by_cache += 1;
                 return Ok(());
             }
