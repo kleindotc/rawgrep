@@ -253,8 +253,8 @@ run_search_benchmarks() {
     # the previous suite (or the user's normal usage) left behind.
     isolate_fragment_cache
 
-    local cmd_rawgrep="rawgrep '$pattern' '$search_dir' --jump --no-color --reserved-tool-dirs --large --threads $THREADS"
-    local cmd_rawgrep_nocache="rawgrep '$pattern' '$search_dir' --jump --no-color --threads $THREADS --reserved-tool-dirs --large --no-cache --no-cache-write"
+    local cmd_rawgrep="rawgrep '$pattern' '$search_dir' --jump --color=never --reserved-tool-dirs --large --threads $THREADS"
+    local cmd_rawgrep_nocache="rawgrep '$pattern' '$search_dir' --jump --color=never --threads $THREADS --reserved-tool-dirs --large --no-cache --no-cache-write"
     local cmd_rg="rg '$pattern' '$search_dir' --no-heading --color=never -n --threads $THREADS"
     # hypergrep has no on-disk fragment cache to toggle like rawgrep does,
     # so (like rg) one command covers all four cache-state phases below.
@@ -409,7 +409,7 @@ run_search_benchmarks "linux_regex" "$LINUX_DIR" "$PATTERN_REGEX"
 # build_fff_cache called once up front for whichever tree.
 # build_fff_cache "$CHROMIUM_DIR"
 # run_fff_benchmark "chromium_fff" "$CHROMIUM_DIR" "$PATTERN_TODO" \
-    "rawgrep '$PATTERN_TODO' '$CHROMIUM_DIR' --jump --no-color --reserved-tool-dirs --large --threads $THREADS"
+    "rawgrep '$PATTERN_TODO' '$CHROMIUM_DIR' --jump --color=never --reserved-tool-dirs --large --threads $THREADS"
 
 # --- ram usage ---
 # hyperfine's --export-json already captured peak RSS per run in
