@@ -672,7 +672,7 @@ fn setup_output_plumbing(worker_count: usize) -> OutputPlumbing {
         let topology = crate::topology::detect();
 
         _ = std::thread::spawn(move || {
-            place_output_worker(&topology, worker_count);
+            place_output_worker(topology, worker_count);
 
             OutputWorker {
                 rx: output_rx,
