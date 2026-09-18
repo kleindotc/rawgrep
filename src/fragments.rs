@@ -529,6 +529,8 @@ macro_rules! impl_fragment_presence_scanner {
         #[target_feature(enable = $feature)]
         #[allow(unsafe_op_in_unsafe_fn)]
         pub unsafe fn $fn_name(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64], mask: u32) {
+            use crate::index_::{Index_, IndexMut_};
+
             let num_frags = fragment_hashes.len();
             let stride = stride_heuristic(buf.len()).max($min_stride);
             let buf_len = buf.len();
@@ -630,7 +632,7 @@ macro_rules! impl_fragment_presence_scanner {
                     for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
                         debug_assert!(frag_idx / 64 < fragment_presence_scratch.len());
 
-                        if *fragment_presence_scratch.get_unchecked(frag_idx / 64) & (1u64 << (frag_idx % 64)) != 0 {
+                        if *fragment_presence_scratch.get_(frag_idx / 64) & (1u64 << (frag_idx % 64)) != 0 {
                             continue;
                         }
 
@@ -639,7 +641,7 @@ macro_rules! impl_fragment_presence_scanner {
                         let $ha = hashes;
                         let $hb = pattern;
                         if $match_block {
-                            *fragment_presence_scratch.get_unchecked_mut(frag_idx / 64) |= 1u64 << (frag_idx % 64);
+                            *fragment_presence_scratch.get_mut_(frag_idx / 64) |= 1u64 << (frag_idx % 64);
                             remaining -= 1;
                         }
                     }
@@ -662,12 +664,12 @@ macro_rules! impl_fragment_presence_scanner {
                     while offset + 4 <= buf_len {
                         let hash = tail_hash_at::<$case_insensitive>(buf, offset, mask);
                         for (frag_idx, &frag_hash) in fragment_hashes.iter().enumerate() {
-                            if *fragment_presence_scratch.get_unchecked(frag_idx / 64) & (1u64 << (frag_idx % 64)) != 0 {
+                            if *fragment_presence_scratch.get_(frag_idx / 64) & (1u64 << (frag_idx % 64)) != 0 {
                                 continue;
                             }
 
                             if frag_hash == hash {
-                                *fragment_presence_scratch.get_unchecked_mut(frag_idx / 64) |= 1u64 << (frag_idx % 64);
+                                *fragment_presence_scratch.get_mut_(frag_idx / 64) |= 1u64 << (frag_idx % 64);
                                 remaining -= 1;
                                 break;
                             }

@@ -40,6 +40,8 @@ pub mod thin_path_arc;
 pub mod binary_ext;
 pub mod extractor;
 pub mod liner;
+pub mod unwrap_;
+pub mod index_;
 pub mod logger;
 
 pub use crossbeam_channel;

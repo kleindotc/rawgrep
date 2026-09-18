@@ -4,6 +4,7 @@ use crate::error::Error;
 use crate::output::{OutputSlotPool, OutputSlotWriter};
 use crate::RawGrepConfig;
 use crate::parser::RawFs;
+use crate::unwrap_::Unwrap_;
 use crate::path_buf::SmallPathBuf;
 use crate::stdout::{RawStdout, OutputKind};
 use crate::{cli, ignore, platform, CursorHide};
@@ -16,11 +17,10 @@ use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, Worker
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::io::IsTerminal;
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use parking_lot::{Condvar, Mutex, RwLock};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 
@@ -55,7 +55,6 @@ pub struct RawGrepCtx<S: MatchSink> {
     running:        Arc<AtomicBool>,
     active_workers: Arc<AtomicUsize>,
 
-    running_signal: Arc<(Mutex<()>, Condvar)>,    // Notified when `running` flips false
     job_done:       Arc<(Mutex<usize>, Condvar)>, // Counts workers still owing a finish for this job
 
     wake:           Arc<(Mutex<u64>, Condvar)>,
@@ -78,7 +77,6 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             injector: Arc::default(),
             active_workers: Arc::default(),
             job_done: Arc::default(),
-            running_signal: Arc::default(),
             wake: Arc::default(),
             _cursor_hide_for_tty: plumbing.cursor_hide,
             current_job: Arc::default(),
@@ -112,7 +110,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             let ctx       = self.clone();
             let stealers  = stealers.clone();
             let pacer     = pacer.clone();
-            let slot_pool = slot_pools.pop().unwrap();
+            let slot_pool = slot_pools.pop().unwrap_();
             let core      = worker_cores[worker_id];
 
             std::thread::spawn(move || {
@@ -156,7 +154,6 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             injector: Arc::new(Injector::new()),
             active_workers: Arc::default(),
             job_done: Arc::new((Mutex::new(worker_count), Condvar::new())),
-            running_signal: Arc::default(),
             wake: Arc::new((Mutex::new(1u64), Condvar::new())),
             _cursor_hide_for_tty: plumbing.cursor_hide,
             current_job: Arc::new(RwLock::new(Some(Arc::new(job)))),
@@ -185,30 +182,20 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     #[inline]
     pub fn cancel(&self) {
         self.running.store(false, Ordering::SeqCst);
-        {
-            let (lock, cvar) = &*self.running_signal;
-            let _guard = lock.lock();
-            cvar.notify_all();
-        }
     }
 
     #[inline]
     pub fn wait(&mut self) -> (Stats, Option<CacheStats>) {
         {
-            let (lock, cvar) = &*self.running_signal;
-            let mut guard = lock.lock();
-            cvar.wait_while(&mut guard, |_| self.running.load(Ordering::SeqCst));
-        }
-        {
             let (lock, cvar) = &*self.job_done;
-            let mut guard = lock.lock();
-            cvar.wait_while(&mut guard, |remaining| *remaining > 0);
+            let guard = lock.lock().unwrap_();
+            drop(cvar.wait_while(guard, |remaining| *remaining > 0).unwrap_());
         }
 
         _ = self.output_tx.send(OutputMessage::FlushReq);
-        _ = self.flush_ack_rx.lock().recv();
+        _ = self.flush_ack_rx.lock().unwrap_().recv();
 
-        self.current_job.read()
+        self.current_job.read().unwrap_()
             .as_ref()
             .map(|j| (j.stats.to_stats(), j.grepper.cache().map(|c| c.stats.to_cache_stats())))
             .unwrap_or_default()
@@ -232,7 +219,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             return;
         }
 
-        let mut guard = self.current_job.write();
+        let mut guard = self.current_job.write().unwrap_();
 
         let Some(job_arc) = guard.as_mut() else {
             debug!("[ctx] self.job is None..");
@@ -243,7 +230,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             return;
         };
 
-        let acc = job.cache_acc.lock();
+        let acc = job.cache_acc.lock().unwrap_();
         let file_keys         = &acc.file_keys;
         let file_metas        = &acc.file_metas;
         let fragment_presence = &acc.fragment_presence;
@@ -292,21 +279,16 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         //
         self.running.store(false, Ordering::SeqCst);
         {
-            let (lock, cvar) = &*self.running_signal;
-            let mut guard = lock.lock();
-            cvar.wait_while(&mut guard, |_| self.running.load(Ordering::SeqCst));
-        }
-        {
             let (lock, cvar) = &*self.job_done;
-            let mut guard = lock.lock();
-            cvar.wait_while(&mut guard, |remaining| *remaining > 0);
+            let guard = lock.lock().unwrap_();
+            drop(cvar.wait_while(guard, |remaining| *remaining > 0).unwrap_());
         }
         while self.injector.steal().is_success() {}
 
         // Now it's safe to arm the counter for the new generation.
         {
             let (lock, _) = &*self.job_done;
-            *lock.lock() = self.worker_count;
+            *lock.lock().unwrap_() = self.worker_count;
         }
 
         let (job, work) = build_job_and_initial_work(config, sink, inspect_before_search)?;
@@ -315,7 +297,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         // Swap in new job
         //
         {
-            let mut guard = self.current_job.write();
+            let mut guard = self.current_job.write().unwrap_();
             *guard = Some(job.into());
         }
         debug!("[ctx] job swapped in");
@@ -326,7 +308,7 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         self.running.store(true, Ordering::SeqCst);
         let (lock, cvar) = &*self.wake;
         {
-            let mut _gen = lock.lock();
+            let mut _gen = lock.lock().unwrap_();
             *_gen = _gen.wrapping_add(1);
         }
         cvar.notify_all();
@@ -380,9 +362,9 @@ fn worker_thread_main<S: MatchSink + 'static>(
         //
         {
             let (lock, cvar) = ctx.wake.as_ref();
-            let mut _gen = lock.lock();
+            let mut _gen = lock.lock().unwrap_();
             while *_gen == last_gen {
-                cvar.wait(&mut _gen);
+                _gen = cvar.wait(_gen).unwrap_();
             }
             last_gen = *_gen;
         }
@@ -392,7 +374,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
         // Grab the current job
         let job = {
-            let guard = ctx.current_job.read();
+            let guard = ctx.current_job.read().unwrap_();
             match guard.as_ref() {
                 Some(j) => Arc::clone(j),
                 None    => {
@@ -423,7 +405,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
             fragment_presence = FragmentPresenceBits::new(fragment_hash_count);
         }
         if matcher_cache.is_none() {
-            matcher_cache = Some(job.grepper.matcher().create_cache().unwrap());
+            matcher_cache = Some(job.grepper.matcher().create_cache().unwrap_());
         }
 
         let ignore_case = job.grepper.ignore_case();
@@ -478,7 +460,6 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     pending_fragment_presence: fragment_presence,
                 }.start_worker_loop(
                     &ctx.running,
-                    &ctx.running_signal,
                     &ctx.active_workers,
                     &ctx.injector,
                     stealers,
@@ -519,7 +500,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
         // Deposit cache data
         if !cli.no_cache_write && !cli.no_cache {
-            let mut acc = job.cache_acc.lock();
+            let mut acc = job.cache_acc.lock().unwrap_();
             acc.file_keys.append(&mut result.file_keys);
             acc.file_metas.append(&mut result.file_metas);
             acc.fragment_presence.append(&mut result.fragment_presence.words);
@@ -531,7 +512,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
         {
             let (lock, cvar) = &*ctx.job_done;
-            let mut remaining = lock.lock();
+            let mut remaining = lock.lock().unwrap_();
             *remaining -= 1;
             if *remaining == 0 {
                 cvar.notify_all();
@@ -698,6 +679,6 @@ fn place_output_worker(topology: &crate::topology::CoreTopology, worker_count: u
 
     match free {
         Some(lp) => crate::util::pin_thread_to_core(lp),
-        None     => crate::topology::pin_thread_to_core_deprioritized(*worker_cores.last().unwrap()),
+        None     => crate::topology::pin_thread_to_core_deprioritized(*worker_cores.last().unwrap_()),
     }
 }

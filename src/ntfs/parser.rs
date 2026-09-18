@@ -3,6 +3,7 @@
 use smallvec::SmallVec;
 
 use crate::{tracy, util};
+use crate::unwrap_::Unwrap_;
 use crate::cli::Cli;
 use crate::binary::{is_dot_entry, is_hidden_entry};
 use crate::util::{read_at_offset, read_u8_unaligned, read_u32_unaligned_le, read_u64_unaligned_le};
@@ -444,7 +445,7 @@ impl NtfsFs {
             if apply_fixups(&mut indx).is_err() { continue; }
 
             if indx.len() < 4 { continue; }
-            if u32::from_le_bytes(indx[0..4].try_into().unwrap()) != NTFS_INDX_MAGIC { continue; }
+            if u32::from_le_bytes(indx[0..4].try_into().unwrap_()) != NTFS_INDX_MAGIC { continue; }
             if indx.len() < 0x28 { continue; }
 
             let node_hdr = &indx[0x18..];
@@ -471,10 +472,10 @@ fn parse_boot_sector(boot: &[u8]) -> io::Result<NtfsSuperBlock> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Not an NTFS volume"));
     }
 
-    let bytes_per_sector    = u16::from_le_bytes(boot[11..13].try_into().unwrap());
+    let bytes_per_sector    = u16::from_le_bytes(boot[11..13].try_into().unwrap_());
     let sectors_per_cluster = boot[13];
     let cluster_size = bytes_per_sector as u32 * sectors_per_cluster as u32;
-    let mft_lcn = u64::from_le_bytes(boot[48..56].try_into().unwrap());
+    let mft_lcn = u64::from_le_bytes(boot[48..56].try_into().unwrap_());
     let mft_record_size = {
         let raw = boot[64] as i8;
         if raw > 0 { (raw as u32) * cluster_size } else { 1u32 << (-raw as u32) }
@@ -489,7 +490,7 @@ fn validate_file_magic(record: &[u8]) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "MFT record too short"));
     }
 
-    if u32::from_le_bytes(record[0..4].try_into().unwrap()) != NTFS_FILE_MAGIC {
+    if u32::from_le_bytes(record[0..4].try_into().unwrap_()) != NTFS_FILE_MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad MFT record magic"));
     }
 
@@ -502,8 +503,8 @@ fn validate_file_magic(record: &[u8]) -> io::Result<()> {
 fn apply_fixups(buf: &mut [u8]) -> io::Result<()> {
     if buf.len() < 8 { return Ok(()); }
 
-    let usa_offset = u16::from_le_bytes(buf[4..6].try_into().unwrap()) as usize;
-    let usa_count  = u16::from_le_bytes(buf[6..8].try_into().unwrap()) as usize;
+    let usa_offset = u16::from_le_bytes(buf[4..6].try_into().unwrap_()) as usize;
+    let usa_count  = u16::from_le_bytes(buf[6..8].try_into().unwrap_()) as usize;
 
     if usa_count < 2 || usa_offset + usa_count * 2 > buf.len() { return Ok(()); }
 
@@ -535,7 +536,7 @@ fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsInode> {
     validate_file_magic(record)?;
 
     let flags = &record[NTFS_MFT_RECORD_FLAGS_OFFSET..NTFS_MFT_RECORD_FLAGS_OFFSET+2];
-    let flags = u16::from_le_bytes(flags.try_into().unwrap());
+    let flags = u16::from_le_bytes(flags.try_into().unwrap_());
     if flags & NTFS_MFT_RECORD_FLAG_IN_USE == 0 {
         return Err(io::Error::new(io::ErrorKind::NotFound, "MFT record not in use"));
     }
@@ -545,7 +546,7 @@ fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsInode> {
         let val_off = read_u32_unaligned_le(si, NTFS_ATTR_RES_VALUE_OFF_OFFSET) as usize;
         if val_off + NTFS_SI_MTIME_OFFSET + 8 <= si.len() {
             let ft = &si[val_off + NTFS_SI_MTIME_OFFSET..val_off + NTFS_SI_MTIME_OFFSET + 8];
-            let ft = u64::from_le_bytes(ft.try_into().unwrap());
+            let ft = u64::from_le_bytes(ft.try_into().unwrap_());
             mtime_sec = filetime_to_unix(ft);
         }
     }
@@ -558,7 +559,7 @@ fn parse_mft_record(record: &[u8], record_num: u64) -> io::Result<NtfsInode> {
 fn find_data_size(record: &[u8]) -> u64 {
     match find_attribute(record, NTFS_ATTR_DATA, None) {
         Some((true,  attr)) => read_u32_unaligned_le(attr, NTFS_ATTR_RES_VALUE_LEN_OFFSET) as u64,
-        Some((false, attr)) if attr.len() >= 56 => u64::from_le_bytes(attr[48..56].try_into().unwrap()), // data_size at +0x30
+        Some((false, attr)) if attr.len() >= 56 => u64::from_le_bytes(attr[48..56].try_into().unwrap_()), // data_size at +0x30
         _ => 0,
     }
 }
@@ -611,7 +612,7 @@ fn decode_runlist(attr_slice: &[u8], _sb: &NtfsSuperBlock) -> io::Result<SmallVe
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Attr slice too short"));
     }
 
-    let runlist_off = u16::from_le_bytes(attr_slice[32..34].try_into().unwrap()) as usize;
+    let runlist_off = u16::from_le_bytes(attr_slice[32..34].try_into().unwrap_()) as usize;
     if runlist_off >= attr_slice.len() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Runlist offset out of range"));
     }
@@ -683,13 +684,13 @@ fn filetime_to_unix(ft: u64) -> i64 {
 fn linearise_index_entries_into(entries_buf: &[u8], out: &mut Vec<u8>) {
     let mut pos = 0;
     while pos + 0x10 <= entries_buf.len() { // @Cleanup
-        let entry_len = u16::from_le_bytes(entries_buf[pos+8..pos+10].try_into().unwrap()) as usize;
-        let key_len   = u16::from_le_bytes(entries_buf[pos+10..pos+12].try_into().unwrap()) as usize;
-        let flags     = u16::from_le_bytes(entries_buf[pos+12..pos+14].try_into().unwrap());
+        let entry_len = u16::from_le_bytes(entries_buf[pos+8..pos+10].try_into().unwrap_()) as usize;
+        let key_len   = u16::from_le_bytes(entries_buf[pos+10..pos+12].try_into().unwrap_()) as usize;
+        let flags     = u16::from_le_bytes(entries_buf[pos+12..pos+14].try_into().unwrap_());
 
         if entry_len < 0x10 || flags & NTFS_INDEX_ENTRY_LAST != 0 { break; }
 
-        let record_num = u64::from_le_bytes(entries_buf[pos..pos+8].try_into().unwrap()) & 0x0000_FFFF_FFFF_FFFF;
+        let record_num = u64::from_le_bytes(entries_buf[pos..pos+8].try_into().unwrap_()) & 0x0000_FFFF_FFFF_FFFF;
 
         'entry: {
             let key_end = pos + 0x10 + key_len;
@@ -700,7 +701,7 @@ fn linearise_index_entries_into(entries_buf: &[u8], out: &mut Vec<u8>) {
 
             let namespace   = key[NTFS_FN_NAMESPACE_OFFSET];
             let fn_name_len = key[NTFS_FN_NAME_LEN_OFFSET] as usize;
-            let file_attrs  = key[NTFS_FN_FLAGS_OFFSET..NTFS_FN_FLAGS_OFFSET+4].try_into().unwrap();
+            let file_attrs  = key[NTFS_FN_FLAGS_OFFSET..NTFS_FN_FLAGS_OFFSET+4].try_into().unwrap_();
             let file_attrs  = u32::from_le_bytes(file_attrs);
 
             if namespace == 2 || fn_name_len == 0 { break 'entry; }

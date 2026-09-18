@@ -1,6 +1,7 @@
 //! ext4 filesystem implementation of RawFs trait
 
 use crate::{tracy, util};
+use crate::index_::{Index_, IndexMut_};
 use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u64_unaligned_le};
 use crate::grep::{AnyNodeScratch, AnyNodeCache, NodeCacheStats};
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe, FastDivU32};
@@ -269,7 +270,7 @@ impl RawFs for Ext4Fs {
 
             unsafe { buf.set_len(new_len); }  // @ProbablySafe...
 
-            match self.read_at_offset(unsafe { buf.get_unchecked_mut(old_len..) }, disk_offset) {
+            match self.read_at_offset(buf.get_mut_(old_len..), disk_offset) {
                 Ok(n) => buf.truncate(old_len + n),
                 Err(_) => { buf.truncate(old_len); break; }
             }
@@ -328,12 +329,11 @@ impl RawFs for Ext4Fs {
                 unsafe { buf.set_len(probe_len); }  // @ProbablySafe...
 
                 let offset = first.start * block_size;
-                match self.read_at_offset(unsafe { buf.get_unchecked_mut(..probe_len) }, offset) {
+                match self.read_at_offset(buf.get_mut_(..probe_len), offset) {
                     Ok(n) => {
                         buf.truncate(n);
-                        debug_assert!(buf.len() >= n);
 
-                        if binary_probe(unsafe { buf.get_unchecked(..n) }, file_size) {
+                        if binary_probe(buf.get_(..n), file_size) {
                             buf.clear();
                             return Ok(false);                    // binary
                         }
@@ -397,7 +397,7 @@ impl RawFs for Ext4Fs {
             // Direct blocks
             //
 
-            let blocks = unsafe { node.blocks.get_unchecked(..EXT4_BLOCK_POINTERS_COUNT) };
+            let blocks = node.blocks.get_(..EXT4_BLOCK_POINTERS_COUNT);
 
             if blocks.iter().all(|&b| b == 0 || b as u64 >= self.max_block) {
                 return Ok(true);
@@ -419,8 +419,7 @@ impl RawFs for Ext4Fs {
                 //
                 let n = self.read_at_offset(scratch2, first as u64 * block_size).unwrap_or(0);
 
-                debug_assert!(scratch2.len() >= n);
-                let probe = unsafe { scratch2.get_unchecked(..n) };
+                let probe = scratch2.get_(..n);
 
                 if binary_probe(probe, file_size) {
                     return Ok(false); // binary
@@ -557,13 +556,9 @@ impl Ext4Fs {
     pub fn inode_disk_offset(&self, inode_num: u64) -> u64 {
         let (group, index) = self.sb.inodes_per_group_recip.divmod(inode_num - 1);
 
-        debug_assert!(self.inode_table_blocks.len() >= group as usize);
-
-        unsafe {
-            self.inode_table_blocks.get_unchecked(group as usize)
+        self.inode_table_blocks.get_(group as usize)
             * self.sb.block_size as u64
             + index * self.sb.inode_size as u64
-        }
     }
 
     /// Read inline data from inode's block array (max 60 bytes)
@@ -582,7 +577,7 @@ impl Ext4Fs {
         let inline_bytes: &[u8] = util::cast_slice(&node.blocks);
         let actual_size = size_to_read.min(inline_bytes.len());
 
-        let inline_bytes = unsafe { inline_bytes.get_unchecked(..actual_size) };
+        let inline_bytes = inline_bytes.get_(..actual_size);
         if check_binary && binary_probe(inline_bytes, actual_size) {
             return Ok(false);
         }

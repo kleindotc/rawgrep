@@ -79,6 +79,8 @@ mod pack_self_consistency_tests {
 
 #[inline(always)]
 fn binary_search<T: Ord + Copy>(sorted: &[T], target: T) -> bool {
+    use crate::index_::Index_;
+
     if sorted.is_empty() {
         return false;
     }
@@ -88,7 +90,7 @@ fn binary_search<T: Ord + Copy>(sorted: &[T], target: T) -> bool {
 
     while len > 1 {
         let half = len / 2;
-        let mid = unsafe { *sorted.get_unchecked(base + half) };
+        let mid = *sorted.get_(base + half);
         if mid <= target {
             base += half;
         }
@@ -96,7 +98,7 @@ fn binary_search<T: Ord + Copy>(sorted: &[T], target: T) -> bool {
         len -= half;
     }
 
-    unsafe { *sorted.get_unchecked(base) == target }
+    *sorted.get_(base) == target
 }
 
 //

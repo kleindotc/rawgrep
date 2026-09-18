@@ -2,6 +2,8 @@
 
 use crate::debug;
 use crate::writeln_blue;
+use crate::unwrap_::Unwrap_;
+use crate::index_::{Index_, IndexMut_};
 use crate::util::{likely, unlikely, prefetch_read};
 
 use std::time::Instant;
@@ -450,18 +452,18 @@ impl CacheStorage for DiskStorage {
 
 #[derive(Default)]
 pub struct MemoryStorage {
-    data: parking_lot::Mutex<Option<Vec<u8>>>,
+    data: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl CacheStorage for MemoryStorage {
     #[inline]
     fn load(&self) -> io::Result<Option<Vec<u8>>> {
-        Ok(self.data.lock().clone())
+        Ok(self.data.lock().unwrap_().clone())
     }
 
     #[inline]
     fn save(&self, data: &[u8]) -> io::Result<()> {
-        *self.data.lock() = Some(data.to_vec());
+        *self.data.lock().unwrap_() = Some(data.to_vec());
         Ok(())
     }
 
@@ -475,7 +477,7 @@ impl CacheStorage for MemoryStorage {
             data.extend_from_slice(segment);
         }
 
-        *self.data.lock() = Some(data);
+        *self.data.lock().unwrap_() = Some(data);
         Ok(())
     }
 }
@@ -526,7 +528,7 @@ fn rebuild_lookup(lookup: &mut [u32], num_files: usize, key_at: impl Fn(usize) -
     let mut next_index = (num_files > 0).then(|| (key_at(0).hash() as usize) & mask);
 
     for file_id in 0..num_files {
-        let index = unsafe { next_index.unwrap_unchecked() };
+        let index = next_index.unwrap_();
 
         if let Some(next_id) = (file_id + 1 < num_files).then_some(file_id + 1) {
             let nh = (key_at(next_id).hash() as usize) & mask;
@@ -536,9 +538,9 @@ fn rebuild_lookup(lookup: &mut [u32], num_files: usize, key_at: impl Fn(usize) -
 
         let mut probe = index;
         for _ in 0..16 {
-            let existing = unsafe { *lookup.get_unchecked(probe) };
+            let existing = *lookup.get_(probe);
             if existing == FILE_LOOKUP_EMPTY {
-                unsafe { *lookup.get_unchecked_mut(probe) = file_id as u32 };
+                *lookup.get_mut_(probe) = file_id as u32;
                 break;
             }
 
@@ -612,7 +614,7 @@ impl FragmentCache<MemoryStorage> {
             cache_dir: None,
             ignore_cache: false,
         };
-        Self::create_empty(&config, MemoryStorage::default()).unwrap()
+        Self::create_empty(&config, MemoryStorage::default()).unwrap_()
     }
 
     pub fn with_test_data(
@@ -635,9 +637,9 @@ impl FragmentCache<MemoryStorage> {
         let num_files = file_keys.len();
 
         {
-            let owned_keys  = cache.owned_file_keys.as_mut().unwrap();
-            let owned_metas = cache.owned_file_metas.as_mut().unwrap();
-            let owned_bits  = cache.owned_file_bitsets.as_mut().unwrap();
+            let owned_keys  = cache.owned_file_keys.as_mut().unwrap_();
+            let owned_metas = cache.owned_file_metas.as_mut().unwrap_();
+            let owned_bits  = cache.owned_file_bitsets.as_mut().unwrap_();
 
             for file_id in 0..num_files {
                 owned_keys[file_id]  = file_keys[file_id];
@@ -660,10 +662,10 @@ impl FragmentCache<MemoryStorage> {
             }
         }
 
-        cache.fragment_hashes = FatPtr::from_box(cache.owned_fragment_hashes.as_ref().unwrap());
-        cache.file_keys       = FatPtr::from_box(cache.owned_file_keys.as_ref().unwrap());
-        cache.file_metas      = FatPtr::from_box(cache.owned_file_metas.as_ref().unwrap());
-        cache.file_bitsets    = FatPtr::from_box(cache.owned_file_bitsets.as_ref().unwrap());
+        cache.fragment_hashes = FatPtr::from_box(cache.owned_fragment_hashes.as_ref().unwrap_());
+        cache.file_keys       = FatPtr::from_box(cache.owned_file_keys.as_ref().unwrap_());
+        cache.file_metas      = FatPtr::from_box(cache.owned_file_metas.as_ref().unwrap_());
+        cache.file_bitsets    = FatPtr::from_box(cache.owned_file_bitsets.as_ref().unwrap_());
 
         cache.num_files = num_files as u32;
 
@@ -840,9 +842,9 @@ impl<S: CacheStorage> FragmentCache<S> {
         // (Used to be 3 separate copy-pasted alloc+copy blocks -- see
         // finish_grow() near the top of the file. @Refactor done.)
         //
-        let old_file_keys    = self.owned_file_keys.take().unwrap();
-        let old_file_metas   = self.owned_file_metas.take().unwrap();
-        let old_file_bitsets = self.owned_file_bitsets.take().unwrap();
+        let old_file_keys    = self.owned_file_keys.take().unwrap_();
+        let old_file_metas   = self.owned_file_metas.take().unwrap_();
+        let old_file_bitsets = self.owned_file_bitsets.take().unwrap_();
 
         let old_u64s       = num_files * bits_per_file_u64;
         let new_total_u64s = new_capacity * bits_per_file_u64;
@@ -863,7 +865,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             let mut new_lookup = new_empty_lookup(needed_lookup_size);
 
             // Rehash all existing entries
-            rebuild_lookup(&mut new_lookup, num_files, |id| unsafe { *new_file_keys.get_unchecked(id) });
+            rebuild_lookup(&mut new_lookup, num_files, |id| *new_file_keys.get_(id));
 
             self.file_lookup = new_lookup;
         }
@@ -900,7 +902,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         let num_files     = self.num_files as usize;
         let file_capacity = self.file_capacity;
 
-        let old_bits = self.owned_file_bitsets.take().unwrap();
+        let old_bits = self.owned_file_bitsets.take().unwrap_();
 
         // Unknown -- only bits we've actually verified get set to 1.
         let mut new_bits = vec![0u64; file_capacity * new_stride].into_boxed_slice();
@@ -925,7 +927,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         }
 
         self.owned_file_bitsets = Some(new_bits);
-        self.file_bitsets = FatPtr::from_box(self.owned_file_bitsets.as_ref().unwrap());
+        self.file_bitsets = FatPtr::from_box(self.owned_file_bitsets.as_ref().unwrap_());
     }
 
     fn load_from_disk(storage: S, config: &CacheConfig) -> io::Result<Self> {
@@ -1220,7 +1222,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         let mut index = (hash as usize) & mask;
 
         for _ in 0..16 {
-            let file_id = *unsafe { self.file_lookup.get_unchecked(index) };
+            let file_id = *self.file_lookup.get_(index);
             if file_id == FILE_LOOKUP_EMPTY {
                 return None;
             }
@@ -1250,11 +1252,9 @@ impl<S: CacheStorage> FragmentCache<S> {
             let index = num_fragments;
             let new_num_fragments = num_fragments + 1;
 
-            unsafe {
-                *self.owned_fragment_hashes.as_mut()
-                    .unwrap_unchecked()
-                    .get_unchecked_mut(index) = frag_hash;
-            }
+            *self.owned_fragment_hashes.as_mut()
+                .unwrap_()
+                .get_mut_(index) = frag_hash;
 
             //
             // Migrate bitset stride if we crossed a 64-boundary
@@ -1284,11 +1284,9 @@ impl<S: CacheStorage> FragmentCache<S> {
             let ring_pos = self.ring_pos as usize;
             let index = ring_pos;
 
-            unsafe {
-                *self.owned_fragment_hashes.as_mut()
-                    .unwrap_unchecked()
-                    .get_unchecked_mut(index) = frag_hash;
-            }
+            *self.owned_fragment_hashes.as_mut()
+                .unwrap_()
+                .get_mut_(index) = frag_hash;
 
             let next_pos = (ring_pos + 1) % (self.max_fragments as usize);
             self.ring_pos = next_pos as u32;
@@ -1319,7 +1317,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         let bit_index  = index % 64;
         let mask       = !(1u64 << bit_index);
 
-        let owned_file_bitsets = unsafe { self.owned_file_bitsets.as_mut().unwrap_unchecked() };
+        let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap_();
 
         if bits_per_file_u64 == 1 {
             debug_assert_eq!(u64_offset, 0, "bits_per_file_u64 == 1 implies index < 64");
@@ -1345,9 +1343,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         for file_id in 0..num_files {
             let bitset_index = file_id * bits_per_file_u64 + u64_offset;
             if bitset_index < owned_file_bitsets_len {
-                unsafe {
-                    *owned_file_bitsets.get_unchecked_mut(bitset_index) &= mask;
-                }
+                *owned_file_bitsets.get_mut_(bitset_index) &= mask;
             }
         }
     }
@@ -1362,12 +1358,10 @@ impl<S: CacheStorage> FragmentCache<S> {
         // @Note: This might silently fail, which means this file will always
         // miss the cache, maybe we should return like a boolean or something.
         for _ in 0..16 {
-            let existing = unsafe { *self.file_lookup.get_unchecked(index) };
+            let existing = *self.file_lookup.get_(index);
 
             if existing == FILE_LOOKUP_EMPTY {
-                unsafe {
-                    *self.file_lookup.get_unchecked_mut(index) = file_id;
-                }
+                *self.file_lookup.get_mut_(index) = file_id;
 
                 return;  // Successfully inserted
             }
@@ -1502,7 +1496,7 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         let fast_word = bits_per_file_u64 == 1 && words_per_file == 1 && !has_new_fragment;
         let selector_mask: u64 = if fast_word {
-            frags.iter().fold(0u64, |m, f| m | (1u64 << f.existing_index.unwrap()))
+            frags.iter().fold(0u64, |m, f| m | (1u64 << f.existing_index.unwrap_()))
         } else {
             0
         };
@@ -1512,8 +1506,8 @@ impl<S: CacheStorage> FragmentCache<S> {
                 self.prefetch_lookup(next_key);
             }
 
-            let file_key  = *unsafe { file_keys .get_unchecked(file_index) };
-            let file_meta = *unsafe { file_metas.get_unchecked(file_index) };
+            let file_key  = *file_keys .get_(file_index);
+            let file_meta = *file_metas.get_(file_index);
 
             let existing_id = self.lookup_file_id(file_key);
             let meta_changed = match existing_id {
@@ -1541,12 +1535,12 @@ impl<S: CacheStorage> FragmentCache<S> {
                     // Fast branch-free path when bits_per_file_u64 == 1 ...
                     //
 
-                    let presence_word = unsafe { *fragment_presence.get_unchecked(file_index) };
+                    let presence_word = *fragment_presence.get_(file_index);
 
                     let mut deposited = 0u64;
                     for (frag_i, f) in frags.iter().enumerate() {
                         let bit = (presence_word >> frag_i) & 1;
-                        deposited |= bit << unsafe { f.existing_index.unwrap_unchecked() };
+                        deposited |= bit << f.existing_index.unwrap_();
                     }
 
                     let expected = !deposited & selector_mask;
@@ -1557,11 +1551,11 @@ impl<S: CacheStorage> FragmentCache<S> {
                     }
 
                 } else {
-                    let presence = unsafe {
-                        fragment_presence.get_unchecked(
-                            file_index * words_per_file .. (file_index + 1) * words_per_file
-                        )
-                    };
+                    let presence = fragment_presence.get_(
+                        file_index * words_per_file
+                        ..
+                        (file_index + 1) * words_per_file
+                    );
 
                     let mut cached_u64_index = usize::MAX;
                     let mut cached_word = 0u64;
@@ -1570,9 +1564,9 @@ impl<S: CacheStorage> FragmentCache<S> {
                         //
                         // has_new_fragment is false here, so this is always Some.
                         //
-                        let frag_index     = unsafe { frag_plan.existing_index.unwrap_unchecked() } as usize;
+                        let frag_index     = frag_plan.existing_index.unwrap_() as usize;
 
-                        let presence       = unsafe { *presence.get_unchecked(frag_i / 64) };
+                        let presence       = *presence.get_(frag_i / 64);
                         let is_present     = (presence & (1 << (frag_i % 64))) != 0;
 
                         let expect_bit_set = !is_present;
@@ -1666,8 +1660,8 @@ impl<S: CacheStorage> FragmentCache<S> {
                 break;
             }
 
-            let file_key  = *unsafe { file_keys .get_unchecked(file_plan.file_index as usize) };
-            let file_meta = *unsafe { file_metas.get_unchecked(file_plan.file_index as usize) };
+            let file_key  = *file_keys .get_(file_plan.file_index as usize);
+            let file_meta = *file_metas.get_(file_plan.file_index as usize);
 
             let file_id = match file_plan.existing_id {
                 Some(id) => id as usize,
@@ -1692,30 +1686,28 @@ impl<S: CacheStorage> FragmentCache<S> {
             // Update metadata
             //
 
-            unsafe {
-                *self.owned_file_keys.as_mut().unwrap_unchecked()
-                    .get_unchecked_mut(file_id) = file_key;
+            *self.owned_file_keys.as_mut().unwrap_().get_mut_(file_id) = file_key;
 
-                *self.owned_file_metas.as_mut().unwrap_unchecked()
-                    .get_unchecked_mut(file_id) = file_meta;
-            }
+            *self.owned_file_metas.as_mut().unwrap_().get_mut_(file_id) = file_meta;
 
             let needs_full_reset =
                 file_plan.existing_id.is_none()
              || file_plan.meta_changed
              || file_id >= original_num_files;
 
-            let presence = unsafe {
+            let presence = {
                 let file_index     = file_plan.file_index as usize;
                 let words_per_file = words_per_file       as usize;
-                fragment_presence.get_unchecked(
-                    file_index * words_per_file .. (file_index + 1) * words_per_file
+                fragment_presence.get_(
+                    file_index * words_per_file
+                    ..
+                    (file_index + 1) * words_per_file
                 )
             };
 
             let mut fragment_data = Vec::with_capacity(frag_indexes.len());
             for (frag_i, &frag_index) in frag_indexes.iter().enumerate() {
-                let presence = unsafe { *presence.get_unchecked(frag_i / 64) };
+                let presence = *presence.get_(frag_i / 64);
                 let is_present = (presence & (1 << (frag_i % 64))) != 0;
                 fragment_data.push((frag_index, is_present));
             }
@@ -1740,7 +1732,7 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         let num_fragments      = self.num_fragments as usize;
         let bits_per_file_u64  = num_fragments.div_ceil(64).max(1);
-        let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap();
+        let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap_();
 
         for i in 0..file_updates.len() {
             let (file_id, ref fragment_data, needs_full_reset) = file_updates[i];
@@ -1773,7 +1765,7 @@ impl<S: CacheStorage> FragmentCache<S> {
                 let bit_index = frag_index % 64;
 
                 if u64_index < owned_file_bitsets.len() {
-                    let bits = unsafe { owned_file_bitsets.get_unchecked_mut(u64_index) };
+                    let bits = owned_file_bitsets.get_mut_(u64_index);
                     if is_present {
                         // ----- Fragment PRESENT - clear bit (bit=0)
                         *bits &= !(1u64 << bit_index);

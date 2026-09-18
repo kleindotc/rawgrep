@@ -785,7 +785,6 @@ dependencies = [
  "memmap2",
  "mimalloc",
  "nohash-hasher",
- "parking_lot",
  "paste",
  "proptest",
  "regex-automata",

@@ -1,7 +1,4 @@
-use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
-use std::io::{self, Seek};
-use std::fs::{File, OpenOptions};
-
+use crate::unwrap_::Unwrap_;
 use crate::apfs::{ApfsFs, ApfsVolume, APFS_NX_MAGIC, ApfsInode};
 use crate::cli::Cli;
 use crate::matcher::Matcher;
@@ -17,6 +14,10 @@ use crate::ext4::parser::InodeBlockCache;
 use crate::ext4::{
     EXT4_INODE_TABLE_OFFSET, EXT4_MAGIC_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, Ext4Fs, Ext4Inode
 };
+
+use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
+use std::io::{self, Seek};
+use std::fs::{File, OpenOptions};
 
 use nohash_hasher::IntSet;
 
@@ -388,7 +389,7 @@ pub fn detect_fs_type(file: &File, block0: &[u8]) -> FsProbe {
     // ext4 (and ext2/ext3, which share the same magic): offset 1024 + 56
     if block0.len() >= EXT4_SUPERBLOCK_OFFSET as usize + EXT4_MAGIC_OFFSET + 2 {
         let off = EXT4_SUPERBLOCK_OFFSET as usize + EXT4_MAGIC_OFFSET;
-        let magic = u16::from_le_bytes(block0[off..off + 2].try_into().unwrap());
+        let magic = u16::from_le_bytes(block0[off..off + 2].try_into().unwrap_());
         if magic == EXT4_SUPER_MAGIC {
             return FsProbe::Supported(FsType::Ext4);
         }
@@ -401,7 +402,7 @@ pub fn detect_fs_type(file: &File, block0: &[u8]) -> FsProbe {
 
     // APFS: NX magic at offset 32 in block 0
     if block0.len() >= 36 {
-        let magic = u32::from_le_bytes(block0[32..36].try_into().unwrap());
+        let magic = u32::from_le_bytes(block0[32..36].try_into().unwrap_());
         if magic == APFS_NX_MAGIC {
             return FsProbe::Supported(FsType::Apfs);
         }
@@ -433,7 +434,7 @@ pub fn detect_fs_type(file: &File, block0: &[u8]) -> FsProbe {
 
     // HFS+ / HFSX: "H+" or "HX" at offset 1024
     if block0.len() >= 1026 {
-        let magic = u16::from_be_bytes(block0[1024..1026].try_into().unwrap());
+        let magic = u16::from_be_bytes(block0[1024..1026].try_into().unwrap_());
         if magic == HFSPLUS_MAGIC || magic == HFSX_MAGIC {
             return FsProbe::Recognized("HFS+");
         }

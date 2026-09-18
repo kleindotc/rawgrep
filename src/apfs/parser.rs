@@ -15,6 +15,7 @@
 //!   - Encryption (wrapped keys)
 
 use crate::tracy;
+use crate::unwrap_::Unwrap_;
 use crate::util::{self, read_at_offset};
 use crate::parser::{BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe};
 
@@ -225,14 +226,14 @@ impl ApfsFs {
         }
 
         // Offset 32: nx_magic (u32 LE)
-        let magic = u32::from_le_bytes(data[32..36].try_into().unwrap());
+        let magic = u32::from_le_bytes(data[32..36].try_into().unwrap_());
         if magic != APFS_NX_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Not an APFS container (bad NX magic)"));
         }
 
         let block_size = u32::from_le_bytes(
             data[APFS_NX_BLOCK_SIZE_OFFSET..APFS_NX_BLOCK_SIZE_OFFSET + 4]
-                .try_into().unwrap(),
+                .try_into().unwrap_(),
         );
         if block_size == 0 || !block_size.is_power_of_two() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid APFS block size"));
@@ -240,12 +241,12 @@ impl ApfsFs {
 
         let omap_root_paddr = u64::from_le_bytes(
             data[APFS_NX_OMAP_OID_OFFSET..APFS_NX_OMAP_OID_OFFSET + 8]
-                .try_into().unwrap(),
+                .try_into().unwrap_(),
         );
 
         let volume_oid = u64::from_le_bytes(
             data[APFS_NX_FS_OID_OFFSET..APFS_NX_FS_OID_OFFSET + 8]
-                .try_into().unwrap(),
+                .try_into().unwrap_(),
         );
 
         Ok(ApfsSuperBlock { block_size, omap_root_paddr, volume_oid })
@@ -268,18 +269,18 @@ impl ApfsFs {
         if block.len() < 36 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Volume block too small"));
         }
-        let magic = u32::from_le_bytes(block[32..36].try_into().unwrap());
+        let magic = u32::from_le_bytes(block[32..36].try_into().unwrap_());
         if magic != APFS_APSB_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad APSB magic"));
         }
 
         let omap_oid = u64::from_le_bytes(
             block[APFS_APSB_OMAP_OID_OFFSET..APFS_APSB_OMAP_OID_OFFSET + 8]
-                .try_into().unwrap(),
+                .try_into().unwrap_(),
         );
         let root_tree_oid = u64::from_le_bytes(
             block[APFS_APSB_ROOT_TREE_OID_OFFSET..APFS_APSB_ROOT_TREE_OID_OFFSET + 8]
-                .try_into().unwrap(),
+                .try_into().unwrap_(),
         );
 
         // Resolve volume's omap OID -> paddr (it lives in the container omap)

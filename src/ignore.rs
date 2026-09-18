@@ -1,5 +1,6 @@
 use crate::tracy;
 use crate::util::unlikely;
+use crate::index_::{Index_, IndexMut_};
 
 use std::{path::MAIN_SEPARATOR, sync::Arc};
 
@@ -118,11 +119,11 @@ impl GitignoreChain {
         }
 
         let filename_start = memrchr(MAIN_SEPARATOR as _, path).map_or(0, |i| i + 1);
-        let filename = unsafe { path.get_unchecked(filename_start..) };
+        let filename = path.get_(filename_start..);
         let filename_hash = hash_bytes(filename);
 
         if inner.stack.len() == 1 {
-            let (_, prefix_len, gi) = unsafe { inner.stack.get_unchecked(0) };
+            let (_, prefix_len, gi) = inner.stack.get_(0);
             let rel = relative_path(path, *prefix_len);
             return gi.is_ignored_with_filename_hashed(rel, filename, is_dir, filename_hash)
         }
@@ -215,16 +216,16 @@ impl LiteralLookup {
         let mut slots = vec![(0u32, u16::MAX); cap].into_boxed_slice();
 
         for &index in indexes {
-            let meta    = metas[index as usize];
-            let pattern = &literal_data[meta.offset as usize..meta.offset as usize + meta.len as usize];
+            let meta    = metas.get_(index as usize);
+            let pattern = literal_data.get_(meta.offset as usize..meta.offset as usize + meta.len as usize);
             let hash    = hash_bytes(pattern) as u32;
 
             let mut slot = (hash & mask) as usize;
-            while slots[slot].1 != u16::MAX {
+            while slots.get_(slot).1 != u16::MAX {
                 slot = (slot + 1) & mask as usize;
             }
 
-            slots[slot] = (hash, index);
+            *slots.get_mut_(slot) = (hash, index);
         }
 
         Self { slots, mask }
@@ -243,16 +244,16 @@ impl LiteralLookup {
 
         let mut slot = (hash & self.mask) as usize;
         loop {
-            let (slot_hash, index) = self.slots[slot];
+            let (slot_hash, index) = *self.slots.get_(slot);
             if index == u16::MAX {
                 return false;
             }
 
             if slot_hash == hash {
-                let meta = metas[index as usize];
+                let meta = metas.get_(index as usize);
                 if !(meta.dir_only() && !is_dir) {
                     let len     = meta.len as usize;
-                    let pattern = &literal_data[meta.offset as usize..meta.offset as usize + len];
+                    let pattern = literal_data.get_(meta.offset as usize..meta.offset as usize + len);
                     if pattern == filename {
                         return true;
                     }
@@ -410,7 +411,13 @@ impl Gitignore {
         let mut has_negations = false;
 
         for line in content.split(|&b| b == b'\n') {
-            if line.is_empty() || line[0] == b'#' {
+            if line.is_empty() {
+                continue;
+            }
+
+            let first = *line.get_(0);
+
+            if first == b'#' {
                 continue;
             }
 
@@ -419,8 +426,8 @@ impl Gitignore {
                 continue;
             }
 
-            let (mut pattern_bytes, negated) = if line[0] == b'!' {
-                (&line[1..], true)
+            let (mut pattern_bytes, negated) = if first == b'!' {
+                (line.get_(1..), true)
             } else {
                 (line, false)
             };
@@ -436,10 +443,10 @@ impl Gitignore {
             // hash/bang." Without this, the backslash itself stays part of the
             // stored pattern and never matches the real (unescaped) filename.
             if pattern_bytes.len() >= 2
-                && pattern_bytes[0] == b'\\'
-                && matches!(pattern_bytes[1], b'#' | b'!')
+                && *pattern_bytes.get_(0) == b'\\'
+                && matches!(pattern_bytes.get_(1), b'#' | b'!')
             {
-                pattern_bytes = &pattern_bytes[1..];
+                pattern_bytes = pattern_bytes.get_(1..);
             }
 
             // Strip a trailing '/' -- and any further redundant trailing
@@ -456,7 +463,7 @@ impl Gitignore {
             let dir_only = pattern_bytes.last() == Some(&(MAIN_SEPARATOR as _));
             if dir_only {
                 while pattern_bytes.last() == Some(&(MAIN_SEPARATOR as _)) {
-                    pattern_bytes = &pattern_bytes[..pattern_bytes.len() - 1];
+                    pattern_bytes = pattern_bytes.get_(..pattern_bytes.len() - 1);
                 }
             }
 
@@ -465,11 +472,11 @@ impl Gitignore {
             }
 
             let mut leading_double_star = false;
-            let (pattern_bytes, anchored) = if pattern_bytes[0] == MAIN_SEPARATOR as _ {
-                (&pattern_bytes[1..], true)
+            let (pattern_bytes, anchored) = if *pattern_bytes.get_(0) == MAIN_SEPARATOR as _ {
+                (pattern_bytes.get_(1..), true)
 
             } else if pattern_bytes.len() > 3 && pattern_bytes.starts_with(b"**/") {
-                let rest = &pattern_bytes[3..];
+                let rest = pattern_bytes.get_(3..);
                 if memchr(MAIN_SEPARATOR as _, rest).is_none() {
                     //
                     // "**/foo" IS just unanchored "foo"
@@ -498,9 +505,9 @@ impl Gitignore {
             //
             let mid_anchor: Option<Box<[u8]>> = if anchored {
                 memchr::memmem::find(pattern_bytes, b"/**/").and_then(|pos| {
-                    let tail = &pattern_bytes[pos + 4..];
+                    let tail = &pattern_bytes.get_(pos + 4..);
                     (!tail.is_empty() && memchr(MAIN_SEPARATOR as _, tail).is_none())
-                        .then(|| pattern_bytes[..pos].into())
+                        .then(|| pattern_bytes.get_(..pos).into())
                 })
             } else {
                 None
@@ -508,12 +515,12 @@ impl Gitignore {
 
             let trailing_double_star: Option<Box<[u8]>> = if anchored && mid_anchor.is_none() {
                 if pattern_bytes == b"**" {
-                    Some(Box::from(&b""[..]))
+                    Some(Default::default())
                 } else if pattern_bytes.len() > 3
                     && pattern_bytes.ends_with(b"/**")
-                    && memchr::memchr3(b'*', b'?', b'[', &pattern_bytes[..pattern_bytes.len() - 3]).is_none()
+                    && memchr::memchr3(b'*', b'?', b'[', pattern_bytes.get_(..pattern_bytes.len() - 3)).is_none()
                 {
-                    Some(pattern_bytes[..pattern_bytes.len() - 3].into())
+                    Some(pattern_bytes.get_(..pattern_bytes.len() - 3).into())
                 } else {
                     None
                 }
@@ -522,7 +529,7 @@ impl Gitignore {
             };
 
             let pattern_bytes: &[u8] = match &mid_anchor {
-                Some(head) => &pattern_bytes[head.len() + 4..],
+                Some(head) => pattern_bytes.get_(head.len() + 4..),
                 None => pattern_bytes,
             };
 
@@ -664,7 +671,7 @@ impl Gitignore {
                 // Wildcard
                 //
 
-                let pattern = unsafe { self.wildcards.get_unchecked(entry.index()) };
+                let pattern = self.wildcards.get_(entry.index());
 
                 if pattern.dir_only() && !is_dir {
                     continue;
@@ -684,16 +691,14 @@ impl Gitignore {
             // Literal
             //
 
-            let meta = unsafe { *self.literal_meta.get_unchecked(entry.index()) };
+            let meta = *self.literal_meta.get_(entry.index());
 
             if meta.dir_only() && !is_dir {
                 continue;
             }
 
             let len = meta.len as usize;
-            let pattern = unsafe {
-                self.literal_data.get_unchecked(meta.offset as usize..meta.offset as usize + len)
-            };
+            let pattern = self.literal_data.get_(meta.offset as usize..meta.offset as usize + len);
 
             let matched = if meta.anchored() {
                 match_anchored_literal(pattern, path)
@@ -751,9 +756,7 @@ impl Gitignore {
                 // Wildcard
                 //
 
-                let pattern = unsafe {
-                    self.wildcards.get_unchecked(entry.index())
-                };
+                let pattern = self.wildcards.get_(entry.index());
 
                 if pattern.dir_only() && !is_dir {
                     continue;
@@ -776,16 +779,14 @@ impl Gitignore {
             // Literal
             //
 
-            let meta = unsafe { *self.literal_meta.get_unchecked(entry.index()) };
+            let meta = *self.literal_meta.get_(entry.index());
 
             if meta.dir_only() && !is_dir {
                 continue;
             }
 
             let len = meta.len as usize;
-            let pattern = unsafe {
-                self.literal_data.get_unchecked(meta.offset as usize..meta.offset as usize + len)
-            };
+            let pattern = self.literal_data.get_(meta.offset as usize..meta.offset as usize + len);
 
             let matched = if meta.anchored() {
                 match_anchored_literal(pattern, path)
@@ -861,8 +862,8 @@ fn match_anchored_dir_prefix(prefix: &[u8], path: &[u8]) -> bool {
         return false;
     }
 
-    let head = unsafe { path.get_unchecked(..len) };
-    head == prefix && unsafe { *path.get_unchecked(len) } == MAIN_SEPARATOR as _
+    let head = path.get_(..len);
+    head == prefix && *path.get_(len) == MAIN_SEPARATOR as _
 }
 
 #[inline(always)]
@@ -870,10 +871,10 @@ fn match_wildcard(pattern: &WildcardPattern, text: &[u8]) -> bool {
     if pattern.leading_double_star {
         let mut start = 0usize;
         loop {
-            if match_wildcard_anchored_at(pattern, &text[start..]) {
+            if match_wildcard_anchored_at(pattern, text.get_(start..)) {
                 return true;
             }
-            match memchr(MAIN_SEPARATOR as u8, &text[start..]) {
+            match memchr(MAIN_SEPARATOR as u8, text.get_(start..)) {
                 Some(off) => start += off + 1,
                 None => return false,
             }
@@ -900,8 +901,8 @@ fn match_wildcard_anchored_at(pattern: &WildcardPattern, text: &[u8]) -> bool {
             //
 
             text.len() > pattern_len
-                && unsafe { text.get_unchecked(..pattern_len) } == prefix.as_ref()
-                && unsafe { *text.get_unchecked(pattern_len) }  == MAIN_SEPARATOR as u8
+                && text.get_(..pattern_len) == prefix.as_ref()
+                && *text.get_(pattern_len)  == MAIN_SEPARATOR as u8
         };
     }
 
@@ -917,7 +918,7 @@ fn match_wildcard_anchored_at(pattern: &WildcardPattern, text: &[u8]) -> bool {
         }
 
         let filename_start = memrchr(MAIN_SEPARATOR as u8, text).map_or(0, |i| i + 1);
-        let filename = unsafe { text.get_unchecked(filename_start..) };
+        let filename = text.get_(filename_start..);
         return match_wildcard_tail(pattern, filename, false);
     }
 
@@ -937,12 +938,12 @@ fn match_wildcard_tail(pattern: &WildcardPattern, text: &[u8], anchored: bool) -
 
         // SAFETY: text.len() >= slen, checked above.
         let split = text.len() - suffix_len;
-        let tail = unsafe { text.get_unchecked(split..) };
+        let tail = text.get_(split..);
         if tail != suffix.as_ref() {
             return false;
         }
 
-        let head = unsafe { text.get_unchecked(..split) };
+        let head = text.get_(..split);
 
         let middle = if let Some(ref prefix) = pattern.prefix {
             let pattern_len = prefix.len();
@@ -951,11 +952,11 @@ fn match_wildcard_tail(pattern: &WildcardPattern, text: &[u8], anchored: bool) -
             }
 
             // SAFETY: head.len() >= plen, checked above.
-            if unsafe { head.get_unchecked(..pattern_len) } != prefix.as_ref() {
+            if head.get_(..pattern_len) != prefix.as_ref() {
                 return false;
             }
 
-            unsafe { head.get_unchecked(pattern_len..) }
+            head.get_(pattern_len..)
         } else {
             head
         };
@@ -972,11 +973,11 @@ fn match_wildcard_tail(pattern: &WildcardPattern, text: &[u8], anchored: bool) -
             return false;
         }
 
-        if unsafe { text.get_unchecked(..pattern_len) } != prefix.as_ref() {
+        if text.get_(..pattern_len) != prefix.as_ref() {
             return false;
         }
 
-        let middle = unsafe { text.get_unchecked(pattern_len..) };
+        let middle = text.get_(pattern_len..);
         return !anchored || memchr::memchr(b'/', middle).is_none();
     }
 
@@ -1020,21 +1021,21 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
 
     while text_index < text_len {
         if pattern_index < pattern_len {
-            let p_char = unsafe { *pattern.get_unchecked(pattern_index) };
+            let p_char = *pattern.get_(pattern_index);
 
             match p_char {
                 b'*' => {
                     let run_start = pattern_index;
                     let mut run_end = pattern_index + 1;
-                    while run_end < pattern_len && unsafe { *pattern.get_unchecked(run_end) } == b'*' {
+                    while run_end < pattern_len && *pattern.get_(run_end) == b'*' {
                         run_end += 1;
                     }
 
                     let left_ok = run_start == 0
-                        || unsafe { *pattern.get_unchecked(run_start - 1) } == MAIN_SEPARATOR as u8;
+                        || *pattern.get_(run_start - 1) == MAIN_SEPARATOR as u8;
 
                     let right_ok = run_end == pattern_len
-                        || unsafe { *pattern.get_unchecked(run_end) } == MAIN_SEPARATOR as u8;
+                        || *pattern.get_(run_end) == MAIN_SEPARATOR as u8;
 
                     star_can_cross = (run_end - run_start) == 2 && left_ok && right_ok;
 
@@ -1049,12 +1050,12 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
                     // whenever a "**" is immediately followed by a separator.
                     //
                     if star_can_cross && right_ok && run_end < pattern_len {
-                        let rest = &pattern[run_end + 1..];
+                        let rest = pattern.get_(run_end + 1..);
 
                         //
                         // Zero directories -- "**/" vanishes entirely
                         //
-                        if glob_match(rest, &text[text_index..], anchored) {
+                        if glob_match(rest, text.get_(text_index..), anchored) {
                             return true;
                         }
 
@@ -1065,10 +1066,10 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
                         //
                         let mut search_from = text_index;
                         loop {
-                            match memchr(MAIN_SEPARATOR as u8, &text[search_from..text_len]) {
+                            match memchr(MAIN_SEPARATOR as u8, text.get_(search_from..text_len)) {
                                 Some(off) => {
                                     let sep_pos = search_from + off;
-                                    if glob_match(rest, &text[sep_pos + 1..], anchored) {
+                                    if glob_match(rest, text.get_(sep_pos + 1..), anchored) {
                                         return true;
                                     }
 
@@ -1089,7 +1090,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
 
                 b'?' => {
                     // '?' must not match a separator either, when anchored
-                    if anchored && unsafe { *text.get_unchecked(text_index) } == MAIN_SEPARATOR as u8 {
+                    if anchored && *text.get_(text_index) == MAIN_SEPARATOR as u8 {
                         // Fallthrough to backtrack logic below...
                     } else {
                         pattern_index += 1;
@@ -1099,7 +1100,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
                 }
 
                 b'[' => {
-                    let ch = unsafe { *text.get_unchecked(text_index) };
+                    let ch = *text.get_(text_index);
                     let sep_blocked = anchored && ch == MAIN_SEPARATOR as u8;
 
                     match match_char_class(pattern, pattern_index, ch) {
@@ -1131,7 +1132,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
                     }
                 }
 
-                c if c == unsafe { *text.get_unchecked(text_index) } => {
+                c if c == *text.get_(text_index) => {
                     pattern_index += 1;
                     text_index += 1;
                     continue;
@@ -1149,7 +1150,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
         let crossable = star_can_cross;
 
         let next_lit = if next_pat_index < pattern_len {
-            let b = unsafe { *pattern.get_unchecked(next_pat_index) };
+            let b = *pattern.get_(next_pat_index);
             (b != b'*' && b != b'?' && b != b'[').then_some(b)
         } else {
             None
@@ -1159,7 +1160,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
             Some(lit) => {
                 let search_start = match_index + 1;
                 debug_assert!(search_start <= text_len);
-                let haystack = unsafe { text.get_unchecked(search_start..text_len) };
+                let haystack = text.get_(search_start..text_len);
 
                 //
                 // An anchored '*' can't swallow a '/', so normally we must not
@@ -1173,7 +1174,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
                     haystack.len()
                 };
 
-                let scoped = unsafe { haystack.get_unchecked(..bound) };
+                let scoped = haystack.get_(..bound);
                 match memchr(lit, scoped) {
                     Some(off) => {
                         match_index   = search_start + off;
@@ -1190,7 +1191,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
                 // Trailing star, or followed by another wildcard token
                 //
 
-                if anchored && !crossable && unsafe { *text.get_unchecked(text_index) } == MAIN_SEPARATOR as u8 {
+                if anchored && !crossable && *text.get_(text_index) == MAIN_SEPARATOR as u8 {
                     return false;
                 }
                 pattern_index = next_pat_index;
@@ -1203,7 +1204,7 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
     //
     // Skip trailing stars
     //
-    while pattern_index < pattern_len && unsafe { *pattern.get_unchecked(pattern_index) } == b'*' {
+    while pattern_index < pattern_len && *pattern.get_(pattern_index) == b'*' {
         pattern_index += 1;
     }
 
@@ -1218,19 +1219,19 @@ fn glob_match(pattern: &[u8], text: &[u8], anchored: bool) -> bool {
 /// whether or not `ch` actually matched it.
 fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<(usize, bool)> {
     let pattern_len = pattern.len();
-    if start + 2 >= pattern_len || unsafe { *pattern.get_unchecked(start) } != b'[' {
+    if start + 2 >= pattern_len || *pattern.get_(start) != b'[' {
         return None;
     }
 
     let negated =
-        unsafe { *pattern.get_unchecked(start + 1) } == b'!'
-     || unsafe { *pattern.get_unchecked(start + 1) } == b'^';
+        *pattern.get_(start + 1) == b'!'
+     || *pattern.get_(start + 1) == b'^';
 
     let mut i = if negated { start + 2 } else { start + 1 };
 
     // Find closing ]
     let mut end = i;
-    while end < pattern_len && unsafe { *pattern.get_unchecked(end) } != b']' {
+    while end < pattern_len && *pattern.get_(end) != b']' {
         end += 1;
     }
     if end >= pattern_len {
@@ -1239,9 +1240,9 @@ fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<(usize, bool
 
     let mut matched = false;
     while i < end {
-        if i + 2 < end && unsafe { *pattern.get_unchecked(i + 1) } == b'-' {
-            let lo = unsafe { *pattern.get_unchecked(i) };
-            let hi = unsafe { *pattern.get_unchecked(i + 2) };
+        if i + 2 < end && *pattern.get_(i + 1) == b'-' {
+            let lo = *pattern.get_(i);
+            let hi = *pattern.get_(i + 2);
 
             if ch >= lo && ch <= hi {
                 matched = true;
@@ -1250,7 +1251,7 @@ fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> Option<(usize, bool
 
             i += 3;
         } else {
-            if ch == unsafe { *pattern.get_unchecked(i) } {
+            if ch == *pattern.get_(i) {
                 matched = true;
                 break;
             }
@@ -1269,12 +1270,12 @@ fn trim_bytes(bytes: &[u8]) -> &[u8] {
         return bytes;
     }
 
-    if unlikely(bytes[end - 1] == b'\r') {
+    if unlikely(*bytes.get_(end - 1) == b'\r') {
         end -= 1;
     }
 
-    while end > 0 && bytes[end - 1] == b' ' {
-        let backslash_run = bytes[..end - 1]
+    while end > 0 && *bytes.get_(end - 1) == b' ' {
+        let backslash_run = bytes.get_(..end - 1)
             .iter()
             .rev()
             .take_while(|&&b| b == b'\\')
@@ -1287,7 +1288,7 @@ fn trim_bytes(bytes: &[u8]) -> &[u8] {
         end -= 1;
     }
 
-    unsafe { bytes.get_unchecked(..end) }
+    bytes.get_(..end)
 }
 
 #[inline]
@@ -1324,6 +1325,6 @@ fn relative_path(path: &[u8], prefix_len: u32) -> &[u8] {
     } else {
         // Skip the owning directory's path *and* the separator that was
         // inserted when descending into its first child.
-        unsafe { path.get_unchecked(prefix_len + 1..) }
+        path.get_(prefix_len + 1..)
     }
 }

@@ -1,4 +1,5 @@
 use crate::tracy;
+use crate::index_::Index_;
 use crate::grep::{AnyNodeCache, AnyNodeScratch, NodeCacheStats};
 use crate::binary::{is_binary_chunk, is_dot_entry, is_hidden_entry};
 use crate::worker::{BINARY_PROBE_BYTE_SIZE, PendingSubdir, STREAMING_CHUNK_SIZE};
@@ -208,11 +209,7 @@ impl Parser {
             self.get_buf(kind),
             |entry_id, name_start, name_len, _file_type| {
                 let name_end = name_start + name_len;
-
-                // SAFETY: bounds checked by with_directory_entries
-                let name_bytes = unsafe {
-                    self.dir.get_unchecked(name_start..name_end)
-                };
+                let name_bytes = self.dir.get_(name_start..name_end);
 
                 if name_bytes == name {
                     ControlFlow::Break(entry_id)
@@ -238,11 +235,7 @@ impl Parser {
             &self.dir,
             |entry_id, name_start, name_len, file_type| {
                 let name_end = name_start + name_len;
-
-                // SAFETY: bounds checked by with_directory_entries
-                let name_bytes = unsafe {
-                    self.dir.get_unchecked(name_start..name_end)
-                };
+                let name_bytes = self.dir.get_(name_start..name_end);
 
                 let skip = (
                     !self.dont_skip_dot_entries && is_hidden_entry(name_bytes)
@@ -306,16 +299,7 @@ impl Parser {
 
     #[inline(always)]
     pub fn buf_ptr(&self, ptr: BufFatPtr) -> &[u8] {
-        #[cfg(debug_assertions)] {
-            &self.get_buf(ptr.kind)[ptr.offset as usize..(ptr.offset+ptr.len) as usize]
-        }
-
-        #[cfg(not(debug_assertions))]
-        unsafe {
-            self.get_buf(ptr.kind).get_unchecked(
-                ptr.offset as usize..(ptr.offset+ptr.len) as usize
-            )
-        }
+        self.get_buf(ptr.kind).get_(ptr.offset as usize..(ptr.offset+ptr.len) as usize)
     }
 }
 

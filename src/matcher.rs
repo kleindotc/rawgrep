@@ -258,6 +258,8 @@ impl Matcher {
     /// fails, in which case the caller should fall back to the regex-automata engine.
     #[cfg(feature = "hyperscan")]
     fn try_hyperscan(pattern: &str, ignore_case: bool) -> io::Result<Self> {
+        use crate::unwrap_::Unwrap_;
+
         let _span = tracy::span!("Matcher::try_hyperscan");
 
         //
@@ -273,7 +275,7 @@ impl Matcher {
         if ignore_case { flags |= hyperscan::CompileFlags::CASELESS };
 
         let db: BlockDatabase = Pattern::with_flags(pattern, flags)
-            .unwrap()
+            .unwrap_()
             .build()
             .map_err(|e| io::Error::new(
                 io::ErrorKind::InvalidInput,

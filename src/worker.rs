@@ -5,6 +5,7 @@
 // TODO(#24): Support for work splitting for large file(s). (detect that)
 
 use crate::liner::*;
+use crate::index_::{Index_, IndexMut_};
 use crate::pacer::FlushPacer;
 use crate::cache::{FileKey, FileMeta, FragmentCache};
 use crate::output::{OutputSlab, OutputSlotWriter, OutputSlotOwnedOverflow};
@@ -31,7 +32,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nohash_hasher::IntSet;
 use crossbeam_channel::{Receiver, Sender};
-use parking_lot::{Mutex, Condvar};
 use crossbeam_deque::{Injector, Steal, Stealer};
 pub use crossbeam_deque::Worker as DequeWorker;
 
@@ -741,13 +741,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         let skip_reserved   = !self.cli.should_ignore_reserved_tool_dir_filter();
 
         for entry_index in entries_start..entries_end {
-            let entry = unsafe { self.entries_arena.get_unchecked(entry_index) };
+            let entry = self.entries_arena.get_(entry_index);
 
-            let name_bytes = unsafe {
-                self.parser.dir.get_unchecked(
-                    entry.name_offset as usize..entry.name_offset as usize + entry.name_len as usize
-                )
-            };
+            let name_bytes = self.parser.dir.get_(
+                entry.name_offset as usize
+                ..
+                entry.name_offset as usize + entry.name_len as usize
+            );
 
             let ft = match entry.file_type {
                 FileType::Other => {
@@ -810,8 +810,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             }
         }
 
-        debug_assert!(self.file_entries_arena.len() >= file_mark);
-        self.fs.sort_entries_by_offset(unsafe { self.file_entries_arena.get_unchecked_mut(file_mark..) });
+        self.fs.sort_entries_by_offset(self.file_entries_arena.get_mut_(file_mark..));
 
         let file_result;
         {
@@ -872,7 +871,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         // makes the local half (below) a contiguous cache-friendly run,
         // and gives the queued half a better starting order too.
         //
-        self.fs.sort_subdirs_by_offset(unsafe { self.subdirs_arena.get_unchecked_mut(subdir_mark..) });
+        self.fs.sort_subdirs_by_offset(self.subdirs_arena.get_mut_(subdir_mark..));
 
         let n = self.subdirs_arena.len() - subdir_mark;
         let keep_local = work_distribution_strategy(depth, n, self.num_workers);
@@ -884,7 +883,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         //
 
         for i in (queue_start..queue_end).rev() {
-            let p = *unsafe { self.subdirs_arena.get_unchecked(i) };
+            let p = *self.subdirs_arena.get_(i);
             local.push(WorkItem::Directory(DirWork::new(
                 p.file_id,
                 self.path_arena.slice(p.path_start, p.path_start + p.path_len as u32),
@@ -898,7 +897,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         //
 
         for i in subdir_mark..queue_start {
-            let p = *unsafe { self.subdirs_arena.get_unchecked(i) };
+            let p = *self.subdirs_arena.get_(i);
             if let Err(e) = self.dispatch_directory_bytes(
                 p.file_id,
                 p.path_start,
@@ -930,7 +929,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         self.node_scratch.clear();
         let batch_stats = self.fs.parse_nodes_batch(
-            unsafe { self.file_entries_arena.get_unchecked(start_files..end_files) },
+            self.file_entries_arena.get_(start_files..end_files),
             &mut self.node_cache,
             &mut self.node_scratch
         );
@@ -943,7 +942,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         for (i, node) in (start_files..end_files).zip(nodes.drain(..)) {
             if node.file_id() == 0 { continue; }  // Poisoned...
 
-            let (_, name_fat_ptr) = *unsafe { self.file_entries_arena.get_unchecked(i) };
+            let (_, name_fat_ptr) = *self.file_entries_arena.get_(i);
 
             self.process_file(&node, name_fat_ptr, parent_path, gitignore_chain)?;
 
@@ -1058,7 +1057,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn process_file_buffered(
         &mut self,
         node: &F::Node,
@@ -1163,7 +1162,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         let mut probed = !check_binary;
 
         for chunk_index in 0..chunks_len {
-            let (disk_offset, len) = *unsafe { self.parser.scratch_chunks.get_unchecked(chunk_index) };
+            let (disk_offset, len) = *self.parser.scratch_chunks.get_(chunk_index);
             let len = len as usize;
 
             #[cfg(unix)] {
@@ -1190,7 +1189,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             buf.reserve(total);
             unsafe {
                 buf.set_len(total);
-                buf.get_unchecked_mut(..tail_len).copy_from_slice(&carry.tail);
+                buf.get_mut_(..tail_len).copy_from_slice(&carry.tail);
             }
 
             let n = match self.fs.read_at_offset(&mut buf[tail_len..total], disk_offset) {
@@ -1208,7 +1207,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 probed = true;
 
                 let probe_len = n.min(self.fs.block_size() as usize);
-                let probe = unsafe { buf.get_unchecked(tail_len..tail_len + probe_len) };
+                let probe = buf.get_(tail_len..tail_len + probe_len);
                 if crate::parser::binary_probe(probe, node.size() as usize) {
                     self.parser.chunk = buf;
                     self.stats.files_skipped_as_binary_due_to_probe += 1;
@@ -1295,7 +1294,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     }
 
     fn find_and_print_matches_impl<C: LineCodec>(&mut self, skip: usize) -> io::Result<bool> {
-        let buf = unsafe { self.parser.file.get_unchecked(skip..) };
+        let buf = self.parser.file.get_(skip..);
 
         let buf_len = buf.len();
         if buf_len == 0 { return Ok(false); }
@@ -1343,11 +1342,11 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 // where the line starts.
                 //
 
-                let line_end = C::find_newline(unsafe { buf.get_unchecked(m_start..) })
+                let line_end = C::find_newline(buf.get_(m_start..))
                     .map(|rel| m_start + rel)
                     .unwrap_or(buf_len);
 
-                let line = C::strip_trailing_cr(unsafe { buf.get_unchecked(line_start..line_end) });
+                let line = C::strip_trailing_cr(buf.get_(line_start..line_end));
 
                 Self::collect_line_ranges(
                     &self.ranges_scratch,
@@ -1393,7 +1392,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         self.newlines_scratch.reserve(average_newline_count_heuristic(buf_len));
 
         let mut scan_pos = 0usize;
-        while let Some(rel) = C::find_newline(unsafe { buf.get_unchecked(scan_pos..) }) {
+        while let Some(rel) = C::find_newline(buf.get_(scan_pos..)) {
             let abs = scan_pos + rel;
             self.newlines_scratch.push(abs as u32);
 
@@ -1410,7 +1409,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 prefetch_read(unsafe { buf.as_ptr().add((line_end + C::UNIT_WIDTH).min(buf_len)) });
             }
 
-            let raw_line = C::strip_trailing_cr(unsafe { buf.get_unchecked(line_start..line_end) });
+            let raw_line = C::strip_trailing_cr(buf.get_(line_start..line_end));
 
             //
             // Non-UTF-8 sources get transcoded one line at a time into a
@@ -1508,7 +1507,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         carry: &mut ChunkCarry,
         is_last: bool,
     ) -> io::Result<()> {
-        let data = unsafe { data.get_unchecked(skip..) };
+        let data = data.get_(skip..);
         if data.is_empty() { return Ok(()) }
 
         let should_print_color        = should_enable_ansi_coloring();
@@ -1540,7 +1539,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         if C::RAW_PASSTHROUGH {
             debug_assert_eq!(C::UNIT_WIDTH, 1);
 
-            let region = unsafe { data.get_unchecked(..process_until) };
+            let region = data.get_(..process_until);
 
             self.ranges_scratch.clear();
             self.matcher.push_all_matches(
@@ -1560,7 +1559,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
                 carry.tail.clear();
                 if !is_last && process_until < data.len() {
-                    carry.tail.extend_from_slice(unsafe { data.get_unchecked(process_until..) });
+                    carry.tail.extend_from_slice(data.get_(process_until..));
                 }
 
                 return Ok(());
@@ -1574,11 +1573,11 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                     region, &self.ranges_scratch, i, scan_pos, &mut carry.line_num, should_print_line_numbers,
                 );
 
-                let line_end = memchr::memchr(b'\n', unsafe { region.get_unchecked(m_start..) })
+                let line_end = memchr::memchr(b'\n', region.get_(m_start..))
                     .map(|rel| m_start + rel)
                     .unwrap_or(process_until);
 
-                let line = C::strip_trailing_cr(unsafe { region.get_unchecked(line_start..line_end) });
+                let line = C::strip_trailing_cr(region.get_(line_start..line_end));
 
                 Self::collect_line_ranges(
                     &self.ranges_scratch, &mut self.line_ranges_scratch, &mut i,
@@ -1608,7 +1607,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             carry.tail.clear();
             if !is_last && process_until < data.len() {
-                carry.tail.extend_from_slice(unsafe { data.get_unchecked(process_until..) });
+                carry.tail.extend_from_slice(data.get_(process_until..));
             }
 
             return Ok(());
@@ -1618,7 +1617,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         self.newlines_scratch.reserve(average_newline_count_heuristic(data.len()));
 
         let mut scan_pos = 0usize;
-        while let Some(rel) = C::find_newline(unsafe { data.get_unchecked(scan_pos..) }) {
+        while let Some(rel) = C::find_newline(data.get_(scan_pos..)) {
             let abs = scan_pos + rel;
             self.newlines_scratch.push(abs as u32);
 
@@ -1630,7 +1629,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         for &newline_pos in self.newlines_scratch.iter().chain([&(process_until as u32)]) {
             let line_end = newline_pos as usize;
 
-            let raw_line = C::strip_trailing_cr(unsafe { data.get_unchecked(line_start..line_end) });
+            let raw_line = C::strip_trailing_cr(data.get_(line_start..line_end));
 
             self.parser.scratch.clear();
             C::decode_line(raw_line, &mut self.parser.scratch);
@@ -1670,7 +1669,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         carry.tail.clear();
         if !is_last && process_until < data.len() {
-            carry.tail.extend_from_slice(unsafe { data.get_unchecked(process_until..) });
+            carry.tail.extend_from_slice(data.get_(process_until..));
         }
 
         Ok(())
@@ -1683,7 +1682,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         // by ~55KB, it's nice I guess.
         //
 
-        let buf = unsafe { self.parser.file.get_unchecked(skip..) };
+        let buf = self.parser.file.get_(skip..);
 
         let buf_len = buf.len();
         if buf_len == 0 { return Ok(false); }
@@ -1737,13 +1736,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 &mut line_num, should_print_line_numbers,
             );
 
-            let line_end = memchr::memchr(b'\n', unsafe { decoded.get_unchecked(m_start..) })
+            let line_end = memchr::memchr(b'\n', decoded.get_(m_start..))
                 .map(|rel| m_start + rel)
                 .unwrap_or(decoded_len);
 
-            let raw_line = unsafe { decoded.get_unchecked(line_start..line_end) };
+            let raw_line = decoded.get_(line_start..line_end);
             let line = if raw_line.last() == Some(&0x0D) {
-                unsafe { raw_line.get_unchecked(..raw_line.len() - 1) }
+                raw_line.get_(..raw_line.len() - 1)
             } else {
                 raw_line
             };
@@ -1804,7 +1803,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         line_num: &mut u32,
         should_print_line_numbers: bool,
     ) -> (usize, usize) {
-        let m_start = unsafe { ranges_scratch.get_unchecked(i).0 } as usize;
+        let m_start = ranges_scratch.get_(i).0 as usize;
 
         //
         // The matcher is expected to return sorted non-overlapping ranges.
@@ -1818,7 +1817,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         let m_start = m_start.max(scan_pos);
 
-        let line_start = match memchr::memrchr(b'\n', unsafe { buf.get_unchecked(scan_pos..m_start) }) {
+        let line_start = match memchr::memrchr(b'\n', buf.get_(scan_pos..m_start)) {
             Some(rel) => scan_pos + rel + 1,
             None      => scan_pos,
         };
@@ -1831,7 +1830,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         //
         if should_print_line_numbers || S::STDOUT_NOP {
             *line_num += memchr::memchr_iter(
-                b'\n', unsafe { buf.get_unchecked(scan_pos..line_start) }
+                b'\n', buf.get_(scan_pos..line_start)
             ).count() as u32;
         }
 
@@ -1858,7 +1857,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     ) {
         let group_start = *i;
         while *i < ranges_scratch.len()
-        && (unsafe { ranges_scratch.get_unchecked(*i) }.0 as usize) < line_end
+        && (ranges_scratch.get_(*i).0 as usize) < line_end
         {
             *i += 1;
         }
@@ -1869,9 +1868,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         mid_hook(i);
 
-        let global_matches = unsafe {
-            ranges_scratch.get_unchecked(group_start..(i).min(ranges_scratch.len()))
-        };
+        let global_matches = ranges_scratch.get_(group_start..(i).min(ranges_scratch.len()));
 
         let line_start_u32 = line_start as u32;
         let line_len_u32   = line_len   as u32;
@@ -2034,23 +2031,21 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 if s >= display.len() { break; }
                 let e = e.min(display.len());
 
-                debug_assert!(last <= s && s <= display.len());
-                scratch.extend_from_slice(unsafe { display.get_unchecked(last..s) });
+                scratch.extend_from_slice(display.get_(last..s));
 
                 if should_print_color {
                     scratch.extend_from_slice(crate::color::BOLD.as_bytes()); // @Incomplete: Check if whatever we output to supports bold?...
                     scratch.extend_from_slice(red.as_bytes());
                 }
 
-                debug_assert!(s <= e && e <= display.len());
-                scratch.extend_from_slice(unsafe { display.get_unchecked(s..e) });
+                scratch.extend_from_slice(display.get_(s..e));
 
                 if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
 
                 last = e;
             }
 
-            scratch.extend_from_slice(unsafe { display.get_unchecked(last..) });
+            scratch.extend_from_slice(display.get_(last..));
             scratch.push(b'\n');
 
             output.write_record(scratch);
@@ -2111,7 +2106,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         let pre_ell     = start > 0;
         let post_ell    = end < line.len();
-        let display     = unsafe { line.get_unchecked(start..end) };
+        let display     = line.get_(start..end);
         let display_len = display.len();
 
         let mut reserve_len = display_len + 1;
@@ -2139,20 +2134,18 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             let ds = s.saturating_sub(start).min(display_len);
             let de = e.saturating_sub(start).min(display_len);
 
-            debug_assert!(last <= ds && ds <= display_len);
-            scratch.extend_from_slice(unsafe { display.get_unchecked(last..ds) });
+            scratch.extend_from_slice(display.get_(last..ds));
 
             if should_print_color { scratch.extend_from_slice(red.as_bytes()); }
 
-            debug_assert!(ds <= de && de <= display_len);
-            scratch.extend_from_slice(unsafe { display.get_unchecked(ds..de) });
+            scratch.extend_from_slice(display.get_(ds..de));
 
             if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
 
             last = de;
         }
 
-        scratch.extend_from_slice(unsafe { display.get_unchecked(last..) });
+        scratch.extend_from_slice(display.get_(last..));
         if post_ell {
             scratch.extend_from_slice(ELLIPSIS);
         }
@@ -2226,7 +2219,6 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
         mut self,
 
         running: &AtomicBool,
-        running_signal: &(Mutex<()>, Condvar),
         active_workers: &AtomicUsize,
 
         injector: &Injector<WorkItem>,
@@ -2272,9 +2264,6 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
                         && local_worker.is_empty()
                     {
                         running.store(false, Ordering::Release);
-                        let (lock, cvar) = running_signal;
-                        let _guard = lock.lock();
-                        cvar.notify_all();
                         break;
                     }
 

@@ -219,6 +219,8 @@ pub mod linux {
 
     /// Unescape octal sequences in mountpoint paths (e.g., \040 -> space)
     fn unescape_mountpoint(s: &str) -> String {
+        use crate::unwrap_::Unwrap_;
+
         let mut result = String::with_capacity(s.len());
         let mut chars = s.chars().peekable();
 
@@ -228,7 +230,7 @@ pub mod linux {
                 for _ in 0..3 {
                     if let Some(&next) = chars.peek() {
                         if next.is_ascii_digit() {
-                            octal.push(chars.next().unwrap());
+                            octal.push(chars.next().unwrap_());
                         } else {
                             break;
                         }

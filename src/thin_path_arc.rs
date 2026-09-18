@@ -1,3 +1,5 @@
+use crate::unwrap_::Unwrap_;
+
 use std::alloc::{self, Layout};
 use std::mem;
 use std::ptr::{self, NonNull};
@@ -52,7 +54,7 @@ impl ThinPathArc {
     #[inline]
     fn layout(len: usize) -> Layout {
         let size = HEADER_SIZE.checked_add(len).expect("path length overflows layout size");
-        Layout::from_size_align(size, HEADER_ALIGN).unwrap()
+        Layout::from_size_align(size, HEADER_ALIGN).unwrap_()
     }
 
     #[inline]
