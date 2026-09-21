@@ -3,7 +3,7 @@
 // Licensed under the MIT License (https://opensource.org/licenses/MIT).
 
 #![allow(unused, dead_code)]
-#![allow(clippy::pedantic, clippy::all)]
+#![allow(clippy::pedantic, clippy::all, deprecated)]
 
 //! count occurrences of a given byte, or the number of UTF-8 code points, in a
 //! byte slice, fast.

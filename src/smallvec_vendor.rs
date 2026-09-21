@@ -1,4 +1,4 @@
-#![allow(clippy::pedantic, clippy::all)]
+#![allow(clippy::pedantic, clippy::all, deprecated)]
 
 // Portions of this file are copied from the `smallvec` crate.
 // Copyright (c) The Servo Project Developers.

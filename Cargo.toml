@@ -25,7 +25,7 @@ hyperscan-static = ["hyperscan", "hyperscan/static"]
 enable-bytemuck-checks = ["dep:bytemuck"]
 
 # Profiling
-tracy = ["tracy-client?/enable"]
+tracy = ["dep:tracy-client", "tracy-client/enable"]
 
 # Allocators
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
