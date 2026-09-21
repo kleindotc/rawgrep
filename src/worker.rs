@@ -782,18 +782,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             return Ok(());
         }
 
-        if likely(path_end > path_start) {
-            let bytes = self.path_arena.slice(path_start, path_end);
-            let last_segment = memchr::memrchr(MAIN_SEPARATOR as _, bytes)
-                .map(|pos| bytes.get_(pos + 1..))
-                .unwrap_or(bytes);
-
-            if !self.cli.should_ignore_reserved_tool_dir_filter() && is_reserved_tool_dir(last_segment) {
-                self.stats.dirs_skipped_reserved += 1;
-                return Ok(());
-            }
-        }
-
         let dir_size = node.size() as usize;
         self.fs.read_file_content(&mut self.parser, &node, dir_size, BufKind::Dir, false, false)?;
         self.stats.dirs_encountered += 1;
@@ -865,11 +853,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             match ft {
                 FileType::Dir => {
-                    let last_segment = memchr::memrchr(MAIN_SEPARATOR as _, name_bytes)
-                        .and_then(|pos| name_bytes.get(pos + 1..))
-                        .unwrap_or(name_bytes);
-
-                    if skip_reserved && is_reserved_tool_dir(last_segment) {
+                    if skip_reserved && is_reserved_tool_dir(name_bytes) {
                         self.stats.dirs_skipped_reserved += 1;
                         continue;
                     }
@@ -1125,7 +1109,12 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 file_identifier
             ));
 
-        let likely = known || binary_worker_table::likely_binary(file_ext_or_name, &self.dir_tally);
+        use binary_worker_table::Verdict;
+        let likely = known || match binary_worker_table::verdict(file_ext_or_name) {
+            Verdict::Binary  => true,
+            Verdict::Text    => false,
+            Verdict::Unknown => self.dir_tally.likely_binary(),
+        };
 
         (known, likely)
     }
@@ -1151,7 +1140,21 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             let (_, name_fat_ptr) = *self.file_entries_arena.get_(entry_index);
             let name = self.parser.buf_ptr(name_fat_ptr);
 
-            if is_binary_ext(name) { return LookaheadResult::NONE; }
+            let file_ext_pos     = memchr::memrchr(b'.', name);
+            let file_ext_or_name = file_ext_pos
+                .and_then(|p| if p + 1 < name.len() { Some(name.get_(p + 1..)) } else { None })
+                .unwrap_or(name);
+
+            if is_binary_ext(file_ext_or_name) {
+                //
+                // @Robustness: Not sure how correct this is, in a sense that
+                // ... well it should be, since a file with a binary extension
+                // is kinda guaranteed to be binary, and this whole branch is
+                // only enabled if the --binary flag isn't passed.
+                //
+                return LookaheadResult { cache_skip: None, binary: Some((true, true)) };
+            }
+
             Some(name)
         } else {
             None
@@ -1236,18 +1239,22 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         let check_binary = !self.cli.should_search_binary();
 
-        if check_binary && is_binary_ext(file_ext_or_name) {
-            self.stats.files_skipped_as_binary_due_to_ext += 1;
-            return Ok(());
-        }
-
         //
         // Use what the lookahead already worked out, or do it now if a file skipped the lookahead
         //
         let (known_binary, likely_binary) = match (check_binary, pre.binary) {
-            (false, _)          => (false, false),
-            (true, Some(hints)) => hints,
-            (true, None)        => self.binary_hints(file_identifier, file_name),
+            (true, Some((mut known, likely))) => {
+                if !known { known = is_binary_ext(file_ext_or_name) }
+                (known, likely)
+            }
+
+            (true, None) => {
+                let (mut known, likely) = self.binary_hints(file_identifier, file_name);
+                if !known { known = is_binary_ext(file_ext_or_name) }
+                (known, likely)
+            }
+
+            (false, _) => (false, false),
         };
 
         if known_binary {
