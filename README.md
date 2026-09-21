@@ -43,12 +43,12 @@ The following searches are performed against a full clone of the [Chromium sourc
 
 **Pattern: `TODO`**
 
-| Scenario                        | rawgrep          | ripgrep           | hypergrep        |
-|:--------------------------------|-----------------:|------------------:|-----------------:|
-| warm, with fragment cache       | **105.7 ms**     | 369.1 ms (3.49×)  | 359.4 ms (3.40×) |
-| warm, no fragment cache         | **303.6 ms**     | 368.9 ms (1.22×)  | 360.4 ms (1.19×) |
-| cold, no fragment cache         | **8.703 s**      | 11.880 s (1.36×)  | 10.256 s (1.18×) |
-| cold, with fragment cache       | **1.954 s**      | 11.974 s (6.13×)  | 10.261 s (5.25×) |
+| Scenario                    | rawgrep           | ripgrep           | hypergrep          |
+|:---------------------------|------------------:|------------------:|-------------------:|
+| warm, with fragment cache  | **111.8 ms**      | 345.5 ms (3.09×)  | 349.3 ms (3.12×)  |
+| warm, no fragment cache    | **299.7 ms**      | 346.4 ms (1.16×)  | 348.7 ms (1.16×)  |
+| cold, no fragment cache    | **8.688 s**       | 11.863 s (1.37×) | 10.218 s (1.18×) |
+| cold, with fragment cache  | **2.101 s**       | 11.906 s (5.67×) | 10.238 s (4.87×) |
 
 **Pattern: `(?i)\bTODO\((?:crbug\.com/\d+|[a-zA-Z][\w.-]*)\)`**
 
