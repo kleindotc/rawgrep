@@ -89,8 +89,8 @@ The following searches are performed against a full clone of the [Chromium sourc
 
 | Scenario                  | rawgrep      | fff                    |
 | ------------------------- | ------------ | ---------------------- |
-| warm, with fragment cache | **127.9 ms** | 622.8 ms (4.87x)       |
-| cold, with fragment cache | **2.757 s**  | 5.190 s (1.88x)        |
+| warm, with fragment cache | **127.9 ms** | 622.8 ms (4.87×)       |
+| cold, with fragment cache | **2.757 s**  | 5.190 s (1.88×)        |
 
 *FFF's cache is built once before the benchmark.*
 
