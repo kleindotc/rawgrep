@@ -59,8 +59,47 @@ pub fn read_u32_unaligned_le(data: &[u8], offset: usize) -> u32 {
 }
 
 #[inline(always)]
+pub fn read_u64_as_u32_and_u16_unaligned_le(data: &[u8], offset: usize) -> (u32, u16) {
+    let value = unsafe {
+        (data.as_ptr().add(offset) as *const u64)
+            .read_unaligned()
+            .to_le()
+    };
+
+    (value as u32, (value >> 32) as u16)
+}
+
+#[inline(always)]
 pub fn read_u64_unaligned_le(data: &[u8], offset: usize) -> u64 {
     unsafe { (data.as_ptr().add(offset) as *const u64).read_unaligned().to_le() }
+}
+
+#[inline]
+pub fn extend_le(out: &mut Vec<u8>, v: &[impl Copy]) {
+    #[cfg(target_endian = "little")]
+    out.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
+    });
+
+    #[cfg(not(target_endian = "little"))]
+    for x in v { out.extend_from_slice(&x.to_le_bytes()); }
+}
+
+#[inline]
+pub fn read_le(bytes: &[u8]) -> Vec<u64> {          // bytes.len() % 8 == 0
+    let n = bytes.len() / 8;
+
+    #[cfg(target_endian = "little")] {
+        let mut v = Vec::<u64>::with_capacity(n);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), v.as_mut_ptr() as *mut u8, n * 8);
+            v.set_len(n);
+        }
+        v
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    { bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect() }
 }
 
 #[cfg(windows)]

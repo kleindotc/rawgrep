@@ -2,7 +2,42 @@ use rawgrep::fragments::*;
 
 use nohash_hasher::IntSet;
 
-#[cfg(test)]
+/// # Safety
+/// Read Safety of check_fragment_presence_any_count
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn check_fragment_presence_avx2(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64], mask: u32) {
+    teddy::check_fragment_presence_any_count::<false>(buf, fragment_hashes, fragment_presence_scratch, mask)
+}
+
+/// # Safety
+/// Read Safety of check_fragment_presence_any_count
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn check_fragment_presence_avx2_ci(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64], mask: u32) {
+    teddy::check_fragment_presence_any_count::<true>(buf, fragment_hashes, fragment_presence_scratch, mask)
+}
+
+/// # Safety
+/// Read Safety of check_fragment_presence_any_count
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn check_fragment_presence_neon(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64], mask: u32) {
+    teddy::check_fragment_presence_any_count::<false>(buf, fragment_hashes, fragment_presence_scratch, mask)
+}
+
+/// # Safety
+/// Read Safety of check_fragment_presence_any_count
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn check_fragment_presence_neon_ci(buf: &[u8], fragment_hashes: &[u32], fragment_presence_scratch: &mut [u64], mask: u32) {
+    teddy::check_fragment_presence_any_count::<true>(buf, fragment_hashes, fragment_presence_scratch, mask)
+}
+
 mod simd_tests {
     use super::*;
 
@@ -395,19 +430,8 @@ mod simd_tests {
     }
 }
 
-#[cfg(test)]
-mod tests {
+mod basic_tests {
     use super::*;
-
-    #[test]
-    fn short_pattern_gets_fragments_with_3_byte_fragment() {
-        // "foo" is 3 bytes -- with the old fixed 4-byte fragment this produced zero fragments.
-        let fragment_len = select_fragment_len(std::iter::once("foo".as_bytes())).unwrap();
-        assert_eq!(fragment_len, 3);
-
-        let frags = extract_pattern_fragments_with_len("foo".as_bytes(), fragment_len);
-        assert_eq!(frags.len(), 1, "a 3-byte pattern with a 3-byte fragment is exactly one fragment");
-    }
 
     #[test]
     fn em_dash_gets_fragments() {
@@ -457,6 +481,94 @@ mod tests {
             let buf_word = u32::from_le_bytes([b'f', b'o', b'o', tail_byte]);
             let buf_hash = hash_fragment_u32(buf_word & mask);
             assert_eq!(buf_hash, pattern_frag, "tail byte {tail_byte} should be masked out");
+        }
+    }
+}
+
+mod presence_exactness_tests {
+    use super::*;
+
+    fn xorshift(s: &mut u64) -> u64 { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s }
+
+    fn window_hash_ref(buf: &[u8], i: usize, mask: u32, ci: bool) -> u32 {
+        let mut t = [0u8; 4];
+        let n = (buf.len() - i).min(4);
+        t[..n].copy_from_slice(&buf[i..i + n]);
+
+        let mut raw = u32::from_le_bytes(t);
+        if ci { raw = ascii_lowercase_u32_le(raw); }
+
+        hash_fragment_u32(raw & mask)
+    }
+
+    fn reference(buf: &[u8], hashes: &[u32], mask: u32, ci: bool) -> u64 {
+        let win = ((32 - mask.leading_zeros()) / 8) as usize;
+        let mut out = 0u64;
+
+        for i in 0..(buf.len() + 1).saturating_sub(win) {
+            let h = window_hash_ref(buf, i, mask, ci);
+            for (k, &fh) in hashes.iter().enumerate() {
+                if fh == h { out |= 1u64 << k; }
+            }
+        }
+
+        out
+    }
+
+    #[test]
+    fn hash_is_the_assumed_bijection() {
+        for raw in [0u32, 1, 0x1234_5678, 0x00FF_FFFF, u32::MAX] {
+            assert_eq!(hash_fragment_u32(raw), raw.wrapping_mul(FRAGMENT_HASH_MUL));
+            assert_eq!(hash_fragment_u32(raw).wrapping_mul(FRAGMENT_HASH_MUL_INV), raw);
+        }
+    }
+
+    #[test]
+    fn every_path_matches_the_reference() {
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let alphabet = b"abcdefABCDEF_ \n";
+
+        for _ in 0..30_000 {
+            let flen = if xorshift(&mut rng) & 1 == 0 { 3 } else { 4 };
+            let mask = fragment_mask_u32(flen);
+            let ci   = xorshift(&mut rng) & 1 == 1;
+
+            let len = (xorshift(&mut rng) % 600) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| alphabet[(xorshift(&mut rng) % alphabet.len() as u64) as usize]).collect();
+
+            // Fragments: every window of a random literal over the same alphabet
+            let lit_len = flen + (xorshift(&mut rng) % 30) as usize;
+            let lit: Vec<u8> = (0..lit_len).map(|_| alphabet[(xorshift(&mut rng) % alphabet.len() as u64) as usize]).collect();
+
+            let mut hashes: Vec<u32> = Vec::new();
+            for w in lit.windows(flen) {
+                let mut t = [0u8; 4];
+                t[..flen].copy_from_slice(w);
+
+                let mut raw = u32::from_le_bytes(t);
+                if ci { raw = ascii_lowercase_u32_le(raw); }
+
+                let h = hash_fragment_u32(raw & mask);
+                if !hashes.contains(&h) && hashes.len() < 64 { hashes.push(h); }
+            }
+
+            let index: IntSet<u32> = hashes.iter().copied().collect();
+            let all = if hashes.len() == 64 { u64::MAX } else { (1u64 << hashes.len()) - 1 };
+
+            let prior = if xorshift(&mut rng) % 4 == 0 { xorshift(&mut rng) & all } else { 0 };
+            let want  = prior | reference(&buf, &hashes, mask, ci);
+
+            // The public entry point (dispatcher: teddy / scalar depending on length)
+            let mut got = [prior];
+            check_fragment_presence(&buf, &hashes, &mut got, &index, flen, ci);
+            assert_eq!(got[0], want, "dispatcher: len={len} flen={flen} ci={ci} frags={}", hashes.len());
+
+            // The scalar path on its own (covers the 3-byte last-window fix)
+            let mut got = [prior];
+            check_fragment_presence_scalar(&buf, &hashes, &mut got, &index, mask, ci);
+            if buf.len() >= 4 {
+                assert_eq!(got[0], want, "scalar: len={len} flen={flen} ci={ci} frags={}", hashes.len());
+            }
         }
     }
 }

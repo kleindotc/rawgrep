@@ -1,4 +1,5 @@
 use rawgrep::cache::*;
+use rawgrep::parser::{FileKey, FileMeta};
 use proptest::prelude::*;
 
 // --- Helpers --------------------------------------------------------------
@@ -1006,7 +1007,7 @@ fn absent_only_for_specific_fragment_not_others() {
 fn absent_bits_survive_capacity_growth() {
     // Insert many files with absent fragments, force capacity growth,
     // verify all absent bits are still intact.
-    let mut cache = FragmentCache::new_in_memory(32, 8); // small initial capacity
+    let mut cache = FragmentCache::new_in_memory(32, 300); // small initial capacity
 
     let hash = 0xABCD_u32;
     let num_files = 300usize;
@@ -1064,7 +1065,7 @@ fn absent_bits_correct_at_each_u64_boundary_position() {
     let max_frags = 130;
 
     for &target_index in &boundary_indexes {
-        let mut cache = FragmentCache::new_in_memory(max_frags, 32);
+        let mut cache = FragmentCache::new_in_memory(max_frags, 200);
         let k = key(target_index as u64);
         let m = meta(target_index as i64, target_index as u64);
 

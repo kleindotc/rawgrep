@@ -1,5 +1,6 @@
 #![cfg_attr(all(nightly, feature = "use_nightly"), allow(internal_features))]
 #![cfg_attr(all(nightly, feature = "use_nightly"), feature(core_intrinsics))]
+#![cfg_attr(all(nightly, feature = "use_nightly"), feature(portable_simd))]
 
 #![allow(
     clippy::identity_op,
@@ -13,6 +14,7 @@
 
 pub mod ctx;
 pub mod cli;
+pub mod binary_verdicts;
 pub mod grep;
 pub mod ext4;
 pub mod ctrl_c;
@@ -43,6 +45,17 @@ pub mod liner;
 pub mod unwrap_;
 pub mod index_;
 pub mod logger;
+#[cfg(unix)] pub mod run_temperature;
+
+#[cfg(not(feature = "dont_vendor"))]
+pub mod smallvec_vendor;
+#[cfg(not(feature = "dont_vendor"))]
+pub use smallvec_vendor as smallvec;
+
+#[cfg(not(feature = "dont_vendor"))]
+pub mod bytecount_vendor;
+#[cfg(not(feature = "dont_vendor"))]
+pub use bytecount_vendor as bytecount;
 
 pub use crossbeam_channel;
 
@@ -102,6 +115,7 @@ pub struct RawGrepConfig {
 
     // ---- cache ----------------------------------------------------------
     pub no_cache:      bool,
+    pub no_binary_cache:bool,
     pub no_cache_write:bool,
     pub cache_size_mb: usize,
     pub cache_dir:     Option<Box<Path>>,
@@ -112,6 +126,7 @@ impl RawGrepConfig {
     /// Minimal constructor, all optional fields use sensible defaults.
     pub fn new(pattern: impl Into<Box<str>>, search_root_path: impl Into<Box<str>>) -> Self {
         RawGrepConfig {
+            no_binary_cache:  false,
             pattern:          pattern.into(),
             search_root_path: search_root_path.into(),
             device:           None,
@@ -166,6 +181,7 @@ impl RawGrepConfig {
     #[inline]
     pub fn from_cli(c: cli::Cli) -> Self {
         RawGrepConfig {
+            no_binary_cache:  c.no_binary_cache,
             should_ignore_reserved_tool_dir_filter: c.should_ignore_reserved_tool_dir_filter(),
             pattern:          c.pattern.into_boxed_str(),
             search_root_path: c.search_root_path.into_boxed_str(),
@@ -197,6 +213,7 @@ impl RawGrepConfig {
     #[inline]
     pub fn to_cli(&self) -> cli::Cli {
         cli::Cli {
+            no_binary_cache:  self.no_binary_cache,
             hidden:           self.hidden,
             no_cache_write:   self.no_cache_write,
             reserved_tool_dirs: self.should_ignore_reserved_tool_dir_filter,

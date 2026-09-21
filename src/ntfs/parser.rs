@@ -1,6 +1,6 @@
 //! NTFS filesystem implementation of RawFs trait
 
-use smallvec::SmallVec;
+use crate::smallvec::SmallVec;
 
 use crate::{tracy, util};
 use crate::unwrap_::Unwrap_;
@@ -37,7 +37,7 @@ impl FileNode for NtfsInode {
     fn size(&self) -> u64 { self.size }
 
     #[inline(always)]
-    fn mtime(&self) -> i64 { self.mtime_sec }
+    fn mtime_sec(&self) -> i64 { self.mtime_sec }
 
     #[inline(always)]
     fn is_dir(&self) -> bool { self.flags & NTFS_MFT_RECORD_FLAG_IS_DIR != 0 }
@@ -81,6 +81,7 @@ impl RawFs for NtfsFs {
         max_size: usize,
         kind: BufKind,
         check_binary: bool,
+        likely_binary: bool,
     ) -> io::Result<bool> {
         let _span = tracy::span!("NtfsFs::read_file_content");
 
@@ -113,6 +114,7 @@ impl RawFs for NtfsFs {
             node,
             size_to_read,
             check_binary,
+            likely_binary,
             buf
         )? {
             parser.get_buf_mut(kind).clear();
@@ -144,6 +146,7 @@ impl RawFs for NtfsFs {
         node: &NtfsInode,
         max_size: usize,
         check_binary: bool,
+        _likely_binary: bool,
         buf: &mut Vec<u8>
     ) -> io::Result<bool> {
         let _span = tracy::span!("NtfsFs::collect_file_chunks");

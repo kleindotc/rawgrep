@@ -181,8 +181,7 @@ fn ascii_case_fold_byte(class: &Class) -> Option<u8> {
 }
 
 /// Case-aware counterpart to `literal_bytes`: unwraps a Hir that reduces
-/// to exactly one literal run (through Capture and all-literal Concat,
-/// same as before), now also allowing ASCII case-fold classes to
+/// to exactly one literal run, now also allowing ASCII case-fold classes to
 /// participate in the run. If any component of the run was
 /// case-insensitive, the whole merged run is marked case-insensitive --
 /// once merged we no longer track case-sensitivity per byte, so this is
@@ -292,12 +291,12 @@ fn alternation_literal_parts(subs: &[Hir]) -> Vec<LiteralPart> {
 }
 
 /// Bounds how large a literal we'll materialize by repeating a unit
-/// `min` times, so a pathological pattern like "a{100000000}" can't force
-/// an unbounded allocation here. Repeating fewer than `min` times is
+/// 'min' times, so a pathological pattern like "a{100000000}" can't force
+/// an unbounded allocation here. Repeating fewer than 'min' times is
 /// still a fully sound (if less specific) claim: the real match always
-/// contains at least `min` copies, and any prefix of that guaranteed run
-/// is equally guaranteed. Always produces at least one copy when `min >= 1`
-/// and the unit is nonempty, matching the pre-optimization behavior as a floor.
+/// contains at least 'min' copies, and any prefix of that guaranteed run
+/// is equally guaranteed. Always produces at least one copy when 'min >= 1'
+/// and the unit is nonempty.
 pub const MAX_REPEATED_LITERAL_BYTES: usize = 4096;
 
 fn repeat_bytes(unit: &[u8], min: u32) -> Vec<u8> {
@@ -491,9 +490,8 @@ fn common_substrings(a: &[u8], b: &[u8], min_len: usize) -> Vec<Vec<u8>> {
 }
 
 pub fn extract_regex_literals(
-    pattern: &str,
-    case_insensitive: bool,
-) -> Option<(Vec<u32>, usize, bool)> {
+    pattern: &str, case_insensitive: bool
+) -> Option<(Vec<u32>, usize, bool, bool)> {
     use crate::logger::*;
     use crate::fragments::{MIN_FRAGMENT_LEN, extract_pattern_fragments_with_len, select_fragment_len};
 
@@ -541,11 +539,13 @@ pub fn extract_regex_literals(
 
     let fragment_len = select_fragment_len(parts.iter().map(|p| p.as_slice()))?;
 
+    let single_literal = parts.len() == 1;
+
     let mut all_fragments = IntSet::default();
     for part in &parts {
         let frags = extract_pattern_fragments_with_len(part, fragment_len);
         all_fragments.extend(frags);
     }
 
-    Some((all_fragments.into_iter().collect(), fragment_len, needs_folding))
+    Some((all_fragments.into_iter().collect(), fragment_len, needs_folding, single_literal))
 }

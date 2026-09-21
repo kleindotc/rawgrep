@@ -8,8 +8,8 @@ use crate::unwrap_::Unwrap_;
 use crate::path_buf::SmallPathBuf;
 use crate::stdout::{RawStdout, OutputKind};
 use crate::{cli, ignore, platform, CursorHide};
-use crate::parser::Parser;
-use crate::cache::{FileKey, FileMeta, CacheStats};
+use crate::parser::{Parser, FileKey, FileMeta};
+use crate::cache::CacheStats;
 use crate::stats::{AtomicStats, Stats};
 use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs, AnyNodeScratch, AnyNodeCache};
 use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OutputMessage, EntriesArena};
@@ -26,9 +26,10 @@ use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 
 #[derive(Default)]
 struct CacheAccumulator {
-    file_keys:          Vec<FileKey>,
-    file_metas:         Vec<FileMeta>,
-    fragment_presence:  Vec<u64>,
+    file_keys:            Vec<FileKey>,
+    file_metas:           Vec<FileMeta>,
+    fragment_presence:    Vec<u64>,
+    verdict_fingerprints: Vec<u64>,
 }
 
 /// Per-search data, swapped atomically between searches.
@@ -197,8 +198,15 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
         self.current_job.read().unwrap_()
             .as_ref()
-            .map(|j| (j.stats.to_stats(), j.grepper.cache().map(|c| c.stats.to_cache_stats())))
-            .unwrap_or_default()
+            .map(|j| {
+                let stats = j.stats.to_stats();
+                #[cfg(not(feature = "no-cache-stats"))] {
+                    (stats, j.grepper.cache().map(|c| c.stats.to_cache_stats()))
+                }
+                #[cfg(feature = "no-cache-stats")] {
+                    (stats, None)
+                }
+            }).unwrap_or_default()
     }
 
     #[inline]
@@ -230,10 +238,11 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             return;
         };
 
-        let acc = job.cache_acc.lock().unwrap_();
-        let file_keys         = &acc.file_keys;
-        let file_metas        = &acc.file_metas;
-        let fragment_presence = &acc.fragment_presence;
+        let mut acc = job.cache_acc.lock().unwrap_();
+        let verdict_fingerprints = core::mem::take(&mut acc.verdict_fingerprints);
+        let file_keys            = &acc.file_keys;
+        let file_metas           = &acc.file_metas;
+        let fragment_presence    = &acc.fragment_presence;
 
         let (fragment_hashes, cache) = job.grepper.fragment_hashes_and_cache_mut();
 
@@ -255,13 +264,20 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
         } else {
             debug!("job.grepper.cache is None... (pattern < 3 bytes)");
         }
+
+        if !config.binary
+            && let Ok(cache_path) = crate::cache::get_cache_path(config.cache_dir.as_deref(), "binary-verdicts.bin")
+        {
+            let verdicts = job.grepper.binary_verdicts();
+            _ = verdicts.save(&cache_path, verdict_fingerprints);
+        }
     }
 
     /// Start a new search, cancelling any in-flight one.
     ///
     /// Returns immediately - results arrive via `sink`.
-    /// Returns `Err` if setup (device detection, fs detection, path
-    /// resolution) fails before any work starts.
+    /// Returns `Err` if setup (device detection, fs detection, path resolution)
+    /// fails before any work starts.
     pub fn search(
         &self,
         config: &RawGrepConfig,
@@ -349,6 +365,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
 
     let mut matcher_cache             = None;
 
+    let mut verdict_fingerprints      = Vec::new();
     let mut file_keys                 = Vec::new();
     let mut file_metas                = Vec::new();
     let mut fragment_presence         = FragmentPresenceBits::default();
@@ -408,6 +425,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
             matcher_cache = Some(job.grepper.matcher().create_cache().unwrap_());
         }
 
+        let single_literal_fragments = job.grepper.single_literal_fragments();
         let ignore_case = job.grepper.ignore_case();
 
         macro_rules! dispatch {
@@ -424,8 +442,10 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     selected_fragment_hash_len: $g.selected_fragment_hash_len(),
                     cli:              $g.cli(),
                     sink:             $g.sink.clone(),
+                    binary_verdicts:  &$g.binary_verdicts,
                     stats:            Default::default(),
                     print_line_numbers,
+                    single_literal_fragments,
                     num_workers,
                     ignore_case,
                     pacer,
@@ -434,6 +454,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     path_buf,
                     swap_path_buf,
                     matcher_cache: matcher_cache.as_mut(),
+                    dir_tally: Default::default(),
                     gitignore_enabled: job.gitignore_enabled,
                     node_scratch:
                     $g.fs().take_node_scratch(&mut node_scratch),
@@ -455,6 +476,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     green: $crate::color::green::code(),
                     cyan:  $crate::color::cyan::code(),
 
+                    pending_verdict_fingerprints: verdict_fingerprints,
                     pending_file_keys: file_keys,
                     pending_file_metas: file_metas,
                     pending_fragment_presence: fragment_presence,
@@ -499,16 +521,23 @@ fn worker_thread_main<S: MatchSink + 'static>(
         );
 
         // Deposit cache data
-        if !cli.no_cache_write && !cli.no_cache {
+        {
             let mut acc = job.cache_acc.lock().unwrap_();
-            acc.file_keys.append(&mut result.file_keys);
-            acc.file_metas.append(&mut result.file_metas);
-            acc.fragment_presence.append(&mut result.fragment_presence.words);
+
+            if !cli.no_cache_write && !cli.no_cache {
+                acc.file_keys.append(&mut result.file_keys);
+                acc.file_metas.append(&mut result.file_metas);
+                acc.fragment_presence.append(&mut result.fragment_presence.words);
+            }
+            if !cli.no_binary_cache {
+                acc.verdict_fingerprints.append(&mut result.verdict_fingerprints);
+            }
         }
 
-        file_keys         = result.file_keys;
-        file_metas        = result.file_metas;
-        fragment_presence = result.fragment_presence;
+        file_keys            = result.file_keys;
+        file_metas           = result.file_metas;
+        verdict_fingerprints = result.verdict_fingerprints;
+        fragment_presence    = result.fragment_presence;
 
         {
             let (lock, cvar) = &*ctx.job_done;
@@ -521,7 +550,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
     }
 }
 
-// Shared job-building logic, pulled out of search() unchanged in behavior.
+// Shared job-building logic
 fn build_job_and_initial_work<S: MatchSink + 'static>(
     config: &RawGrepConfig,
     sink: S,

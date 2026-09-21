@@ -5,54 +5,26 @@ use crate::writeln_blue;
 use crate::unwrap_::Unwrap_;
 use crate::index_::{Index_, IndexMut_};
 use crate::util::{likely, unlikely, prefetch_read};
+use crate::parser::{FileIdentifier, FileKey, FileMeta};
 
 use std::time::Instant;
 use std::io::{self};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
+#[cfg(not(feature = "no-cache-stats"))]
+use std::sync::atomic::Ordering;
 
 const FILE_LOOKUP_EMPTY: u32 = u32::MAX;
 
-/// Uniquely identifies a file across reboots
-#[repr(C, align(16))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FileKey {
-    pub device_id: u64,
-    pub inode: u64,
-}
+/// File slot flag:       An existing row that must be zeroed before its bits are written.
+const RESET: u32 = 1 << 31;
 
-impl FileKey {
-    #[inline(always)]
-    pub const fn new(device_id: u64, inode: u64) -> Self {
-        Self { device_id, inode }
-    }
+/// File slot marker:     A new file that did not fit under `max_files`.
+const DROPPED: u32 = u32::MAX;
 
-    #[inline(always)]
-    pub const fn hash(&self) -> u32 {
-        ((self.device_id ^ self.inode).wrapping_mul(0x9e3779b9)) as u32
-    }
-}
-
-/// Metadata for cache invalidation
-#[repr(C, align(16))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileMeta {
-    pub mtime_sec: i64,
-    pub size: u64,
-}
-
-impl FileMeta {
-    #[inline(always)]
-    pub const fn new(mtime_sec: i64, size: u64) -> Self {
-        Self { mtime_sec, size }
-    }
-
-    #[inline(always)]
-    pub const fn matches(&self, other: FileMeta) -> bool {
-        self.mtime_sec == other.mtime_sec && self.size == other.size
-    }
-}
+/// Fragment slot marker: The fragment could not be given a cache slot.
+const NO_SLOT: u32 = u32::MAX;
 
 #[derive(Debug, Default)]
 pub struct CacheStats {
@@ -63,6 +35,7 @@ pub struct CacheStats {
 }
 
 #[derive(Debug, Default)]
+#[cfg(not(feature = "no-cache-stats"))]
 pub struct AtomicCacheStats {
     pub hits: AtomicU32,
     pub misses: AtomicU32,
@@ -70,6 +43,7 @@ pub struct AtomicCacheStats {
     pub dropped_at_capacity: AtomicU32,
 }
 
+#[cfg(not(feature = "no-cache-stats"))]
 impl AtomicCacheStats {
     pub fn to_cache_stats(&self) -> CacheStats {
         CacheStats {
@@ -179,7 +153,6 @@ impl<T: Copy> FatPtr<T> {
     /// - `ptr` must be valid for reads of `len * size_of::<T>()` bytes
     /// - `ptr` must be properly aligned for T
     /// - The memory must remain valid for the lifetime of this FatPtr
-    #[allow(unused)]
     #[inline(always)]
     const unsafe fn from_raw(ptr: *const T, len: usize) -> Self {
         Self { ptr, len }
@@ -190,6 +163,25 @@ impl<T: Copy> FatPtr<T> {
         let Self { ptr, len } = *self;
         debug_assert!(index < len, "FatPtr: index {index} out of bounds (len {len})");
         unsafe { *ptr.add(index) }
+    }
+
+    #[inline(always)]
+    #[allow(unused)]
+    fn slice(&self, start: usize, end: usize) -> &[T] {
+        let Self { ptr, len } = *self;
+
+        debug_assert!(start < len && end < len, "FatPtr: slice out of bounds (len {len})");
+
+        if len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(ptr, len) } }
+    }
+
+    #[inline(always)]
+    fn make_slice(&self, new_len: usize) -> &[T] {
+        let Self { ptr, len } = *self;
+
+        debug_assert!(new_len <= len, "FatPtr: slice out of bounds (new len {new_len}) (len {len})");
+
+        if new_len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(ptr, new_len) } }
     }
 
     #[allow(unused)]
@@ -248,14 +240,6 @@ impl std::ops::Deref for CacheBytes {
             CacheBytes::Mapped(m) => &m[..],
             CacheBytes::Owned(v)  => &v[..],
         }
-    }
-}
-
-impl CacheBytes {
-    #[cfg(unix)]
-    #[inline]
-    fn advise(&self, advice: memmap2::Advice) {
-        if let CacheBytes::Mapped(mmap) = self { _ = mmap.advise(advice) }
     }
 }
 
@@ -419,7 +403,7 @@ impl CacheStorage for DiskStorage {
                 let ret = unsafe { libc::mlock(bytes.as_ptr() as *const libc::c_void, bytes.len()) };
                 if ret != 0 {
                     let err = io::Error::last_os_error();
-                    eprintln!("[cache] mlock failed ({err}), falling back to populate+advise");
+                    eprintln!("[cache] mlock failed ({err}), falling back to populated but unlocked mapping");
                     false
                 } else {
                     true
@@ -440,9 +424,20 @@ impl CacheStorage for DiskStorage {
 
             eprintln!("mmap populated cache pages in {}ms", t0.elapsed().as_millis() as f64);
 
+            //
+            // With the pages populated and mlock'd there is nothing left to advise about,
+            // so madvise would be a no-op (WillNeed would even re-walk the whole mapping's
+            // page cache to rediscover what MAP_POPULATE just loaded).
+            //
+            // The exception is mlock failing (RLIMIT_MEMLOCK): the pages are still resident
+            // but reclaimable. Lookups are point accesses, so if reclaim takes some and they
+            // fault back in, don't let the kernel read ahead around each fault.
+            //
             let t0 = Instant::now();
             if try_mlock_cache(&mmap[..]) {
                 eprintln!("mlock-cached cache pages in {}ms", t0.elapsed().as_millis() as f64);
+            } else {
+                _ = mmap.advise(memmap2::Advice::Random);
             }
 
             Ok(Some(CacheBytes::Mapped(mmap)))
@@ -479,28 +474,6 @@ impl CacheStorage for MemoryStorage {
 
         *self.data.lock().unwrap_() = Some(data);
         Ok(())
-    }
-}
-
-/// Finish growing an array: copy `copy_len` elements from `src` into the
-/// front of `uninit`, then mark the whole box initialized. The tail past
-/// `copy_len` (if any) is left uninitialized -- callers own that invariant
-/// and must overwrite it before it's ever read (the bitset growth call
-/// sites below rely on this instead of paying to zero memory nothing will
-/// read yet).
-///
-/// # SAFETY
-/// `src` must be valid for reads of `copy_len` elements of `T`, and
-/// `copy_len` must not exceed `uninit.len()`.
-#[inline(always)]
-unsafe fn finish_grow<T: Copy>(
-    mut uninit: Box<[std::mem::MaybeUninit<T>]>,
-    src: *const T,
-    copy_len: usize,
-) -> Box<[T]> {
-    unsafe {
-        std::ptr::copy_nonoverlapping(src, uninit.as_mut_ptr() as *mut T, copy_len);
-        uninit.assume_init()
     }
 }
 
@@ -572,15 +545,25 @@ pub struct FragmentCache<S: CacheStorage = DiskStorage> {
 
     // @Cleanup
     owned_fragment_hashes: Option<Box<[u32]>>,
+
     owned_file_keys:       Option<Box<[FileKey]>>,
     owned_file_metas:      Option<Box<[FileMeta]>>,
     owned_file_bitsets:    Option<Box<[u64]>>,
+
+    // Set only by apply_batch, which always rebuilds keys+metas+bits together in
+    // lockstep -- so unlike the trio above, they belong in one allocation. u128
+    // as the element type is just a cheap way to get a 16-byte-aligned buffer
+    // (matches FileKey/FileMeta's repr(align(16))) without hand-rolling
+    // std::alloc::Layout. When this is Some, the trio above is None -- see
+    // apply_batch's commit step and save_to_disk's dirty check.
+    owned_arena: Option<Box<[u128]>>,
 
     //
     // ---------------------------------------------------------------
 
     file_lookup: Box<[u32]>,  // Open-addressed hash table
 
+    #[cfg(not(feature = "no-cache-stats"))]
     pub stats: AtomicCacheStats,
 
     storage: S,
@@ -592,7 +575,7 @@ impl FragmentCache<DiskStorage> {
     /// Create new or load existing cache
     #[inline]
     pub fn new(config: &CacheConfig) -> io::Result<Self> {
-        let path = Self::get_cache_path(config.cache_dir.as_deref())?;
+        let path = get_cache_path(config.cache_dir.as_deref(), "fragment-cache.bin")?;
         let storage = DiskStorage::new(path);
 
         if !config.ignore_cache {
@@ -721,6 +704,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             max_files,
             file_capacity: INITIAL_CAPACITY,
             fragment_hashes,
+            owned_arena: None,
             file_keys,
             file_metas,
             file_bitsets,
@@ -729,163 +713,10 @@ impl<S: CacheStorage> FragmentCache<S> {
             owned_file_metas: Some(owned_file_metas),
             owned_file_bitsets: Some(owned_file_bitsets),
             file_lookup,
+            storage,
+            #[cfg(not(feature = "no-cache-stats"))]
             stats: AtomicCacheStats::default(),
-            storage
         })
-    }
-
-    /// COW: copy mmap data to owned buffers when we need to write
-    fn ensure_owned(&mut self) {
-        if self.owned_fragment_hashes.is_some() {
-            // Already owned
-            return;
-        }
-
-        let start = Instant::now();
-
-        let num_fragments           = self.num_fragments as usize;
-        let num_files               = self.num_files as usize;
-
-        // Allocate with growth headroom
-        let new_capacity            = (num_files + 64*1024).min(self.max_files as usize);
-
-        let alloc_start             = Instant::now();
-
-        let new_fragment_hashes_u   = Box::<[u32]>::new_uninit_slice(self.max_fragments as usize);
-        let new_file_keys_u         = Box::<[FileKey]>::new_uninit_slice(new_capacity);
-        let new_file_metas_u        = Box::<[FileMeta]>::new_uninit_slice(new_capacity);
-
-        let bits_per_file_u64       = num_fragments.div_ceil(64).max(1);
-        let total_u64s              = new_capacity * bits_per_file_u64;
-        let used_u64s               = num_files * bits_per_file_u64;
-
-        eprintln!(
-            "ensure_owned called: num_files={}, new_capacity={}, bits_per_file_u64={}, total_bitset_KB={}",
-            num_files,
-            new_capacity,
-            num_fragments.div_ceil(64).max(1),
-            (new_capacity * bits_per_file_u64 * 8) / 1024,
-        );
-
-        // allocate uninit and only copy what we need
-        let new_file_bitsets_u = Box::<[u64]>::new_uninit_slice(total_u64s);
-        let alloc_time = alloc_start.elapsed();
-
-        //
-        // Copy existing data from the mmap
-        //
-        let copy_start = Instant::now();
-        let (new_fragment_hashes, new_file_keys, new_file_metas, new_file_bitsets) = unsafe {
-            (
-                finish_grow(new_fragment_hashes_u, self.fragment_hashes.ptr, num_fragments),
-                finish_grow(new_file_keys_u,       self.file_keys.ptr,       num_files),
-                finish_grow(new_file_metas_u,      self.file_metas.ptr,      num_files),
-
-                //
-                // Copy used bitsets from mmap!! We leave the rest
-                // uninitialized - `merge_updates` will initialize each new
-                // file's bitset when its added
-                //
-                finish_grow(new_file_bitsets_u,    self.file_bitsets.ptr,    self.file_bitsets.len().min(used_u64s)),
-            )
-        };
-        let copy_time = copy_start.elapsed();
-
-        // ----------- Update pointers to point to owned data
-        self.fragment_hashes       = FatPtr::from_box(&new_fragment_hashes);
-        self.file_keys             = FatPtr::from_box(&new_file_keys);
-        self.file_metas            = FatPtr::from_box(&new_file_metas);
-        self.file_bitsets          = FatPtr::from_box(&new_file_bitsets);
-
-        // ----------- Store owned data
-        self.owned_fragment_hashes = Some(new_fragment_hashes);
-        self.owned_file_keys       = Some(new_file_keys);
-        self.owned_file_metas      = Some(new_file_metas);
-        self.owned_file_bitsets    = Some(new_file_bitsets);
-
-        // ----------- Update capacity
-        self.file_capacity         = new_capacity;
-
-        self.backing = None;
-
-        let total_time = start.elapsed();
-        eprintln!(
-            "Cache copy-on-write: {} files (capacity {}), {} fragments in {:.2}ms (alloc: {:.2}ms, copy: {:.2}ms)",
-            num_files,
-            new_capacity,
-            num_fragments,
-            total_time.as_millis() as f64,
-            alloc_time.as_millis() as f64,
-            copy_time.as_millis()  as f64,
-        );
-    }
-
-    /// Grow capacity to fit at least `needed` files
-    /// Must be called after ensure_owned()
-    fn ensure_capacity(&mut self, needed: usize) {
-        if needed <= self.file_capacity {
-            return;
-        }
-
-        // @Constant
-        let new_capacity = (needed + 64 * 1024).min(self.max_files as usize);
-        if new_capacity <= self.file_capacity {
-            return;  // At max capacity already
-        }
-
-        let num_files         = self.num_files as usize;
-        let num_fragments     = self.num_fragments as usize;
-        let bits_per_file_u64 = num_fragments.div_ceil(64).max(1);
-
-        //
-        // Grow file_keys, file_metas and file_bitsets to new_capacity.
-        // (Used to be 3 separate copy-pasted alloc+copy blocks -- see
-        // finish_grow() near the top of the file. @Refactor done.)
-        //
-        let old_file_keys    = self.owned_file_keys.take().unwrap_();
-        let old_file_metas   = self.owned_file_metas.take().unwrap_();
-        let old_file_bitsets = self.owned_file_bitsets.take().unwrap_();
-
-        let old_u64s       = num_files * bits_per_file_u64;
-        let new_total_u64s = new_capacity * bits_per_file_u64;
-
-        let (new_file_keys, new_file_metas, new_file_bitsets) = unsafe {
-            (
-                finish_grow(Box::<[FileKey]>::new_uninit_slice(new_capacity),  old_file_keys.as_ptr(),    num_files),
-                finish_grow(Box::<[FileMeta]>::new_uninit_slice(new_capacity), old_file_metas.as_ptr(),   num_files),
-                finish_grow(Box::<[u64]>::new_uninit_slice(new_total_u64s),    old_file_bitsets.as_ptr(), old_u64s.min(old_file_bitsets.len())),
-            )
-        };
-
-        //
-        // Grow lookup table if needed (maintain load factor < 0.5)
-        //
-        let needed_lookup_size = (new_capacity * 2).next_power_of_two();
-        if needed_lookup_size > self.file_lookup.len() {
-            let mut new_lookup = new_empty_lookup(needed_lookup_size);
-
-            // Rehash all existing entries
-            rebuild_lookup(&mut new_lookup, num_files, |id| *new_file_keys.get_(id));
-
-            self.file_lookup = new_lookup;
-        }
-
-        //
-        // Update FatPtrs
-        //
-        self.file_keys          = FatPtr::from_box(&new_file_keys);
-        self.file_metas         = FatPtr::from_box(&new_file_metas);
-        self.file_bitsets       = FatPtr::from_box(&new_file_bitsets);
-
-        //
-        // Store new owned data
-        //
-        self.owned_file_keys    = Some(new_file_keys);
-        self.owned_file_metas   = Some(new_file_metas);
-        self.owned_file_bitsets = Some(new_file_bitsets);
-
-        eprintln!("Cache capacity grew: {} -> {} files", self.file_capacity, new_capacity);
-        self.file_capacity      = new_capacity;
     }
 
     /// Migrate bitsets when num_fragments crosses a 64-boundary.
@@ -987,13 +818,6 @@ impl<S: CacheStorage> FragmentCache<S> {
             FatPtr::from_raw(bytes.as_ptr().add(file_bitsets_offset) as *const u64, file_bitsets_len)
         };
 
-        #[cfg(unix)]
-        bytes.advise(memmap2::Advice::Sequential);
-
-        // @Note: This is here to try to prevent possible major page faults in ensure_owned calls we do.
-        #[cfg(unix)]
-        bytes.advise(memmap2::Advice::WillNeed);
-
         // ---- Build lookup table
         let lookup_size = ((num_files * 2).max(1024)).next_power_of_two();
         let mut file_lookup = new_empty_lookup(lookup_size);
@@ -1005,9 +829,6 @@ impl<S: CacheStorage> FragmentCache<S> {
             bytes.len() as f64 / (1024.0 * 1024.0),
             start.elapsed().as_millis() as f64
         );
-
-        #[cfg(unix)]
-        bytes.advise(memmap2::Advice::Random);
 
         let file_capacity = num_files;
 
@@ -1030,6 +851,7 @@ impl<S: CacheStorage> FragmentCache<S> {
             backing: Some(bytes),
             max_fragments: config.max_fragments as u32,
             max_files: config.max_files as u32,
+            owned_arena: None,
             file_capacity,
             fragment_hashes,
             file_keys,
@@ -1040,16 +862,16 @@ impl<S: CacheStorage> FragmentCache<S> {
             owned_file_metas:      None,
             owned_file_bitsets:    None,
             file_lookup,
+            storage,
+            #[cfg(not(feature = "no-cache-stats"))]
             stats: AtomicCacheStats::default(),
-            storage
         })
     }
 
     #[inline]
     pub fn save_to_disk(&self) -> io::Result<()> {
-        if self.owned_file_keys.is_none() {
-            // Never dirtied this run (ensure_owned() was never called),
-            // on-disk cache is already current, nothing to write.
+        if self.owned_file_keys.is_none() && self.owned_arena.is_none() {
+            // Never dirtied this run, on-disk cache is already current.
             return Ok(());
         }
 
@@ -1123,8 +945,7 @@ impl<S: CacheStorage> FragmentCache<S> {
     #[inline(always)]
     pub fn can_skip_file(
         &self,
-        file_key: FileKey,
-        file_meta: FileMeta,
+        FileIdentifier { key: file_key, meta: file_meta }: FileIdentifier,
         fragment_indexes: &[u32],
     ) -> bool {
         let Some(file_id) = self.lookup_file_id(file_key) else {
@@ -1164,12 +985,12 @@ impl<S: CacheStorage> FragmentCache<S> {
         for &frag_index in fragment_indexes {
             let frag_index = frag_index as usize;
 
-            let u64_index = offset + (frag_index >> 6); // Which u64 contains the bit
-            let bit_index = frag_index & 63;            // Which bit contains the info
+            let  u64_index = offset + (frag_index >> 6); // Which u64 contains the bit
+            let  bit_index = frag_index & 63;            // Which bit contains the info
 
             let bitset_val = self.file_bitsets.get(u64_index);
-            let is_absent = (bitset_val & (1u64 << bit_index)) != 0;
 
+            let is_absent  = (bitset_val & (1u64 << bit_index)) != 0;
             if likely(is_absent) {
                 #[cfg(not(feature = "no-cache-stats"))] {
                     self.stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -1371,6 +1192,7 @@ impl<S: CacheStorage> FragmentCache<S> {
     }
 
     #[inline]
+    #[cfg(not(feature = "no-cache-stats"))]
     pub fn get_stats(&self) -> (u32, u32, u32) {
         (
             self.stats.hits.load(Ordering::Relaxed),
@@ -1396,37 +1218,51 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         fragments_size + file_keys_size + file_metas_size + file_bitsets_size + lookup_size
     }
+}
 
-    #[inline]
-    fn get_cache_path(cache_dir: Option<&Path>) -> io::Result<PathBuf> {
-        let dir = if let Some(d) = cache_dir {
-            d.to_path_buf()
+#[inline]
+pub fn get_cache_path(cache_dir: Option<&Path>, cache_name: &str) -> io::Result<PathBuf> {
+    let dir = if let Some(d) = cache_dir {
+        d.to_path_buf()
+    } else {
+        let home = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            //
+            // ~/.cache/rawgrep/
+            // When running with sudo, use the actual user's home directory
+            //
+            PathBuf::from("/home").join(sudo_user)
         } else {
-            let home = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-                //
-                // ~/.cache/rawgrep/
-                // When running with sudo, use the actual user's home directory
-                //
-                PathBuf::from("/home").join(sudo_user)
-            } else {
-                #[cfg(unix)]
-                let home_str = std::env::var("HOME");
+            #[cfg(unix)]
+            let home_str = std::env::var("HOME");
 
-                #[cfg(not(unix))]
-                let home_str = std::env::var("USERPROFILE");
+            #[cfg(not(unix))]
+            let home_str = std::env::var("USERPROFILE");
 
-                let home_str = home_str.map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+            let home_str = home_str.map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
 
-                PathBuf::from(home_str)
-            };
-
-            home.join(".cache").join("rawgrep")
+            PathBuf::from(home_str)
         };
 
-        std::fs::create_dir_all(&dir)?;
-        fix_ownership(&dir)?;
+        home.join(".cache").join("rawgrep")
+    };
 
-        Ok(dir.join("fragment_cache.bin"))
+    std::fs::create_dir_all(&dir)?;
+    fix_ownership(&dir)?;
+
+    Ok(dir.join(cache_name))
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct ExistingIndex(std::num::NonZeroU32);
+impl ExistingIndex {
+    #[inline(always)]
+    pub fn new(index: u32) -> Self {
+        Self(unsafe { std::num::NonZeroU32::new_unchecked(index.checked_add(1).unwrap()) })
+    }
+    #[inline(always)]
+    pub fn get(&self) -> u32 {
+        self.0.get() - 1
     }
 }
 
@@ -1436,17 +1272,17 @@ struct FragPlan {
     hash: u32,
 
     // Some if already in the table. None means apply_batch must add it.
-    existing_index: Option<u32>,
+    existing_index: Option<ExistingIndex>,
 }
 
 /// Resolution of a single file against the current table.
 struct FilePlan {
-    file_index:   u32,         // index into the caller's file_keys/file_metas
-    existing_id:  Option<u32>, // None means apply_batch must insert it
+    file_index:   u32,                   // Index into the caller's file_keys/file_metas
+    existing_id:  Option<ExistingIndex>, // None means apply_batch must insert it
     meta_changed: bool,
 }
 
-struct BatchPlan {
+pub struct BatchPlan {
     frags: Vec<FragPlan>,
     files: Vec<FilePlan>,
 
@@ -1482,6 +1318,7 @@ impl<S: CacheStorage> FragmentCache<S> {
                 has_new_fragment = true;
             }
 
+            let existing_index = existing_index.map(ExistingIndex::new);
             frags.push(FragPlan { hash, existing_index });
         }
 
@@ -1496,7 +1333,7 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         let fast_word = bits_per_file_u64 == 1 && words_per_file == 1 && !has_new_fragment;
         let selector_mask: u64 = if fast_word {
-            frags.iter().fold(0u64, |m, f| m | (1u64 << f.existing_index.unwrap_()))
+            frags.iter().fold(0u64, |m, f| m | (1u64 << f.existing_index.unwrap_().get()))
         } else {
             0
         };
@@ -1540,7 +1377,7 @@ impl<S: CacheStorage> FragmentCache<S> {
                     let mut deposited = 0u64;
                     for (frag_i, f) in frags.iter().enumerate() {
                         let bit = (presence_word >> frag_i) & 1;
-                        deposited |= bit << f.existing_index.unwrap_();
+                        deposited |= bit << f.existing_index.unwrap_().get();
                     }
 
                     let expected = !deposited & selector_mask;
@@ -1564,7 +1401,7 @@ impl<S: CacheStorage> FragmentCache<S> {
                         //
                         // has_new_fragment is false here, so this is always Some.
                         //
-                        let frag_index     = frag_plan.existing_index.unwrap_() as usize;
+                        let frag_index     = frag_plan.existing_index.unwrap_().get() as usize;
 
                         let presence       = *presence.get_(frag_i / 64);
                         let is_present     = (presence & (1 << (frag_i % 64))) != 0;
@@ -1587,45 +1424,180 @@ impl<S: CacheStorage> FragmentCache<S> {
                 }
             }
 
+            let existing_id = existing_id.map(ExistingIndex::new);
             files.push(FilePlan { file_index: file_index as u32, existing_id, meta_changed });
         }
 
         BatchPlan { frags, files, changed }
     }
 
-    /// Applies a plan produced by plan_batch(). Caller is responsible for
-    /// checking plan.changed first, this does no checking of its own.
-    fn apply_batch(
+    /// Decide, for every fragment in the batch, which cache column it uses.
+    ///
+    /// Pure: mutates nothing in `self`; all output goes into `scratch` (zeroed on entry).
+    ///
+    ///   * existing fragments keep their slot
+    ///   * new fragments are appended while there is room
+    ///   * once the ring is full they evict FIFO, but never a slot this batch depends on
+    ///     (the old code could overwrite a slot that another fragment of the same batch was
+    ///     already resolved to, leaving two fragments on one column)
+    ///   * a fragment that finds no free slot is dropped; its bits are simply never recorded
+    ///
+    /// Outputs: scratch.slot_of, scratch.clear (columns to zero in pre-existing rows) and
+    /// scratch.hashes[..num_fragments].
+    fn resolve_fragments(&self, plan: &BatchPlan, scratch: &mut ScratchViews<'_>) -> io::Result<FragmentLayout> {
+        let max               = self.max_fragments as usize;
+        let old_num_fragments = self.num_fragments as usize;
+
+        if old_num_fragments > max || self.fragment_hashes.len() < old_num_fragments {
+            return Err(bad("fragment table inconsistent"));
+        }
+
+        debug_assert_eq!(scratch.hashes .len(), max);
+        debug_assert_eq!(scratch.slot_of.len(), plan.frags.len());
+
+        let hashes  = &mut *scratch.hashes;   // Working table, zeroed
+        let pinned  = &mut *scratch.pinned;   // Slots this batch depends on
+        let clear   = &mut *scratch.clear;    // Columns to zero in pre-existing rows
+        let slot_of = &mut *scratch.slot_of;
+
+        hashes[..old_num_fragments].copy_from_slice(self.fragment_hashes.make_slice(old_num_fragments));
+
+        let mut num_fragments = old_num_fragments;
+        let mut ring_pos      = if (self.ring_pos as usize) < max { self.ring_pos as usize } else { 0 };
+        let mut dropped       = 0u32;
+
+        //
+        // Everything already resolved by plan_batch is pinned first, so eviction can't hit it.
+        // (Scratch is zeroed, not NO_SLOT-filled, so every entry is written explicitly here.)
+        //
+
+        for (out, f) in slot_of.iter_mut().zip(&plan.frags) {
+            match f.existing_index {
+                Some(i) if (i.get() as usize) < old_num_fragments => {
+                    let i = i.get();
+                    bit_set(pinned, i as usize);
+                    *out = i;
+                }
+
+                Some(_) => return Err(bad("plan existing_index out of range")),
+                None    => *out = NO_SLOT,
+            }
+        }
+
+        //
+        // Place the new ones.
+        //
+
+        for (file_index, frag) in plan.frags.iter().enumerate() {
+            if frag.existing_index.is_some() { continue; }
+
+            //
+            // plan_batch should already have resolved this ... keep the old add_fragment() guarantee.
+            //
+            if let Some(s) = hashes.get_(..num_fragments).iter().position(|&h| h == frag.hash) {
+                bit_set(pinned, s);
+                *slot_of.get_mut_(file_index) = s as u32;
+
+                continue;
+            }
+
+            let slot = if num_fragments < max {
+                num_fragments += 1;
+                num_fragments - 1
+            } else {
+                let mut found = None;
+                for _ in 0..max {
+                    let s = ring_pos;
+                    ring_pos = if ring_pos + 1 == max { 0 } else { ring_pos + 1 };
+
+                    if !bit_get(pinned, s) { found = Some(s); break; }
+                }
+
+                match found {
+                    Some(s) => s,
+                    None    => { dropped += 1; continue; }  // Every slot is pinned by this batch; stays NO_SLOT
+                }
+            };
+
+            *slot_of.get_mut_(file_index) = slot as u32;
+            *hashes .get_mut_(slot)       = frag.hash;
+            bit_set(pinned,   slot);
+            bit_set(clear,    slot);
+        }
+
+        Ok(FragmentLayout { num_fragments, ring_pos, dropped })
+    }
+
+    /// Applies a plan produced by plan_batch(). Caller checks plan.changed first.
+    /// On Err the cache is unchanged.
+    ///
+    /// COW: `self.file_keys/metas/bitsets/fragment_hashes` may currently point into an mmap'd
+    /// disk backing, so this never mutates in place. Everything below is built fresh
+    /// into a new arena and the FatPtrs are swapped onto it atomically at the end.
+    ///
+    /// Allocations: one scratch (temporaries, freed on return) + one arena (kept).
+    pub fn apply_batch(
         &mut self,
         plan: &BatchPlan,
         file_keys: &[FileKey],
         file_metas: &[FileMeta],
         fragment_presence: &[u64],
     ) -> io::Result<()> {
-        let words_per_file = plan.frags.len().div_ceil(64).max(1) as u32;
-
-        // COW: copy mmap data to owned buffers before writing.
-        self.ensure_owned();
-
-        let needed_capacity = self.num_files as usize + plan.files.len();
-        self.ensure_capacity(needed_capacity);
-
-        let start = Instant::now();
+        let mut laps = Laps::new();
 
         //
-        // Resolve every fragment up front. fragment_hashes is shared
-        // by the whole batch, so each new hash only needs adding once here.
         //
-        let mut frag_indexes = Vec::with_capacity(plan.frags.len());
-        for frag_plan in &plan.frags {
-            let index = match frag_plan.existing_index {
-                Some(index) => index,
-                None => self.add_fragment(frag_plan.hash),
-            };
-            frag_indexes.push(index);
+        // Validate and size
+        //
+        //
+
+        let old_num_files       = self.num_files as usize;
+        let max_files           = self.max_files as usize;
+        let max_fragments       = self.max_fragments as usize;
+        let old_num_fragments   = self.num_fragments as usize;
+        let old_words_per_file  = old_num_fragments.div_ceil(64).max(1);
+        let plan_words_per_file = plan.frags.len().div_ceil(64).max(1);
+
+        if max_files >= RESET as usize || old_num_files > max_files {
+            return Err(bad("max_files out of range"));
+        }
+        if self.file_keys.len() < old_num_files || self.file_metas.len() < old_num_files {
+            return Err(bad("cache arrays shorter than num_files"));
         }
 
-        let original_num_files = self.num_files as usize;
+        //
+        // One zeroed allocation for every temporary: file/fragment slots,
+        // the pinned/clear bitsets and the table.
+        //
+        let mut scratch       = BatchScratch::new(plan.files.len(), plan.frags.len(), max_fragments)?;
+        populate_capacity(&mut scratch.buf);
+        let mut scratch       = scratch.views();
+
+        let mut next          = old_num_files;
+        let mut dropped_files = 0u32;
+        for (out, file_plan) in scratch.slots.iter_mut().zip(&plan.files) {
+            let file_index = file_plan.file_index as usize;
+
+            if file_index >= file_keys.len()
+            || file_index >= file_metas.len()
+            || (!plan.frags.is_empty() && (file_index + 1) * plan_words_per_file > fragment_presence.len())
+            {
+                return Err(bad("plan references a file outside the input slices"));
+            }
+
+            *out = match file_plan.existing_id {
+                Some(id) if (id.get() as usize) < old_num_files => id.get() | if file_plan.meta_changed { RESET } else { 0 },
+                Some(_) => return Err(bad("plan existing_id out of range")),
+
+                //
+                // self.file_capacity is capped at max_files, so once `next` hits it every
+                // remaining new file in this batch drops.
+                //
+                None if next < max_files => { next += 1; (next - 1) as u32 }
+                None => { dropped_files += 1; DROPPED }
+            };
+        }
+        let final_files = next;
 
         //
         // Guards against a single merge_updates() batch containing the same
@@ -1637,159 +1609,274 @@ impl<S: CacheStorage> FragmentCache<S> {
         // which they don't right now... Not sure if this might actually happen.
         //
         #[cfg(debug_assertions)]
-        let mut seen_file_ids = std::collections::HashSet::with_capacity(plan.files.len());
-
-        //
-        //
-        // Add all files and collect fragment data
-        //
-        //
-
-        let mut dropped = 0u32;
-        let mut file_updates = Vec::with_capacity(plan.files.len());
-
-        for (i, file_plan) in plan.files.iter().enumerate() {
-            let num_files = self.num_files as usize;
-            if num_files >= self.file_capacity {
-                //
-                // self.file_capacity is capped at self.max_files (see ensure_capacity),
-                // so once it's reached, every subsequent file in this batch, and every future
-                // merge_updates call, will drop new files the same way until max_files is raised.
-                //
-                dropped = (plan.files.len() - i) as u32;
-                break;
+        {
+            let mut seen = vec![0u64; final_files.div_ceil(64).max(1)];
+            for &s in scratch.slots.iter().filter(|&&s| s != DROPPED) {
+                let id = (s & !RESET) as usize;
+                assert!(
+                    !bit_get(&seen, id),
+                    "apply_batch: file_id {id} appears more than once in a single batch, \
+                     caller must de-duplicate by file_key"
+                );
+                bit_set(&mut seen, id);
             }
-
-            let file_key  = *file_keys .get_(file_plan.file_index as usize);
-            let file_meta = *file_metas.get_(file_plan.file_index as usize);
-
-            let file_id = match file_plan.existing_id {
-                Some(id) => id as usize,
-                None => {
-                    let new_file_id = num_files;
-                    self.num_files = (num_files + 1) as u32;
-
-                    self.insert_into_lookup(file_key, new_file_id as u32);
-                    new_file_id
-                }
-            };
-
-            #[cfg(debug_assertions)]
-            debug_assert!(
-                seen_file_ids.insert(file_id),
-                "apply_batch: file_id {} appears more than once in a single batch, \
-                 caller must de-duplicate by file_key before calling merge_updates.",
-                file_id,
-            );
-
-            //
-            // Update metadata
-            //
-
-            *self.owned_file_keys.as_mut().unwrap_().get_mut_(file_id) = file_key;
-
-            *self.owned_file_metas.as_mut().unwrap_().get_mut_(file_id) = file_meta;
-
-            let needs_full_reset =
-                file_plan.existing_id.is_none()
-             || file_plan.meta_changed
-             || file_id >= original_num_files;
-
-            let presence = {
-                let file_index     = file_plan.file_index as usize;
-                let words_per_file = words_per_file       as usize;
-                fragment_presence.get_(
-                    file_index * words_per_file
-                    ..
-                    (file_index + 1) * words_per_file
-                )
-            };
-
-            let mut fragment_data = Vec::with_capacity(frag_indexes.len());
-            for (frag_i, &frag_index) in frag_indexes.iter().enumerate() {
-                let presence = *presence.get_(frag_i / 64);
-                let is_present = (presence & (1 << (frag_i % 64))) != 0;
-                fragment_data.push((frag_index, is_present));
-            }
-
-            file_updates.push((file_id, fragment_data, needs_full_reset));
         }
 
-        if dropped > 0 {
-            self.stats.dropped_at_capacity.fetch_add(dropped, Ordering::Relaxed);
+        let fragment_layout    = self.resolve_fragments(plan, &mut scratch)?;
+        let new_num_fragments  = fragment_layout.num_fragments;
+        let new_words_per_file = new_num_fragments.div_ceil(64).max(1);
+        let total_u64s = final_files.checked_mul(new_words_per_file).ok_or_else(|| bad("bitset size overflow"))?;
+
+        let slots:      &[u32] = &*scratch.slots;
+        let slot_of:    &[u32] = &*scratch.slot_of;
+        let clear:      &[u64] = scratch.clear .get_(..new_words_per_file);
+        let new_hashes: &[u32] = scratch.hashes.get_(..new_num_fragments);
+        laps.lap("plan");
+
+        //
+        //
+        // Allocate
+        //
+        //
+
+        let old_keys     = self.file_keys   .make_slice(old_num_files);
+        let old_metas    = self.file_metas  .make_slice(old_num_files);
+        let old_bits     = self.file_bitsets.make_slice(self.file_bitsets.len().min(old_num_files * old_words_per_file));
+
+        //
+        // keys and metas are both FileKey/FileMeta (repr align(16), size 16), so both
+        // regions are exact multiples of 16 bytes -- metas and bits both land on a
+        // 16-byte boundary already. Bits is a multiple of 8 bytes, so the hashes region
+        // that follows it is 8-byte aligned (needs 4).
+        //
+
+        const _: ()      = assert!(align_of::<FileKey >() == 16);
+        const _: ()      = assert!(align_of::<FileMeta>() == 16);
+
+        let   keys_bytes = final_files  .checked_mul(size_of::<FileKey>()) .ok_or_else(|| bad("size overflow"))?;
+        let  metas_bytes = final_files  .checked_mul(size_of::<FileMeta>()).ok_or_else(|| bad("size overflow"))?;
+        let   bits_bytes = total_u64s   .checked_mul(size_of::<u64>())     .ok_or_else(|| bad("size overflow"))?;
+        let hashes_bytes = max_fragments.checked_mul(size_of::<u32>())     .ok_or_else(|| bad("size overflow"))?;
+
+        debug_assert_eq!(keys_bytes  % 16, 0);
+        debug_assert_eq!(metas_bytes % 16, 0);
+
+        let arena_bytes = keys_bytes.checked_add(metas_bytes)
+            .and_then(|s| s.checked_add(bits_bytes))
+            .and_then(|s| s.checked_add(hashes_bytes))
+            .ok_or_else(|| bad("size overflow"))?;
+
+        //
+        // Zeroed calloc allocation from kernel's zero pages.
+        //
+        let mut arena = vec![0u128; arena_bytes.div_ceil(16)];
+        populate(&mut arena);
+
+        //
+        // SAFETY: base is 16-byte aligned (u128). The four regions (keys | metas | bits | hashes)
+        // are laid out back-to-back at the offsets computed above, each sized exactly to the
+        // FatPtr length it's given -- no aliasing.
+        //
+        // `arena` is not touched again (no push/reserve) until into_boxed_slice() at the very end,
+        // so these pointers stay valid for the rest of the function.
+        //
+
+        let base                    = arena.as_mut_ptr() as *mut u8; assert_eq!(base as usize % 16, 0);
+        let   keys_ptr              = base as *mut FileKey;
+        let  metas_ptr              = unsafe { base.add(keys_bytes) } as *mut FileMeta;
+        let   bits_ptr              = unsafe { base.add(keys_bytes + metas_bytes) } as *mut u64;
+        let hashes_ptr              = unsafe { base.add(keys_bytes + metas_bytes + bits_bytes) } as *mut u32;
+
+        let keys:   &mut [FileKey]  = unsafe { std::slice::from_raw_parts_mut(keys_ptr,   final_files) };
+        let metas:  &mut [FileMeta] = unsafe { std::slice::from_raw_parts_mut(metas_ptr,  final_files) };
+        let bits:   &mut [u64]      = unsafe { std::slice::from_raw_parts_mut(bits_ptr,   total_u64s) };
+        let hashes: &mut [u32]      = unsafe { std::slice::from_raw_parts_mut(hashes_ptr, max_fragments) };
+
+        keys  .get_mut_(..old_num_files)    .copy_from_slice(old_keys);
+        metas .get_mut_(..old_num_files)    .copy_from_slice(old_metas);
+        hashes.get_mut_(..new_num_fragments).copy_from_slice(new_hashes);  // Tail stays zero
+        laps.lap("alloc");
+
+        //
+        //
+        // Rows migration
+        //
+        //
+
+        //
+        // Fused old->new bitset copy. `dst` is freshly zeroed, so stride growth needs no
+        // explicit padding.
+        //
+        // Columns in `clear` are zeroed on the way through, which replaces every per-fragment
+        // 'clear this bit for all existing files' strided loop with one sequential pass
+        // (or a plain memcpy when nothing needs clearing).
+        //
+
+        let rows_available = old_bits.len() / old_words_per_file;
+
+        debug_assert!(old_words_per_file <= new_words_per_file                  && clear.len()    ==                 new_words_per_file);
+        debug_assert!(bits.len()         >= rows_available * new_words_per_file && old_bits.len() >= rows_available * old_words_per_file);
+
+        let no_clear = clear.iter().all(|&c| c == 0);
+        if old_words_per_file == new_words_per_file {
+            let n = rows_available * old_words_per_file;
+
+            if no_clear {
+                bits.get_mut_(..n).copy_from_slice(old_bits.get_(..n));
+
+            } else if old_words_per_file == 1 {
+                let keep = !clear[0];
+                for (dst, src) in bits.get_mut_(..rows_available).iter_mut().zip(old_bits.get_(..rows_available)) { *dst = *src & keep }
+
+            } else {
+                let src_chunks = old_bits.get_(..n).chunks_exact    (old_words_per_file);
+                let dst_chunks = bits.get_mut_(..n).chunks_exact_mut(old_words_per_file);
+                for (dst, src) in dst_chunks.zip(src_chunks) {
+                    for ((dst, src), clear) in dst.iter_mut().zip(src).zip(clear) { *dst = *src & !*clear }
+                }
+            }
+
+        } else {
+            for r in 0..rows_available {
+                let src = old_bits.get_(r * old_words_per_file..).get_    (..old_words_per_file);
+                let dst = bits.get_mut_(r * new_words_per_file..).get_mut_(..old_words_per_file);
+                for ((dst, src), clear) in dst.iter_mut().zip(src).zip(clear) { *dst = *src & !*clear }
+            }
+        }
+
+        laps.lap("migrate");
+
+        //
+        //
+        // Apply the batch
+        //
+        //
+
+        const AHEAD: usize = 16;
+
+        for (i, file_plan) in plan.files.iter().enumerate() {
+            if let Some(&ahead) = slots.get(i + AHEAD) {
+                let ahead_id = ahead & !RESET;
+                if ahead != DROPPED && (ahead_id as usize) < old_num_files {
+                    prefetch_read(bits.as_ptr().wrapping_add(ahead_id as usize * new_words_per_file));
+                }
+            }
+
+            let slot = *slots.get_(i);
+            if slot == DROPPED { continue; }
+
+            let id         = (slot & !RESET)      as usize;
+            let file_index = file_plan.file_index as usize;
+
+            //
+            // final_files-sized regions are already fully allocated,
+            // so every id -- new or existing -- is just a direct write.
+            //
+            *keys .get_mut_(id) = *file_keys .get_(file_index);
+            *metas.get_mut_(id) = *file_metas.get_(file_index);
+
+            let row = bits.get_mut_(id * new_words_per_file..).get_mut_(..new_words_per_file);
+            if slot & RESET != 0 { row.fill(0); }
+
+            let presence = fragment_presence.get_(file_index * plan_words_per_file..).get_(..plan_words_per_file);
+            for (file_index, &slot) in slot_of.iter().enumerate() {
+                if slot == NO_SLOT { continue; }
+
+                let present = bit_get(presence, file_index);
+
+                let dst     = slot as usize;
+                let w       = row.get_mut_(dst >> 6);
+
+                if present {
+                    // ----- Fragment PRESENT (bit=0)
+                    *w     &= !(1u64 << (dst & 63));
+                } else {
+                    // ----- Fragment ABSENT  (bit=1)
+                    *w     |=   1u64 << (dst & 63);
+                }
+            }
+        }
+
+        laps.lap("apply");
+
+        //
+        //
+        // Commit
+        //
+        //
+
+        let arena                  = crate::util::vec_into_boxed_slice_noshrink(arena);
+
+        self.fragment_hashes       = unsafe { FatPtr::from_raw(hashes_ptr as *const u32, max_fragments) };
+        self.file_keys             = unsafe { FatPtr::from_raw(keys_ptr as *const FileKey, final_files) };
+        self.file_metas            = unsafe { FatPtr::from_raw(metas_ptr as *const FileMeta, final_files) };
+        self.file_bitsets          = unsafe { FatPtr::from_raw(bits_ptr as *const u64, total_u64s) };
+
+        self.owned_fragment_hashes = None;  // Ownership moved into owned_arena
+        self.owned_file_keys       = None;
+        self.owned_file_metas      = None;
+        self.owned_file_bitsets    = None;
+        self.owned_arena           = Some(arena);
+
+        self.num_fragments         = new_num_fragments as u32;
+        self.ring_pos              = fragment_layout.ring_pos as u32;
+        self.num_files             = final_files as u32;
+        self.file_capacity         = final_files;
+        self.backing               = None;
+        self.file_lookup           = Box::default();
+
+        laps.lap("commit");
+
+        if dropped_files > 0 {
+            #[cfg(not(feature = "no-cache-stats"))]
+            self.stats.dropped_at_capacity.fetch_add(dropped_files, Ordering::Relaxed);
+
             eprintln!(
                 "FragmentCache dropped {} file(s), max_files ({}) reached; \
                  these files will never be cached until max_files is increased",
-                dropped, self.max_files
+                dropped_files, self.max_files
             );
         }
 
-        //
-        //
-        // Update all bitsets
-        //
-        //
-
-        let num_fragments      = self.num_fragments as usize;
-        let bits_per_file_u64  = num_fragments.div_ceil(64).max(1);
-        let owned_file_bitsets = self.owned_file_bitsets.as_mut().unwrap_();
-
-        for i in 0..file_updates.len() {
-            let (file_id, ref fragment_data, needs_full_reset) = file_updates[i];
-            let offset = file_id * bits_per_file_u64;
-
-            // Prefetch the next file's bitset region one iteration ahead,
-            // files aren't guaranteed contiguous in memory (file_id order here
-            // isn't necessarily sequential), so this is a nice cache-miss hide...
-            if let Some((next_file_id, ..)) = file_updates.get(i + 1) {
-                let next_offset = next_file_id * bits_per_file_u64;
-                if next_offset < owned_file_bitsets.len() {
-                    prefetch_read(unsafe { owned_file_bitsets.as_ptr().add(next_offset) });
-                }
-            }
-
-            if needs_full_reset {
-                //
-                // Unknown -- only checked fragments get marked.
-                //
-                let end = (offset + bits_per_file_u64).min(owned_file_bitsets.len());
-                if end > offset {
-                    owned_file_bitsets[offset..end].fill(0u64);
-                }
-            }
-
-            for &(frag_index, is_present) in fragment_data {
-                let frag_index = frag_index as usize;
-
-                let u64_index = offset + (frag_index / 64);
-                let bit_index = frag_index % 64;
-
-                if u64_index < owned_file_bitsets.len() {
-                    let bits = owned_file_bitsets.get_mut_(u64_index);
-                    if is_present {
-                        // ----- Fragment PRESENT - clear bit (bit=0)
-                        *bits &= !(1u64 << bit_index);
-                    } else {
-                        // ----- Fragment ABSENT  - set bit (bit=1)
-                        *bits |=   1u64 << bit_index;
-                    }
-                }
-            }
+        if fragment_layout.dropped > 0 {
+            eprintln!(
+                "FragmentCache dropped {} fragment(s): every ring slot is used by this batch \
+                 (batch has more distinct fragments than max_fragments = {})",
+                fragment_layout.dropped, self.max_fragments
+            );
         }
 
-        let elapsed = start.elapsed();
-        eprintln!("Cache updated: {} files in {:.2}ms", plan.files.len(), elapsed.as_millis() as f64);
+        laps.report(plan.files.len(), plan.frags.len());
 
         Ok(())
+    }
+
+    /// apply_batch leaves `file_lookup` empty (the table is not persisted, and a one-shot
+    /// writer never queries it). Anything that needs it afterwards calls this first.
+    /// Load factor is <= 0.5, so unbounded probing terminates. Make the reader probe
+    /// unbounded too, otherwise entries past probe 16 can't be found (see chat).
+    pub fn rebuild_lookup_from_keys(&mut self) {
+        let n    = self.num_files as usize;
+        let size = (2 * n.max(1)).next_power_of_two();
+        let mask = size - 1;
+
+        let mut table = vec![FILE_LOOKUP_EMPTY; size].into_boxed_slice();
+        for (id, key) in self.file_keys.make_slice(n).iter().enumerate() {
+            let mut i = (key.hash() as usize) & mask;
+            while table[i] != FILE_LOOKUP_EMPTY { i = (i + 1) & mask; }
+            table[i] = id as u32;
+        }
+
+        self.file_lookup = table;
     }
 
     /// Unconditional merge, same behavior as before. Used by tests and any
     /// caller that already knows it wants to write.
     pub fn merge_updates(
         &mut self,
-        file_keys: &[FileKey],
-        file_metas: &[FileMeta],
-        fragment_hashes: &[u32],
+        file_keys:         &[FileKey],
+        file_metas:        &[FileMeta],
+        fragment_hashes:   &[u32],
         fragment_presence: &[u64],
     ) -> io::Result<()> {
         if file_keys.is_empty() {
@@ -1806,9 +1893,9 @@ impl<S: CacheStorage> FragmentCache<S> {
     /// whether save_to_disk() is worth calling.
     pub fn merge_updates_if_changed(
         &mut self,
-        file_keys: &[FileKey],
-        file_metas: &[FileMeta],
-        fragment_hashes: &[u32],
+        file_keys:         &[FileKey],
+        file_metas:        &[FileMeta],
+        fragment_hashes:   &[u32],
         fragment_presence: &[u64],
     ) -> io::Result<bool> {
         if file_keys.is_empty() {
@@ -1832,23 +1919,23 @@ impl<S: CacheStorage> FragmentCache<S> {
     #[inline]
     pub fn can_skip_file_for_tests(
         &self,
-        file_key: FileKey,
-        file_meta: FileMeta,
+        key:   FileKey,
+        meta:  FileMeta,
         fragment_hashes: &[u32],
     ) -> bool {
         let mut fragment_indexes = Vec::new();
         self.resolve_fragment_indexes(fragment_hashes, &mut fragment_indexes);
 
-        self.can_skip_file(file_key, file_meta, &fragment_indexes)
+        self.can_skip_file(FileIdentifier { key, meta }, &fragment_indexes)
     }
 
     /// Adapter for `merge_updates` that accepts presence as a flat `Vec<bool>`
     /// (`fragment_presence[file_index * fragment_count + frag_index]`) instead of packed bits.
     pub fn merge_updates_for_tests(
         &mut self,
-        file_keys: Vec<FileKey>,
-        file_metas: Vec<FileMeta>,
-        fragment_hashes: &[u32],
+        file_keys:         Vec<FileKey>,
+        file_metas:        Vec<FileMeta>,
+        fragment_hashes:  &[u32],
         fragment_presence: Vec<bool>,
     ) -> io::Result<()> {
         let fragment_count = fragment_hashes.len();
@@ -1873,6 +1960,177 @@ impl<S: CacheStorage> FragmentCache<S> {
             packed.extend_from_slice(&words);
         }
 
-        self.merge_updates(&file_keys, &file_metas, fragment_hashes, &packed)
+        self.merge_updates(&file_keys, &file_metas, fragment_hashes, &packed)?;
+
+        self.rebuild_lookup_from_keys();
+
+        Ok(())
+    }
+}
+
+#[inline(always)] fn bad(msg: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidData, msg.to_owned()) }
+#[inline(always)] fn bit_get(w: &    [u64], i: usize) -> bool {  w.get_    (i >> 6) >> (i & 63) & 1 != 0 }
+#[inline(always)] fn bit_set(w: &mut [u64], i: usize)         { *w.get_mut_(i >> 6) |= 1u64 << (i & 63); }
+
+// ---------------------------------------------------------------------------
+// Phase timers. Everything is recorded and printed ONCE at the end, so the
+// stderr writes are not inside any measured interval. Also records minor page
+// faults per phase.
+// ---------------------------------------------------------------------------
+fn minflt() -> i64 {
+    let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) };
+    r.ru_minflt as i64
+}
+
+struct Laps {
+    start: Instant,
+    last:  Instant,
+    flt:   i64,
+    rows:  [(&'static str, f64, i64); 8],
+    n:     usize,
+}
+
+impl Laps {
+    fn new() -> Self {
+        let now = Instant::now();
+        Laps { start: now, last: now, flt: minflt(), rows: [("", 0.0, 0); 8], n: 0 }
+    }
+
+    fn lap(&mut self, name: &'static str) {
+        let now = Instant::now();
+        let flt = minflt();
+        if self.n < self.rows.len() {
+            self.rows[self.n] = (name, (now - self.last).as_secs_f64() * 1e3, flt - self.flt);
+            self.n += 1;
+        }
+        self.last = now;
+        self.flt  = flt;
+    }
+
+    fn report(&self, files: usize, frags: usize) {
+        let mut s = String::new();
+        for &(name, ms, flt) in &self.rows[..self.n] {
+            s += &format!(" {name} {ms:.2}ms/{flt}pf");
+        }
+        eprintln!(
+            "Cache updated: {files} files, {frags} frags in {:.2}ms |{s}",
+            (self.last - self.start).as_secs_f64() * 1e3,
+        );
+    }
+}
+
+/// What resolve_fragments() decided. The bulk data (slot_of / clear / hashes) stays in the
+/// caller's scratch.
+struct FragmentLayout {
+    num_fragments: usize,
+    ring_pos:      usize,
+    dropped:       u32,
+}
+
+// ---------------------------------------------------------------------------
+// Bulk page pre-fault. `vec![0u64; n]` / `Vec::with_capacity(n)` for a big n comes
+// back as an unbacked mapping: nothing physical exists until each 4K page is
+// first touched -- which is exactly what step 3 above was doing, one page at a
+// time, interleaved with everything else. MADV_POPULATE_WRITE asks the kernel
+// to back the whole range in one call instead, so that cost happens once, up
+// front, rather than trickling in as N minor faults during the write loop.
+//
+// Pure latency hint: correctness never depends on it. Kernels older than 5.14
+// (or any non-Linux target) just take the faults the old way, lazily.
+// ---------------------------------------------------------------------------
+
+//
+// madvise() wants a page-aligned start address and fails with EINVAL otherwise. A large
+// allocation from the system allocator is NOT page aligned: glibc's mmap'd chunks hand out
+// `page_start + 16` (the chunk header sits in front), so passing the raw pointer made every
+// call here fail and populate nothing.
+//
+// So shrink the range inward to whole pages: round the start up, the end down. The partial
+// pages at either end may hold someone else's bytes, and they just fault in lazily as before.
+//
+#[cfg(target_os = "linux")]
+fn populate_range(ptr: *mut u8, len: usize) {
+    if len == 0 { return; }
+
+    let page  = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let start = (ptr as usize).next_multiple_of(page);
+    let end   = (ptr as usize + len) & !(page - 1);
+
+    if end <= start { return; }
+
+    unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_POPULATE_WRITE); }
+}
+
+#[cfg(target_os = "linux")]
+fn populate<T>(slice: &mut [T]) {
+    populate_range(slice.as_mut_ptr() as *mut u8, std::mem::size_of_val(slice));
+}
+
+#[cfg(target_os = "linux")]
+fn populate_capacity<T>(v: &mut Vec<T>) {
+    populate_range(v.as_mut_ptr() as *mut u8, v.capacity() * std::mem::size_of::<T>());
+}
+
+#[cfg(not(target_os = "linux"))]
+fn populate<T>(_slice: &mut [T]) {}
+#[cfg(not(target_os = "linux"))]
+fn populate_capacity<T>(_v: &mut Vec<T>) {}
+
+/// Every per-batch temporary, carved out of one zeroed allocation.
+///
+///   u64 region:  [ clear | pinned ]             max_words each
+///   u32 region:  [ slots | slot_of | hashes ]   plan.files, plan.frags, max_fragments
+///
+/// Nothing here outlives apply_batch(): the fragment hashes are copied into the final
+/// arena at commit time.
+struct BatchScratch {
+    buf:           Vec<u64>,
+    files:         usize,
+    frags:         usize,
+    max_fragments: usize,
+    words:         usize,
+}
+
+struct ScratchViews<'a> {
+    slots:   &'a mut [u32],
+    slot_of: &'a mut [u32],
+    hashes:  &'a mut [u32],
+    clear:   &'a mut [u64],
+    pinned:  &'a mut [u64],
+}
+
+impl BatchScratch {
+    fn new(files: usize, frags: usize, max_fragments: usize) -> io::Result<Self> {
+        let words = max_fragments.div_ceil(64).max(1);
+
+        let n32   = files.checked_add(frags)
+            .and_then(|n| n.checked_add(max_fragments))
+            .ok_or_else(|| bad("scratch size overflow"))?;
+
+        let n64   = words.checked_mul(2)
+            .and_then(|n| n.checked_add(n32.div_ceil(2)))
+            .ok_or_else(|| bad("scratch size overflow"))?;
+
+        Ok(Self { buf: vec![0u64; n64], files, frags, max_fragments, words })
+    }
+
+    fn views(&mut self) -> ScratchViews<'_> {
+        let (u64s, rest)    = self.buf.split_at_mut(self.words * 2);
+        let (clear, pinned) = u64s.split_at_mut(self.words);
+
+        //
+        // SAFETY: u32 has weaker alignment than u64 and every bit pattern is a valid u32,
+        // and `rest` is a whole number of u64s, so prefix and suffix are both empty and
+        // `mid` covers all of `rest` (2 * rest.len() u32s, >= files + frags + max_fragments).
+        //
+        let (pre, mid, post) = unsafe { rest.align_to_mut::<u32>() };
+        assert!(pre.is_empty() && post.is_empty());
+
+        let (slots,   mid) = mid.split_at_mut(self.files);
+        let (slot_of, mid) = mid.split_at_mut(self.frags);
+        let hashes         = &mut mid[..self.max_fragments];
+
+        ScratchViews { slots, slot_of, hashes, clear, pinned }
     }
 }

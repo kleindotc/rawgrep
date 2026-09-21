@@ -7,7 +7,10 @@
 use crate::liner::*;
 use crate::index_::{Index_, IndexMut_};
 use crate::pacer::FlushPacer;
-use crate::cache::{FileKey, FileMeta, FragmentCache};
+use crate::unwrap_::Unwrap_;
+use crate::binary_verdicts::{self, BinaryVerdicts};
+use crate::binary_verdicts::binary_worker_table::{self, DirTally};
+use crate::cache::FragmentCache;
 use crate::output::{OutputSlab, OutputSlotWriter, OutputSlotOwnedOverflow};
 use crate::cli::{should_enable_ansi_coloring, Cli};
 use crate::ignore::{Gitignore, GitignoreChain};
@@ -19,7 +22,7 @@ use crate::fragments::FragmentLen;
 use crate::stats::Stats;
 use crate::stdout::{RawStdout, IOV_MAX};
 use crate::thin_path_arc::ThinPathArc;
-use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs};
+use crate::parser::{BufFatPtr, FileIdentifier, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs, FileKey, FileMeta};
 use crate::util::{likely, truncate_utf8, unlikely, prefetch_read};
 use crate::tracy;
 
@@ -56,11 +59,23 @@ pub const __MAX_FILE_BYTE_SIZE:    usize = 30 * 1024 * 1024; // @Tune
 // Below this size, a non-ASCII-encoded file is decoded to UTF-8 in one
 // pass instead of line by line. Past it we keep the streaming
 // decode_line-per-line path so a huge UTF-16 file doesn't get decoded
-// into a second huge allocation up front.
-const SMALL_FILE_DECODE_THRESHOLD: usize =       512 * 1024; // @Tune
+// into a second huge allocation upfront.
+const SMALL_FILE_DECODE_THRESHOLD: usize = 1024 * 1024;      // @Tune
 
 pub const PREFETCH_AHEAD:          usize = 4;
 pub const PREFETCH_MIN_CHUNKS:     usize = 2;
+
+/// What lookahead_file worked out for a file, handed to process_file so it doesn't redo it.
+/// NONE means 'not evaluated' (the lookahead returned early), process_file then does so itself.
+#[derive(Clone, Copy)]
+struct LookaheadResult {
+    cache_skip: Option<bool>,
+    binary:     Option<(bool /* known binary: skip */, bool /* likely binary: probe-sized reads */)>,
+}
+
+impl LookaheadResult {
+    const NONE: LookaheadResult = LookaheadResult { cache_skip: None, binary: None };
+}
 
 #[inline(always)]
 const fn average_newline_count_heuristic(buffer_length: usize) -> usize {
@@ -194,10 +209,7 @@ impl PendingBuf {
     #[inline]
     pub unsafe fn as_slice(&self) -> &[u8] {
         match self {
-            PendingBuf::Slot { slab, slot, len, .. } => unsafe {
-                &slab.slot(*slot as usize)[..*len as usize]
-            },
-
+            PendingBuf::Slot { slab, slot, len, .. } => unsafe { slab.slot(*slot as usize) }.get_(..*len as usize),
             PendingBuf::Owned(v) => v,
         }
     }
@@ -252,7 +264,6 @@ impl OutputWorker {
             }
         }
 
-        // Trigger check happens on every message now, not just in the outer loop.
         if self.batch_bytes >= OUTPUTTER_FLUSH_BATCH || self.batch.len() >= IOV_MAX {
             if self.flush_batch().is_err() {
                 return false;
@@ -314,18 +325,26 @@ impl OutputWorker {
     }
 }
 
+/// Last (hash_len - 1) bytes of everything presence-scanned so far in this file. Max 3 (FragmentLen::MAX = 4).
+#[derive(Clone, Copy)]
+pub struct PresenceSeam { pub bytes: [u8; 3], pub len: u8 }
+
+impl PresenceSeam { const EMPTY: Self = unsafe { core::mem::zeroed() }; }
+
 /// Carry state for streaming match across chunk boundaries
 pub struct ChunkCarry {
     /// Any matches was found so far in this file
-    pub found_any:   bool,
+    pub found_any: bool,
 
     /// Line number counter across chunks
-    pub line_num:    u32,
+    pub line_num:  u32,
 
-    pub encoding:    Option<Encoding>,
+    pub encoding:  Option<Encoding>,
+    pub seam:      PresenceSeam,
+    pub consumed: (usize, usize),
 
     /// Incomplete last line carried from previous chunk
-    pub tail:        Vec<u8>,
+    pub tail:      Vec<u8>,
 }
 
 impl ChunkCarry {
@@ -333,7 +352,9 @@ impl ChunkCarry {
     pub fn new() -> Self {
         Self {
             encoding: None,
+            seam: PresenceSeam { bytes: [0; 3], len: 0 },
             tail: Vec::new(),
+            consumed: (0, 0),
             found_any: false,
             line_num: 1
         }
@@ -343,8 +364,47 @@ impl ChunkCarry {
     pub fn reset(&mut self) {
         self.tail.clear();
         self.found_any = false;
+        self.consumed = (0, 0);
         self.line_num = 1;
+        self.encoding  = None;
+        self.seam.len  = 0;
     }
+}
+
+macro_rules! as_presence_checker_ctx {
+    ($w:expr) => {
+        WorkerPresenceCheckerCtx {
+            scratch:                 &mut $w.parser.scratch,
+            file:                    &mut $w.parser.file,
+            selected_fragment_hash_len: $w.selected_fragment_hash_len.as_usize() as u32,
+            fragment_hashes:         &$w.fragment_hashes,
+            fragment_index:          &$w.fragment_index,
+            fragment_presence_scratch: &mut $w.fragment_presence_scratch,
+            stats:                   &mut $w.stats,
+            ignore_case:             $w.ignore_case
+        }
+    };
+}
+
+macro_rules! dispatch_wide {
+    ($self:expr, $enc:expr, narrow => $narrow:expr, wide => $method:ident($($args:expr),* $(,)?)) => {
+        match $enc {
+            None | Some(Encoding::Utf8) => $narrow,
+            Some(Encoding::Utf16LE) => $self.$method::<Utf16LeCodec>($($args),*),
+            Some(Encoding::Utf16BE) => $self.$method::<Utf16BeCodec>($($args),*),
+            Some(Encoding::Utf32LE) => $self.$method::<Utf32LeCodec>($($args),*),
+            Some(Encoding::Utf32BE) => $self.$method::<Utf32BeCodec>($($args),*),
+        }
+    };
+    ($self:expr, $enc:expr, narrow => $narrow:expr, wide => return $method:ident($($args:expr),* $(,)?)) => {
+        match $enc {
+            None | Some(Encoding::Utf8) => $narrow,
+            Some(Encoding::Utf16LE) => return $self.$method::<Utf16LeCodec>($($args),*),
+            Some(Encoding::Utf16BE) => return $self.$method::<Utf16BeCodec>($($args),*),
+            Some(Encoding::Utf32LE) => return $self.$method::<Utf32LeCodec>($($args),*),
+            Some(Encoding::Utf32BE) => return $self.$method::<Utf32BeCodec>($($args),*),
+        }
+    };
 }
 
 pub type FileEntryArena = Vec<(FileId, BufFatPtr)>;
@@ -393,7 +453,7 @@ impl PathArena {
 
     #[inline(always)]
     fn slice(&self, start: u32, end: u32) -> &[u8] {
-        &self.buf[start as usize..end as usize]
+        self.buf.get_(start as usize..end as usize)
     }
 }
 
@@ -449,12 +509,12 @@ impl FragmentPresenceBits {
     #[inline]
     pub fn row(&self, file_idx: usize) -> &[u64] {
         let s = file_idx * self.words_per_file;
-        &self.words[s..s + self.words_per_file]
+        self.words.get_(s..s + self.words_per_file)
     }
 
     #[inline]
     pub fn get(&self, file_idx: usize, frag_idx: usize) -> bool {
-        self.row(file_idx)[frag_idx / 64] & (1 << (frag_idx % 64)) != 0
+        *self.row(file_idx).get_(frag_idx / 64) & (1 << (frag_idx % 64)) != 0
     }
 }
 
@@ -464,8 +524,9 @@ pub struct WorkerResult {
     pub parser: Parser,
     pub output: OutputSlotWriter,
 
-    pub file_keys:  Vec<FileKey>,
-    pub file_metas: Vec<FileMeta>,
+    pub file_keys:            Vec<FileKey>,
+    pub file_metas:           Vec<FileMeta>,
+    pub verdict_fingerprints: Vec<u64>,
 
     pub path_buf:      Box<SmallPathBuf>,
     pub swap_path_buf: Box<SmallPathBuf>,
@@ -498,6 +559,7 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub selected_fragment_hash_len: FragmentLen,
 
     pub ignore_case:                            bool,
+    pub single_literal_fragments:               bool,
     pub gitignore_enabled:                      bool,
     pub stdout_is_being_redirected_to_dev_null: bool,
     pub print_line_numbers:                     bool,
@@ -517,6 +579,9 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub node_scratch:       Vec<F::Node>,
     pub node_cache:         F::NodeCache,
 
+    pub dir_tally:          DirTally,           // Default; reset at the start of every directory
+    pub binary_verdicts:    &'a BinaryVerdicts, // shared, like `cache`
+
     pub batch_size_cached:  u32,
     pub check_mask:         usize,
     pub stats:              Box<Stats>,         // 8
@@ -534,9 +599,10 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub worker_id:                 u16,
     pub num_workers:               u16,
 
-    pub pending_file_keys:         Vec<FileKey>,
-    pub pending_file_metas:        Vec<FileMeta>,
-    pub pending_fragment_presence: FragmentPresenceBits,
+    pub pending_verdict_fingerprints: Vec<u64>,
+    pub pending_file_keys:            Vec<FileKey>,
+    pub pending_file_metas:           Vec<FileMeta>,
+    pub pending_fragment_presence:    FragmentPresenceBits,
 
     // ----- Cold / output plumbing ----
     pub sink: S,
@@ -560,6 +626,7 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
 
         WorkerResult {
             stats: self.stats,
+            verdict_fingerprints: self.pending_verdict_fingerprints,
             entries_arena: self.entries_arena,
             parser: self.parser,
             path_arena: self.path_arena,
@@ -572,25 +639,31 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
             line_ranges_scratch: self.line_ranges_scratch,
             newlines_scratch: self.newlines_scratch,
             file_keys: self.pending_file_keys,
-            fragment_presence_scratch: self.fragment_presence_scratch,
             file_metas: self.pending_file_metas,
+            fragment_presence_scratch: self.fragment_presence_scratch,
             fragment_presence: self.pending_fragment_presence
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn flush_output(&mut self) {
-        if S::STDOUT_NOP {
+        if S::STDOUT_NOP || self.stdout_is_being_redirected_to_dev_null {
             self.output.clear();
             return;
         }
 
-        if self.output.is_empty() || self.stdout_is_being_redirected_to_dev_null {
+        if self.output.is_empty() {
             return;
         }
 
         self.output.flush();
         self.pacer.record_flush();
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub fn cold_flush_output(&mut self) {
+        self.flush_output();
     }
 
     #[inline(always)]
@@ -605,6 +678,31 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
         } else {
             __MAX_FILE_BYTE_SIZE
         }
+    }
+}
+
+// impl block of gitignore helper functions
+impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
+    #[inline]
+    fn try_load_gitignore(&mut self, gi_file_id: FileId) -> Option<Gitignore> {
+        let _span = tracy::span!("WorkerCtx::try_load_gitignore");
+
+        if let Ok(gi_node) = self.fs.parse_node(gi_file_id) {
+            let size = (gi_node.size() as usize).min(self.max_file_byte_size());
+            if likely(self.fs.read_file_content(&mut self.parser, &gi_node, size, BufKind::Gitignore, true, false).is_ok()) {
+                let matcher = crate::ignore::build_gitignore_from_bytes(
+                    &self.parser.gitignore
+                );
+                return Some(matcher)
+            }
+        }
+
+        None
+    }
+
+    #[inline(always)]
+    fn find_gitignore_file_id_in_buf(&self, kind: BufKind) -> Option<FileId> {
+        self.parser.find_file_id_in_buf(self.fs, b".gitignore", kind)
     }
 }
 
@@ -651,7 +749,8 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             kind: BufKind::File,
         };
 
-        self.process_file(&node, name_fat_ptr, &[], &work.gitignore_chain)?;
+        self.dir_tally.reset();
+        self.process_file(&node, name_fat_ptr, &[], &work.gitignore_chain, LookaheadResult::NONE)?;
 
         Ok(())
     }
@@ -688,7 +787,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             let last_segment = bytes
                 .iter()
                 .rposition(|&b| b == MAIN_SEPARATOR as _)
-                .map(|pos| &bytes[pos + 1..])
+                .map(|pos| bytes.get_(pos + 1..))
                 .unwrap_or(bytes);
 
             if !self.cli.should_ignore_reserved_tool_dir_filter() && is_reserved_tool_dir(last_segment) {
@@ -698,7 +797,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         }
 
         let dir_size = node.size() as usize;
-        self.fs.read_file_content(&mut self.parser, &node, dir_size, BufKind::Dir, false)?;
+        self.fs.read_file_content(&mut self.parser, &node, dir_size, BufKind::Dir, false, false)?;
         self.stats.dirs_encountered += 1;
 
         let new_gitignore_chain = self.should_ignore_gitignore().not().then(|| {
@@ -927,6 +1026,11 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     ) -> io::Result<()> {
         let _span = tracy::span!("process_files");
 
+        // One reset per directory: process_directory calls process_files exactly once, with the
+        // directory's whole file range. Subdirectories are dispatched only after that call returns, so
+        // nothing else uses the tally in between, and a child's own process_files resets it again.
+        self.dir_tally.reset();
+
         self.node_scratch.clear();
         let batch_stats = self.fs.parse_nodes_batch(
             self.file_entries_arena.get_(start_files..end_files),
@@ -938,20 +1042,64 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         self.stats.node_cache_misses += batch_stats.misses;
 
         let mut nodes = std::mem::take(&mut self.node_scratch);
+        debug_assert_eq!(nodes.len(), end_files - start_files);
 
-        for (i, node) in (start_files..end_files).zip(nodes.drain(..)) {
+        //
+        // How many files ahead of the one being processed get their head hinted,
+        // each worker keeps roughly this many files' worth of I/O in flight.
+        //
+        // Ring size must exceed it: the ring memoizes the cache lookup for every file inside the window.
+        //
+        const FILE_PREFETCH_AHEAD: usize = 8;
+        const FILE_RING: usize = 16;
+        const _: () = assert!(FILE_PREFETCH_AHEAD < FILE_RING);
+        const _: () = assert!((FILE_RING - FILE_PREFETCH_AHEAD).is_power_of_two());
+
+        //
+        // Every node is evaluated by lookahead_file exactly once,
+        // FILE_PREFETCH_AHEAD files before it is processed.
+        //
+        // That evaluation hints the head of the files that will really be read, and hands back
+        // the cache lookup result, memoized here so process_file doesn't repeat it.
+        //
+        let mut lookahead_ring = [LookaheadResult::NONE; FILE_RING];
+        let mut ahead_up_to    = 0usize;
+
+        // Is this directory's data cold? Sampled once by the first file that would be hinted.
+        let mut batch_cold: Option<bool> = None;
+
+        for node_index in 0..nodes.len() {
+            let i = start_files + node_index;
+
+            let window_end = (node_index + 1 + FILE_PREFETCH_AHEAD).min(nodes.len());
+            while ahead_up_to < window_end {
+                lookahead_ring[ahead_up_to % FILE_RING] = self.lookahead_file(
+                    nodes.get_(ahead_up_to),
+                    start_files + ahead_up_to,
+                    &mut batch_cold
+                );
+
+                ahead_up_to += 1;
+            }
+
+            let node = nodes.get_(node_index);
             if node.file_id() == 0 { continue; }  // Poisoned...
 
             let (_, name_fat_ptr) = *self.file_entries_arena.get_(i);
 
-            self.process_file(&node, name_fat_ptr, parent_path, gitignore_chain)?;
+            self.process_file(
+                node, name_fat_ptr, parent_path,
+                gitignore_chain, lookahead_ring[node_index % FILE_RING]
+            )?;
 
             if !self.stdout_is_being_redirected_to_dev_null && i & self.check_mask == 0 {
                 let (should_flush, batch_hint, next_mask) = self.pacer.poll(!self.output.is_empty());
+
                 self.batch_size_cached = batch_hint;
                 self.check_mask = next_mask;
+
                 if should_flush {
-                    self.cold_flush();
+                    self.cold_flush_output();
                     continue;
                 }
             }
@@ -961,15 +1109,96 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             }
         }
 
+        nodes.clear();
         self.node_scratch = nodes;
 
         Ok(())
     }
 
-    #[cold]
-    #[inline(never)]
-    fn cold_flush(&mut self) {
-        self.flush_output();
+    /// (known-binary-from-an-earlier-run, likely-binary)
+    #[inline]
+    fn binary_hints(&self, file_identifier: FileIdentifier, name: &[u8]) -> (bool, bool) {
+        let known = !self.binary_verdicts.is_empty() &&
+            self.binary_verdicts.is_binary(binary_verdicts::fingerprint(
+                file_identifier
+            ));
+
+        use binary_worker_table::Verdict;
+        let likely = known || match binary_worker_table::verdict(name) {
+            Verdict::Binary  => true,
+            Verdict::Text    => false,
+            Verdict::Unknown => self.dir_tally.likely_binary(),
+        };
+
+        (known, likely)
+    }
+
+    //
+    // Runs, ahead of time, the checks in process_file that decide whether a file's data is read at all
+    // (size, binary extension, fragment cache) and hints the head of the ones that survive.
+    //
+    // Gitignore is deliberately not checked, it needs the full path, and it VERY RARELY rejects
+    // on the corpora we currenly benchmark on (Chromium and Linux source trees).
+    //
+    #[inline]
+    fn lookahead_file(&self, node: &F::Node, entry_index: usize, batch_cold: &mut Option<bool>) -> LookaheadResult {
+        if node.file_id() == 0 { return LookaheadResult::NONE; }  // Poisoned...
+
+        if !self.cli.should_ignore_all_filters() && node.size() > self.max_file_byte_size() as u64 {
+            return LookaheadResult::NONE;
+        }
+
+        let check_binary = !self.cli.should_search_binary();
+
+        let name = if check_binary {
+            let (_, name_fat_ptr) = *self.file_entries_arena.get_(entry_index);
+            let name = self.parser.buf_ptr(name_fat_ptr);
+
+            if is_binary_ext(name) { return LookaheadResult::NONE; }
+            Some(name)
+        } else {
+            None
+        };
+
+        //
+        // Cache first
+        //
+
+        let file_identifier = self.fs.file_identifier(node);
+
+        let mut cache_skip = None;
+        if let Some(cache) = self.cache {
+            if cache.can_skip_file(file_identifier, self.fragment_indexes) {
+                return LookaheadResult { cache_skip: Some(true), binary: None };
+            }
+
+            cache_skip = Some(false);
+        }
+
+        let binary = name.map(|name| self.binary_hints(file_identifier, name));
+
+        //
+        // Known binary from an earlier run, nothing will be read, therefore nothing to hint.
+        //
+        if let Some((true, _)) = binary { return LookaheadResult { cache_skip, binary } }
+
+        let likely_binary = binary.is_some_and(|(_, likely)| likely);
+
+        let max_size = (node.size() as usize).min(self.max_file_byte_size());
+
+        if batch_cold.is_none() {
+            *batch_cold = self.fs.head_is_cold(node, max_size);  // Stays None if it can't tell yet
+        }
+
+        if *batch_cold != Some(false) {
+            //
+            // For a file we expect the probe to reject, only the probe block is worth fetching
+            //
+            let hint_size = if likely_binary { max_size.min(binary_verdicts::PROBE_BYTES) } else { max_size };
+            self.fs.prefetch_file_head(node, hint_size);
+        }
+
+        LookaheadResult { cache_skip, binary }
     }
 
     fn process_file(
@@ -978,6 +1207,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         file_name_ptr: BufFatPtr,
         parent_path: &[u8],
         gitignore_chain: &GitignoreChain,
+        pre: LookaheadResult,
     ) -> io::Result<()> {
         let _span = tracy::span!("WorkerCtx::process_file_not_batch");
 
@@ -988,10 +1218,39 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             return Ok(());
         }
 
-        let file_name = self.parser.buf_ptr(file_name_ptr);
+        let file_name       = self.parser.buf_ptr(file_name_ptr);
+        let file_identifier = self.fs.file_identifier(node);
 
-        if !self.cli.should_search_binary() && is_binary_ext(file_name) {
+        if let Some(cache) = self.cache {
+            let skip = match pre.cache_skip {
+                Some(skip) => skip,
+                None       => cache.can_skip_file(file_identifier, self.fragment_indexes),
+            };
+
+            if skip {
+                self.stats.files_skipped_by_cache += 1;
+                return Ok(());
+            }
+        }
+
+        let check_binary = !self.cli.should_search_binary();
+
+        if check_binary && is_binary_ext(file_name) {
             self.stats.files_skipped_as_binary_due_to_ext += 1;
+            return Ok(());
+        }
+
+        //
+        // Use what the lookahead already worked out, or do it now if a file skipped the lookahead
+        //
+        let (known_binary, likely_binary) = match (check_binary, pre.binary) {
+            (false, _)          => (false, false),
+            (true, Some(hints)) => hints,
+            (true, None)        => self.binary_hints(file_identifier, file_name),
+        };
+
+        if known_binary {
+            self.stats.files_skipped_as_binary_cached += 1;
             return Ok(());
         }
 
@@ -1009,23 +1268,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             self.path_buf.extend_from_slice(file_name);
         }
 
-        let cache_key = if self.cache.is_some() {
-            Some((
-                FileKey::new(self.fs.device_id(), node.file_id()),
-                FileMeta::new(node.mtime(), node.size()),
-            ))
-        } else {
-            None
-        };
-
-        if let Some(cache) = self.cache {
-            let (file_key, file_meta) = unsafe { cache_key.unwrap_unchecked() };
-            if cache.can_skip_file(file_key, file_meta, self.fragment_indexes) {
-                self.stats.files_skipped_by_cache += 1;
-                return Ok(());
-            }
-        }
-
         if !self.should_ignore_gitignore() && !gitignore_chain.is_empty() {
             if gitignore_chain.is_ignored(self.path_buf.as_ref(), false) {
                 self.stats.files_skipped_gitignore += 1;
@@ -1034,23 +1276,71 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         }
 
         let max_size = (node.size() as usize).min(self.max_file_byte_size());
-        let check_binary = !self.cli.should_search_binary();
 
-        let found_any = if likely(max_size < STREAMING_THRESHOLD) {
-            self.process_file_buffered(node, max_size, check_binary)?
+        let rejected_before = self.stats.files_skipped_as_binary_due_to_probe;
+
+        let streamed = max_size >= STREAMING_THRESHOLD;
+
+        let (found_any, presence_ready) = if likely(!streamed) {
+            let found_any = self.process_file_buffered(node, max_size, check_binary, likely_binary)?;
+            (found_any, false)
         } else {
-            self.process_file_streaming(node, max_size, check_binary)?
+            self.process_file_streaming(node, max_size, check_binary, likely_binary)?
         };
 
-        if !self.cli.no_cache_write && let Some((file_key, file_meta)) = cache_key {
-            self.pending_file_keys.push(file_key);
-            self.pending_file_metas.push(file_meta);
+        if check_binary {
+            let rejected = self.stats.files_skipped_as_binary_due_to_probe != rejected_before;
 
-            if found_any {
-                self.pending_fragment_presence.push_all_fragments_present();
+            let name = self.parser.buf_ptr(file_name_ptr);
+            binary_worker_table::record(name, node.file_id(), rejected);
+            self.dir_tally.record(rejected);
+
+            if rejected {
+                let fp = binary_verdicts::fingerprint(file_identifier);
+                self.pending_verdict_fingerprints.push(fp);
+            }
+        }
+
+        if !self.cli.no_cache_write && !self.cli.no_cache {
+            //
+            // What to record for this file:
+            //
+            //   Some(true)  Every fragment present (it matched, so its fragments are there)
+            //
+            //   Some(false) The exact row in fragment_presence_scratch
+            //
+            //   None        Nothing: we can't vouch for a row, so the file stays out of
+            //               the cache and is simply searched again next run.
+            //
+
+            let record = if found_any && self.single_literal_fragments {
+                Some(true)
+            } else if !streamed {
+                as_presence_checker_ctx!(self).check_fragment_presence();
+                Some(false)
+            } else if presence_ready {
+                //
+                // A streamed file is never whole in parser.file (only its first block is), so
+                // check_fragment_presence() would call every fragment in the rest of the file
+                // ABSENT. process_file_streaming built the row chunk by chunk instead.
+                //
+                Some(false)
             } else {
-                self.check_fragment_presence();
-                self.pending_fragment_presence.push_row(&self.fragment_presence_scratch);
+                //
+                // Read error, short read, or truncated to max_size: the row would be incomplete
+                //
+                None
+            };
+
+            if let Some(all_present) = record {
+                self.pending_file_keys .push(file_identifier.key);
+                self.pending_file_metas.push(file_identifier.meta);
+
+                if all_present {
+                    self.pending_fragment_presence.push_all_fragments_present();
+                } else {
+                    self.pending_fragment_presence.push_row(&self.fragment_presence_scratch);
+                }
             }
         }
 
@@ -1063,11 +1353,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         node: &F::Node,
         max_size: usize,
         check_binary: bool,
+        likely_binary: bool,
     ) -> io::Result<bool> {
         let is_binary = !self.fs.read_file_content(
             &mut self.parser,
             node,
-            max_size, BufKind::File, check_binary
+            max_size, BufKind::File,
+            check_binary, likely_binary
         )?;
         if is_binary {
             self.stats.files_skipped_as_binary_due_to_probe += 1;
@@ -1087,8 +1379,28 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         node: &F::Node,
         max_size: usize,
         check_binary: bool,
-    ) -> io::Result<bool> {
+        likely_binary: bool
+    ) -> io::Result<(bool, bool)> {
         let _span = tracy::span!("WorkerCtx::process_file_streaming");
+
+        //
+        // Same condition process_file_impl uses to record a row. The row is built up piece by piece,
+        // and only while the file hasn't matched: once it has, every fragment counts as present anyway.
+        //
+        let track_presence = self.cache.is_some() && !self.cli.no_cache_write;
+
+        //
+        // Single literal: A match already proves every fragment present, so stop early.
+        // Multi  literal: A match on one branch says nothing about another branch's fragments, so keep going.
+        //
+        let stop_at_first_match = self.single_literal_fragments;
+
+        let mut presence_checker: WorkerPresenceCheckerCtx;
+
+        if track_presence {
+            presence_checker = as_presence_checker_ctx!(self);
+            presence_checker.reset_fragment_presence();
+        }
 
         let mut carry = self.chunk_carry.take().unwrap_or_else(|| ChunkCarry::new().into());
         carry.reset();
@@ -1101,19 +1413,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         );
         buf.clear();
 
-        //
-        // check_binary is forced off here.
-        //
-        // collect_file_chunks used to do the probe read into parser.file and set
-        // skip_first, so the chunk list started at +block_size.
-        //
-        // This loop reads chunks into parser.chunk and never looks at parser.file, so those
-        // first bytes were read and then dropped: a match in the first block of
-        // any file over STREAMING_THRESHOLD was silently missed.
-        //
-        // The probe now runs on the head of chunk 0 below, after it is read,
-        // which also removes the extra redundant pread from this path.
-        //
         if !self.fs.collect_file_chunks(
             &mut self.parser.scratch,
             &mut self.parser.scratch2,
@@ -1121,15 +1420,72 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             &mut self.parser.scratch_chunks,
             node,
             max_size,
-            false, // check_binary,
+            check_binary,
+            likely_binary,
             buf
         )? {
+            self.stats.files_skipped_as_binary_due_to_probe += 1;
             self.chunk_carry = Some(carry);
-            return Ok(false);
+
+            //
+            // Same as the buffered path: a rejected file records an (all-ABSENT) row
+            //
+            return Ok((false, track_presence));
         }
 
         let mut bytes_searched = 0usize;
+        let mut planned        = 0usize;  // Bytes we expect to search if nothing goes wrong
+
+        //
+        // The probed bytes are the first bytes of the file and the chunk list starts right
+        // after them, so they have to be searched here. The loop below never looks at parser.file,
+        // so without this a match in the first block of every streamed file is missed...
+        //
+        // Any partial last line lands in carry.tail and is picked up by chunk 0.
+        //
+        {
+            let head = std::mem::take(Parser::get_buf_mut_impl(
+                &mut self.parser.file,
+                &mut self.parser.dir,
+                &mut self.parser.gitignore,
+                BufKind::File
+            ));
+
+            planned += head.len();
+
+            let mut result = Ok(());
+            if !head.is_empty() {
+                bytes_searched += head.len();
+                result = self.find_and_print_matches_in_chunk(&head, &mut carry, /* is_last */ false);
+
+                if result.is_ok() && track_presence && (!carry.found_any || !stop_at_first_match) {
+                    presence_checker = as_presence_checker_ctx!(self);
+                    presence_checker.feed_presence(&mut carry, &head, &head);
+                }
+            }
+
+            *Parser::get_buf_mut_impl(
+                &mut self.parser.file,
+                &mut self.parser.dir,
+                &mut self.parser.gitignore,
+                BufKind::File
+            ) = head;
+
+            result?;
+        }
+
+        // @Speed: do this in collect_file_chunks while merging...?
+        //
+        // collect_file_chunks merges disk-contiguous pieces without a size cap, so an unfragmented
+        // file arrives as ONE chunk however small STREAMING_CHUNK_SIZE is.
+        //
+        // Split them back down: bounded memory (buf.reserve(total) below), and while chunk 'i' is searched,
+        // the hints for the next PREFETCH_AHEAD chunks are in flight.
+        //
+        crate::parser::split_chunks(&mut self.parser.scratch_chunks, STREAMING_CHUNK_SIZE);
+
         let chunks_len = self.parser.scratch_chunks.len();
+        planned += self.parser.scratch_chunks.iter().map(|&(_, len)| len as usize).sum::<usize>();
 
         //
         // Hinting is @Cutnpaste from Ext4Fs::read_file_content
@@ -1139,19 +1495,16 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         use std::os::fd::AsRawFd;
 
         #[cfg(unix)]
-        const PREFETCH_AHEAD: usize = 4;
-
-        #[cfg(unix)]
         let fd = self.fs.device_file().as_raw_fd();
 
         #[cfg(unix)]
-        let hints_on = chunks_len >= PREFETCH_MIN_CHUNKS;
-
-        #[cfg(unix)]
-        if hints_on {
+        {
             for &(offset, len) in self.parser.scratch_chunks.iter().take(PREFETCH_AHEAD) {
                 unsafe {
-                    libc::posix_fadvise(fd, offset as i64, len as i64, libc::POSIX_FADV_WILLNEED);
+                    libc::posix_fadvise(
+                        fd, offset as i64, len as i64,
+                        libc::POSIX_FADV_WILLNEED
+                    );
                 }
             }
         }
@@ -1159,15 +1512,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         #[cfg(unix)]
         let mut hinted_up_to = PREFETCH_AHEAD.min(chunks_len);
 
-        let mut probed = !check_binary;
-
         for chunk_index in 0..chunks_len {
             let (disk_offset, len) = *self.parser.scratch_chunks.get_(chunk_index);
             let len = len as usize;
 
             #[cfg(unix)] {
                 let want = chunk_index + 1;
-                if hints_on && want >= hinted_up_to {
+                if want >= hinted_up_to {
                     if let Some(&(next_offset, next_len)) = self.parser.scratch_chunks.get(want) {
                         unsafe {
                             libc::posix_fadvise(
@@ -1184,51 +1535,75 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             let tail_len = carry.tail.len();
             let total = tail_len + len;
 
-            let mut buf = std::mem::take(&mut self.parser.chunk);
-            buf.clear();
-            buf.reserve(total);
-            unsafe {
-                buf.set_len(total);
+            let mut buf = std::mem::take(&mut self.parser.stream_chunk);
+            {
+                buf.clear();
+                buf.reserve(total);
+                unsafe { buf.set_len(total); }
                 buf.get_mut_(..tail_len).copy_from_slice(&carry.tail);
             }
 
-            let n = match self.fs.read_at_offset(&mut buf[tail_len..total], disk_offset) {
-                Ok(n)  => n,
-                Err(_) => { self.parser.chunk = buf; break; }
-            };
-
-            if n == 0 { self.parser.chunk = buf; break; }
-
             //
-            // Probe the head of the first chunk we actually read. Same window
-            // width as the buffered path, so classification matches.
+            // read_at_offset can hand back fewer bytes than asked without that meaning EOF, so keep
+            // asking for the rest of this chunk until it's full or we get an EOF/error.
             //
-            if !probed {
-                probed = true;
+            let mut got = 0usize;
+            let mut hard_error = false;
 
-                let probe_len = n.min(self.fs.block_size() as usize);
-                let probe = buf.get_(tail_len..tail_len + probe_len);
-                if crate::parser::binary_probe(probe, node.size() as usize) {
-                    self.parser.chunk = buf;
-                    self.stats.files_skipped_as_binary_due_to_probe += 1;
-                    self.chunk_carry = Some(carry);
-                    return Ok(false);
+            while got < len {
+                match self.fs.read_at_offset(buf.get_mut_(tail_len + got..total), disk_offset + got as u64) {
+                    Ok(0)  => break,     // real EOF
+                    Ok(n)  => got += n,  // short read, retry the rest
+                    Err(_) => { hard_error = true; break; }
                 }
             }
 
-            bytes_searched += n;
+            if got == 0 { self.parser.stream_chunk = buf; break; }
+
+            bytes_searched += got;
             carry.tail.clear();
 
-            self.find_and_print_matches_in_chunk(&buf[..tail_len + n], &mut carry, false)?;
-            self.parser.chunk = buf;
+            //
+            // is_last should fire exactly once for the file. So, only true here if this is genuinely
+            // the final chunk AND it ends cleanly on a newline, otherwise the tail flush below is the one
+            // call carrying is_last.
+            //
+            let is_last_chunk  = chunk_index == chunks_len - 1 && got == len;
+            let ends_on_newline = *buf.get_(tail_len + got - 1) == b'\n';
+            let is_last = is_last_chunk && ends_on_newline;
+
+            self.find_and_print_matches_in_chunk(buf.get_(..tail_len + got), &mut carry, is_last)?;
+
+            //
+            // Only the bytes read for this chunk without the carried partial line in front of them,
+            // since those were already scanned as part of the previous chunk (and seam covers the join).
+            //
+            if track_presence && (!carry.found_any || !stop_at_first_match) {
+                presence_checker = as_presence_checker_ctx!(self);
+                presence_checker.feed_presence(
+                    &mut carry,
+                    buf.get_(        ..tail_len + got),
+                    buf.get_(tail_len..tail_len + got)
+                );
+            }
+
+            self.parser.stream_chunk = buf;
+
+            if hard_error || got < len { break }  // Short of the full chunk
         }
 
         //
-        // Flush final partial line with no trailing newline
+        // Flush final partial line
         //
         if !carry.tail.is_empty() {
             let tail = std::mem::take(&mut carry.tail);
-            self.find_and_print_matches_in_chunk(&tail, &mut carry, true)?;
+            self.find_and_print_matches_in_chunk(&tail, &mut carry, /* is_last */ true)?;
+
+            if track_presence && (!carry.found_any || !stop_at_first_match) {
+                presence_checker = as_presence_checker_ctx!(self);
+                presence_checker.feed_presence(&mut carry, &tail, &[]);
+            }
+
             carry.tail = tail;
             carry.tail.clear();
         }
@@ -1240,19 +1615,54 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             self.stats.files_contained_matches += 1;
         }
 
+        //
+        // A row is only trustworthy if every byte of the file was scanned: no read error or short
+        // read (bytes_searched < planned), and no truncation to max_size.
+        //
+        let complete = bytes_searched == planned && max_size as u64 >= node.size();
+
         let found_any = carry.found_any;
         self.chunk_carry = Some(carry);
+        Ok((found_any, track_presence && complete))
+    }
+}
 
-        Ok(found_any)
+pub struct WorkerPresenceCheckerCtx<'a> {
+    pub scratch:                   &'a mut Vec<u8>,
+    pub file:                      &'a mut Vec<u8>,
+
+    pub selected_fragment_hash_len: u32,
+    pub fragment_hashes:           &'a [u32],
+    pub fragment_index:            &'a IntSet<u32>,
+
+    pub fragment_presence_scratch: &'a mut Vec<u64>,
+
+    pub stats:                     &'a mut Stats,
+
+    pub ignore_case:                bool,
+}
+
+macro_rules! scan_taken {
+    ($self:expr, $field:expr) => {{
+        let taken = std::mem::take($field);
+        $self.scan_fragments(&taken);
+        *$field = taken;
+    }};
+}
+
+impl WorkerPresenceCheckerCtx<'_> {
+    #[inline(always)]
+    fn feed_presence(&mut self, carry: &mut ChunkCarry, data: &[u8], new_bytes: &[u8]) {
+        dispatch_wide!(
+            self, carry.encoding,
+
+            narrow => self.check_fragment_presence_in_seam(&mut carry.seam, new_bytes),
+            wide   => presence_wide(&mut carry.seam, data.get_(carry.consumed.0 .. carry.consumed.1))
+        )
     }
 
-    #[inline]
-    fn check_fragment_presence(&mut self) {
-        let _span = tracy::span!("check_fragment_presence");
-
-        let t0 = Instant::now();
-
-        // Reset all presence to false
+    #[inline(always)]
+    fn reset_fragment_presence(&mut self) {
         unsafe {
             std::ptr::write_bytes(
                 self.fragment_presence_scratch.as_mut_ptr(),
@@ -1260,18 +1670,172 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 self.fragment_presence_scratch.len()
             );
         }
+    }
+
+    #[inline(always)]
+    fn scan_fragments(&mut self, data: &[u8]) {
+        let t0 = Instant::now();
 
         crate::fragments::check_fragment_presence(
-            &self.parser.file,
+            data,
             self.fragment_hashes,
-            &mut self.fragment_presence_scratch,
+            self.fragment_presence_scratch,
             self.fragment_index,
-            self.selected_fragment_hash_len.as_usize(),
+            self.selected_fragment_hash_len as usize,
             self.ignore_case
         );
 
-        self.stats.time_fragment_presence_checking_took_in_millis += t0.elapsed().as_millis() as u32;
+        self.stats.time_spent_fragment_presence_checking_in_nanos += t0.elapsed().as_nanos() as u64;
     }
+
+    #[inline(always)]
+    fn check_fragment_presence(&mut self) {
+        let enc = crate::binary::detect_byte_order_leading_mark_len(self.file);
+        dispatch_wide!(
+            self, enc,
+
+            narrow => {},
+            wide   => return check_fragment_presence_wide(enc.unwrap_().bom_len())
+        );
+
+        let _span = tracy::span!("check_fragment_presence");
+
+        self.reset_fragment_presence();
+        scan_taken!(self, self.file);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn check_fragment_presence_wide<C: LineCodec>(&mut self, bom: usize) {
+        let t0 = Instant::now();
+        self.reset_fragment_presence();
+
+        let file = std::mem::take(self.file);
+        let body = file.get_(bom.min(file.len())..);
+
+        if decode_whole_file_right_away(body.len()) {
+            //
+            // find_and_print_matches_small_decode already decoded the whole file into
+            // 'parser.scratch' and left it there since there was no match.
+            //
+            // @Important: @Correctness requires that nothing touches 'parser.scratch' between
+            // find_and_print_matches() and here...
+            //
+            scan_taken!(self, self.scratch);
+        } else {
+            let mut seam = PresenceSeam::EMPTY;
+            self.presence_wide::<C>(&mut seam, body);
+        }
+
+        *self.file = file;
+        self.stats.time_spent_fragment_presence_checking_in_nanos += t0.elapsed().as_nanos() as u64;
+    }
+
+    #[inline(never)]
+    fn presence_wide<C: LineCodec>(&mut self, seam: &mut PresenceSeam, raw: &[u8]) {
+        const DECODE_SPAN: usize = 64 * 1024;  // @Tune: How much raw input we decode per iteration
+
+        let mut dec = std::mem::take(self.scratch);
+        let mut pos = 0;
+        while pos < raw.len() {
+            let end = if raw.len() - pos <= DECODE_SPAN {
+                raw.len()
+            } else {
+                match C::find_newline(raw.get_(pos + DECODE_SPAN..)) {
+                    Some(rel) => pos + DECODE_SPAN + rel + C::UNIT_WIDTH,
+                    None      => raw.len(),  // One giant line ... same HWM as the matcher
+                }
+            };
+
+            dec.clear();
+            C::decode_line(raw.get_(pos..end), &mut dec);
+            self.check_fragment_presence_in_seam(seam, &dec);
+
+            pos = end;
+        }
+
+        *self.scratch = dec;
+    }
+
+    //
+    // Streaming counterpart of check_fragment_presence(): feed it the pieces of a file in order.
+    //
+    // 'seam' carries the last (fragment_length - 1) bytes seen so far, so fragments that
+    // straddle two pieces are found too.
+    //
+    fn check_fragment_presence_in_seam(&mut self, seam: &mut PresenceSeam, data: &[u8]) {
+        if data.is_empty() { return; }
+
+        let keep = self.selected_fragment_hash_len as usize - 1; // 2 or 3
+
+        self.scan_fragments(data);
+
+        //
+        // Fragments that start in the seam and end in this piece, at most 3 + 3 bytes.
+        //
+        let old = seam.len as usize;
+        if old > 0 {
+            let head = data.len().min(keep);
+
+            let mut joined = [0u8; 8];  // Zero tail doubles as the < 4 pad
+            joined.get_mut_(   ..old)       .copy_from_slice(seam.bytes.get_(..old));
+            joined.get_mut_(old..old + head).copy_from_slice(data      .get_(..head));
+
+            crate::fragments::check_fragment_presence(
+                joined.get_(..old + head),
+                self.fragment_hashes, self.fragment_presence_scratch,
+                self.fragment_index, keep + 1, self.ignore_case,
+            );
+        }
+
+        //
+        // New seam = last 'keep' bytes of (old seam ++ data)
+        //
+
+        let d = data.len();
+        if d >= keep {
+            seam.bytes[..keep].copy_from_slice(&data[d - keep..]);
+            seam.len = keep as u8;
+
+            return;
+        }
+
+        let mut tmp = [0u8; 6];  // old <= 3, d < keep <= 3
+        tmp.get_mut_(   ..old)    .copy_from_slice(seam.bytes.get_(..old));
+        tmp.get_mut_(old..old + d).copy_from_slice(data);
+
+        let total = old + d;
+        let n = total.min(keep);
+
+        seam.bytes.get_mut_(..n).copy_from_slice(tmp.get_(total - n..total));
+        seam.len = n as u8;
+    }
+}
+
+#[inline(always)]
+pub const fn decode_whole_file_right_away(raw_len_after_bom: usize) -> bool {
+    raw_len_after_bom != 0 && raw_len_after_bom <= SMALL_FILE_DECODE_THRESHOLD
+}
+
+macro_rules! as_print_ctx {
+    ($w:expr) => {
+        WorkerPrintCtx {
+            scratch:                 &mut $w.parser.scratch,
+            scratch2:                &mut $w.parser.scratch2,
+            matcher:                 &mut $w.matcher,
+            matcher_cache:           $w.matcher_cache.as_deref_mut(),
+            ranges_scratch:          &mut $w.ranges_scratch,
+            line_ranges_scratch:     &mut $w.line_ranges_scratch,
+            newlines_scratch:        &mut $w.newlines_scratch,
+            output:                  &mut $w.output,
+            cli:                          $w.cli,
+            path_buf:                &$w.path_buf,
+            print_line_numbers:           $w.print_line_numbers,
+            files_contained_matches: &mut $w.stats.files_contained_matches,
+            sink:                    &mut $w.sink,
+            red: $w.red, green: $w.green, cyan: $w.cyan,
+        }
+    };
 }
 
 // impl block for printing matches
@@ -1279,28 +1843,82 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     #[inline(always)]
     fn find_and_print_matches(&mut self) -> io::Result<bool> {
+        as_print_ctx!(self).find_and_print_matches(&self.parser.file)
+    }
+
+    #[inline(always)]
+    fn find_and_print_matches_in_chunk(
+        &mut self,
+        data: &[u8],
+        carry: &mut ChunkCarry,
+        is_last: bool,
+    ) -> io::Result<()> {
+        as_print_ctx!(self).find_and_print_matches_in_chunk(data, carry, is_last)
+    }
+}
+
+pub struct WorkerPrintCtx<'a, S: MatchSink> {
+    pub scratch:                 &'a mut Vec<u8>,
+    pub scratch2:                &'a mut Vec<u8>,
+    pub matcher:                 &'a Matcher,
+    pub matcher_cache:    Option<&'a mut MatcherCache>,
+    pub ranges_scratch:          &'a mut Vec<(u32, u32)>,
+    pub line_ranges_scratch:     &'a mut Vec<(u32, u32)>,
+    pub newlines_scratch:        &'a mut Vec<u32>,
+    pub output:                  &'a mut OutputSlotWriter,
+    pub cli:                     &'a Cli,
+    pub path_buf:                &'a [u8],
+    pub print_line_numbers:       bool,
+    pub files_contained_matches: &'a mut u32,
+    pub sink:                    &'a mut S,
+
+    pub red:   &'static str,
+    pub green: &'static str,
+    pub cyan:  &'static str,
+}
+
+// impl block for printing matches
+#[allow(clippy::while_let_on_iterator)]
+impl<S: MatchSink> WorkerPrintCtx<'_, S> {
+    #[inline(always)]
+    pub fn find_and_print_matches(&mut self, file: &[u8]) -> io::Result<bool> {
         let _span = tracy::span!("find_and_print_matches");
 
-        if self.parser.file.is_empty() { return Ok(false); }
+        if file.is_empty() { return Ok(false); }
 
-        match crate::binary::detect_byte_order_leading_mark_len(&self.parser.file) {
-            Some(Encoding::Utf8)    => self.find_and_print_matches_impl::<RawCodec    >(3),
-            Some(Encoding::Utf16LE) => self.find_and_print_matches_impl::<Utf16LeCodec>(2),
-            Some(Encoding::Utf16BE) => self.find_and_print_matches_impl::<Utf16BeCodec>(2),
-            Some(Encoding::Utf32LE) => self.find_and_print_matches_impl::<Utf32LeCodec>(4),
-            Some(Encoding::Utf32BE) => self.find_and_print_matches_impl::<Utf32BeCodec>(4),
-            None                    => self.find_and_print_matches_impl::<RawCodec    >(0),
+        let enc = crate::binary::detect_byte_order_leading_mark_len(file);
+
+        match enc {
+            None | Some(Encoding::Utf8) => {
+                let skip = if enc.is_some() { 3 } else { 0 };
+                self.find_and_print_matches_impl::<RawCodec>(file, skip)
+            }
+
+            Some(enc) => self.find_and_print_matches_wide(file, enc),
         }
     }
 
-    fn find_and_print_matches_impl<C: LineCodec>(&mut self, skip: usize) -> io::Result<bool> {
-        let buf = self.parser.file.get_(skip..);
+    #[cold]
+    #[inline(never)]
+    fn find_and_print_matches_wide(&mut self, file: &[u8], enc: Encoding) -> io::Result<bool> {
+        match enc {
+            Encoding::Utf16LE => self.find_and_print_matches_impl::<Utf16LeCodec>(file, 2),
+            Encoding::Utf16BE => self.find_and_print_matches_impl::<Utf16BeCodec>(file, 2),
+            Encoding::Utf32LE => self.find_and_print_matches_impl::<Utf32LeCodec>(file, 4),
+            Encoding::Utf32BE => self.find_and_print_matches_impl::<Utf32BeCodec>(file, 4),
+            Encoding::Utf8    => unsafe { std::hint::unreachable_unchecked() }
+        }
+    }
+
+    #[inline(always)]
+    fn find_and_print_matches_impl<C: LineCodec>(&mut self, file: &[u8], skip: usize) -> io::Result<bool> {
+        let buf = file.get_(skip..);
 
         let buf_len = buf.len();
         if buf_len == 0 { return Ok(false); }
 
-        if !C::RAW_PASSTHROUGH && buf_len <= SMALL_FILE_DECODE_THRESHOLD {
-            return self.find_and_print_matches_small_decode::<C>(skip);
+        if !C::RAW_PASSTHROUGH && decode_whole_file_right_away(buf_len) {
+            return self.find_and_print_matches_small_decode::<C>(file, skip);
         }
 
         let should_print_color        = should_enable_ansi_coloring();
@@ -1320,7 +1938,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             self.matcher.push_all_matches(
                 buf,
                 self.matcher_cache.as_deref_mut(),
-                &mut self.ranges_scratch
+                self.ranges_scratch,
             );
 
             if self.ranges_scratch.is_empty() {
@@ -1334,7 +1952,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             while i < self.ranges_scratch.len() {
                 let (m_start, line_start) = Self::resolve_match_line_bounds(
-                    buf, &self.ranges_scratch, i, scan_pos, &mut line_num, should_print_line_numbers,
+                    buf, self.ranges_scratch, i, scan_pos, &mut line_num, should_print_line_numbers,
                 );
 
                 //
@@ -1349,27 +1967,27 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 let line = C::strip_trailing_cr(buf.get_(line_start..line_end));
 
                 Self::collect_line_ranges(
-                    &self.ranges_scratch,
-                    &mut self.line_ranges_scratch,
+                    self.ranges_scratch,
+                    self.line_ranges_scratch,
                     &mut i,
                     line_start, line_end, line.len(), |_| {},
                 );
 
-                self.parser.scratch2.clear();
+                self.scratch2.clear();
 
                 Self::emit_match(
-                    &mut self.output,
-                    &mut self.parser.scratch2,
+                    self.output,
+                    self.scratch2,
                     self.cli,
-                    &self.path_buf,
+                    self.path_buf,
                     &mut found_any,
                     line_num,
                     line,
-                    &self.line_ranges_scratch,
+                    self.line_ranges_scratch,
                     should_print_color,
                     should_print_line_numbers,
-                    &mut self.sink,
-                    self.red, self.green, self.cyan
+                    self.sink,
+                    self.red, self.green, self.cyan,
                 );
 
                 scan_pos = (line_end + C::UNIT_WIDTH).min(buf_len);
@@ -1377,7 +1995,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             }
 
             if found_any {
-                self.stats.files_contained_matches += 1;
+                *self.files_contained_matches += 1;
             }
 
             return Ok(found_any);
@@ -1403,7 +2021,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         let mut line_start = 0;
         let mut line_num   = 1u32;
 
-        for &newline_pos in self.newlines_scratch.iter().chain([&(buf_len as u32)]) {
+        let last_newline_end = self.newlines_scratch.last().map(|&p| p as usize + C::UNIT_WIDTH).unwrap_or(0);
+        let sentinel = (last_newline_end < buf_len).then_some(buf_len as u32);
+
+        for &newline_pos in self.newlines_scratch.iter().chain(sentinel.iter()) {
             let line_end = newline_pos as usize;
             if line_end < buf_len {
                 prefetch_read(unsafe { buf.as_ptr().add((line_end + C::UNIT_WIDTH).min(buf_len)) });
@@ -1417,9 +2038,9 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             // a second huge allocation.
             //
             let line: &[u8] = {
-                self.parser.scratch.clear();
-                C::decode_line(raw_line, &mut self.parser.scratch);
-                self.parser.scratch.as_slice()
+                self.scratch.clear();
+                C::decode_line(raw_line, self.scratch);
+                self.scratch.as_slice()
             };
 
             //
@@ -1430,28 +2051,28 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 self.matcher.push_all_matches(
                     line,
                     self.matcher_cache.as_deref_mut(),
-                    &mut self.ranges_scratch
+                    self.ranges_scratch,
                 );
 
-                &self.ranges_scratch
+                self.ranges_scratch
             };
 
             if !line_matches.is_empty() {
-                self.parser.scratch2.clear(); // @Speed?
+                self.scratch2.clear(); // @Speed?
 
                 Self::emit_match(
-                    &mut self.output,
-                    &mut self.parser.scratch2,
+                    self.output,
+                    self.scratch2,
                     self.cli,
-                    &self.path_buf,
+                    self.path_buf,
                     &mut found_any,
                     line_num,
                     line,
                     line_matches,
                     should_print_color,
                     should_print_line_numbers,
-                    &mut self.sink,
-                    self.red, self.green, self.cyan
+                    self.sink,
+                    self.red, self.green, self.cyan,
                 );
             }
 
@@ -1462,20 +2083,21 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         }
 
         if found_any {
-            self.stats.files_contained_matches += 1;
+            *self.files_contained_matches += 1;
         }
 
         Ok(found_any)
     }
 
-    #[inline]
-    fn find_and_print_matches_in_chunk(
+    pub fn find_and_print_matches_in_chunk(
         &mut self,
         data: &[u8],
         carry: &mut ChunkCarry,
         is_last: bool,
     ) -> io::Result<()> {
         let _span = tracy::span!("find_and_print_matches_in_chunk");
+
+        carry.consumed = (0, 0);
 
         if data.is_empty() { return Ok(()); }
 
@@ -1536,6 +2158,10 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             }
         };
 
+        if !C::RAW_PASSTHROUGH {
+            carry.consumed = (skip, skip + process_until);
+        }
+
         if C::RAW_PASSTHROUGH {
             debug_assert_eq!(C::UNIT_WIDTH, 1);
 
@@ -1545,7 +2171,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             self.matcher.push_all_matches(
                 region,
                 self.matcher_cache.as_deref_mut(),
-                &mut self.ranges_scratch
+                self.ranges_scratch,
             );
 
             if self.ranges_scratch.is_empty() {
@@ -1570,7 +2196,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             while i < self.ranges_scratch.len() {
                 let (m_start, line_start) = Self::resolve_match_line_bounds(
-                    region, &self.ranges_scratch, i, scan_pos, &mut carry.line_num, should_print_line_numbers,
+                    region, self.ranges_scratch, i, scan_pos, &mut carry.line_num, should_print_line_numbers,
                 );
 
                 let line_end = memchr::memchr(b'\n', region.get_(m_start..))
@@ -1580,25 +2206,25 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 let line = C::strip_trailing_cr(region.get_(line_start..line_end));
 
                 Self::collect_line_ranges(
-                    &self.ranges_scratch, &mut self.line_ranges_scratch, &mut i,
+                    self.ranges_scratch, self.line_ranges_scratch, &mut i,
                     line_start, line_end, line.len(), |_| {},
                 );
 
-                self.parser.scratch2.clear();
+                self.scratch2.clear();
 
                 Self::emit_match(
-                    &mut self.output,
-                    &mut self.parser.scratch2,
+                    self.output,
+                    self.scratch2,
                     self.cli,
-                    &self.path_buf,
+                    self.path_buf,
                     &mut carry.found_any,
                     carry.line_num,
                     line,
-                    &self.line_ranges_scratch,
+                    self.line_ranges_scratch,
                     should_print_color,
                     should_print_line_numbers,
-                    &mut self.sink,
-                    self.red, self.green, self.cyan
+                    self.sink,
+                    self.red, self.green, self.cyan,
                 );
 
                 scan_pos = (line_end + 1).min(process_until);
@@ -1626,38 +2252,50 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         let mut line_start = 0usize;
 
-        for &newline_pos in self.newlines_scratch.iter().chain([&(process_until as u32)]) {
+        //
+        // The sentinel stands for a real unterminated final line -- content after the last
+        // newline with no '\n' of its own.
+        //
+        // When the last real newline already reaches process_until (true on every non-last
+        // streaming chunk, and on any buffered file/final chunk ending in '\n'), there is no
+        // such line; adding the sentinel anyway makes the loop process a phantom empty 'line'
+        // past the real content.
+        //
+        let last_newline_end = self.newlines_scratch.last().map(|&p| p as usize + C::UNIT_WIDTH).unwrap_or(0);
+        let sentinel = (last_newline_end < process_until).then_some(process_until as u32);
+
+        for &newline_pos in self.newlines_scratch.iter().chain(sentinel.iter()) {
             let line_end = newline_pos as usize;
 
             let raw_line = C::strip_trailing_cr(data.get_(line_start..line_end));
 
-            self.parser.scratch.clear();
-            C::decode_line(raw_line, &mut self.parser.scratch);
-            let line: &[u8] = self.parser.scratch.as_slice();
+            self.scratch.clear();
+            C::decode_line(raw_line, self.scratch);
+            let line: &[u8] = self.scratch.as_slice();
 
             self.ranges_scratch.clear();
             self.matcher.push_all_matches(
                 line,
                 self.matcher_cache.as_deref_mut(),
-                &mut self.ranges_scratch
+                self.ranges_scratch,
             );
 
             if !self.ranges_scratch.is_empty() {
-                self.parser.scratch2.clear(); // @Speed?
+                self.scratch2.clear(); // @Speed?
 
                 Self::emit_match(
-                    &mut self.output,
-                    &mut self.parser.scratch2,
+                    self.output,
+                    self.scratch2,
                     self.cli,
-                    &self.path_buf,
+                    self.path_buf,
                     &mut carry.found_any,
                     carry.line_num,
                     line,
-                    &self.ranges_scratch,
+                    self.ranges_scratch,
                     should_print_color,
                     should_print_line_numbers,
-                    &mut self.sink,
-                    self.red, self.green, self.cyan
+                    self.sink,
+                    self.red, self.green, self.cyan,
                 );
             }
 
@@ -1676,26 +2314,26 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     }
 
     #[inline(never)]
-    fn find_and_print_matches_small_decode<C: LineCodec>(&mut self, skip: usize) -> io::Result<bool> {
+    fn find_and_print_matches_small_decode<C: LineCodec>(&mut self, file: &[u8], skip: usize) -> io::Result<bool> {
         //
         // This monomorphization firewall here reduces the executable size
         // by ~55KB, it's nice I guess.
         //
 
-        let buf = self.parser.file.get_(skip..);
+        let buf = file.get_(skip..);
 
         let buf_len = buf.len();
         if buf_len == 0 { return Ok(false); }
 
-        self.parser.scratch.clear();
-        C::decode_line(buf, &mut self.parser.scratch);
+        self.scratch.clear();
+        C::decode_line(buf, self.scratch);
 
         self.find_and_print_matches_small_decode_impl()
     }
 
     #[inline(never)]
     fn find_and_print_matches_small_decode_impl(&mut self) -> io::Result<bool> {
-        let decoded_len = self.parser.scratch.len();
+        let decoded_len = self.scratch.len();
         if decoded_len == 0 { return Ok(false); }
 
         //
@@ -1711,12 +2349,14 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         //
 
         self.ranges_scratch.clear();
-        let decoded = self.parser.scratch.as_slice();
-        self.matcher.push_all_matches(
-            decoded,
-            self.matcher_cache.as_deref_mut(),
-            &mut self.ranges_scratch
-        );
+        {
+            let decoded = self.scratch.as_slice();
+            self.matcher.push_all_matches(
+                decoded,
+                self.matcher_cache.as_deref_mut(),
+                self.ranges_scratch,
+            );
+        }
         if self.ranges_scratch.is_empty() { return Ok(false); }
 
         let should_print_color        = should_enable_ansi_coloring();
@@ -1728,11 +2368,11 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         let mut line_num  = 1u32;
 
         while i < self.ranges_scratch.len() {
-            let decoded = self.parser.scratch.as_slice();
+            let decoded = self.scratch.as_slice();
 
             let (m_start, line_start) = Self::resolve_match_line_bounds(
                 decoded,
-                &self.ranges_scratch, i, scan_pos,
+                self.ranges_scratch, i, scan_pos,
                 &mut line_num, should_print_line_numbers,
             );
 
@@ -1747,32 +2387,39 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
                 raw_line
             };
 
+            let ranges_scratch_ptr: *const Vec<_> = &*self.ranges_scratch;
             Self::collect_line_ranges(
-                &self.ranges_scratch, &mut self.line_ranges_scratch, &mut i, line_start, line_end, line.len(),
+                self.ranges_scratch, self.line_ranges_scratch, &mut i, line_start, line_end, line.len(),
 
                 |next_i| {
-                    // Warm the next match's line while we process the current one
-                    if let Some(&(next_start, _)) = self.ranges_scratch.get(next_i) {
+                    //
+                    // Warm the next match's line while we process the current one.
+                    //
+                    // SAFETY: read-only prefetch hint, ranges_scratch isn't
+                    // mutated between here and the read (same as original).
+                    //
+                    let ranges_scratch = unsafe { &*ranges_scratch_ptr };
+                    if let Some(&(next_start, _)) = ranges_scratch.get(next_i) {
                         prefetch_read(unsafe { decoded.as_ptr().add(next_start as usize) });
                     }
                 },
             );
 
-            self.parser.scratch2.clear();
+            self.scratch2.clear();
 
             Self::emit_match(
-                &mut self.output,
-                &mut self.parser.scratch2,
+                self.output,
+                self.scratch2,
                 self.cli,
-                &self.path_buf,
+                self.path_buf,
                 &mut found_any,
                 line_num,
                 line,
-                &self.line_ranges_scratch,
+                self.line_ranges_scratch,
                 should_print_color,
                 should_print_line_numbers,
-                &mut self.sink,
-                self.red, self.green, self.cyan
+                self.sink,
+                self.red, self.green, self.cyan,
             );
 
             scan_pos = (line_end + 1).min(decoded_len);
@@ -1780,7 +2427,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         }
 
         if found_any {
-            self.stats.files_contained_matches += 1;
+            *self.files_contained_matches += 1;
         }
 
         Ok(found_any)
@@ -1837,13 +2484,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         (m_start, line_start)
     }
 
-    /// Given a resolved `line_end`, groups every consecutive entry in
-    /// `ranges_scratch` starting at `i` that still falls on this line,
-    /// advances `*i` past them, and rewrites that group into `line_ranges_scratch`
+    /// Given a resolved 'line_end', groups every consecutive entry in
+    /// 'ranges_scratch' starting at 'i' that still falls on this line,
+    /// advances '*i' past them, and rewrites that group into 'line_ranges_scratch'
     /// as offsets relative to the line instead of the whole buffer.
     ///
-    /// `mid_hook` runs right after the group is found but before the relative
-    /// ranges are built, and is handed the post-group index -- small_decode uses
+    /// 'mid_hook' runs right after the group is found but before the relative
+    /// ranges are built, and is handed the post-group index, small_decode uses
     /// this to prefetch the next match's line while this one is still being formatted.
     #[inline(always)]
     fn collect_line_ranges(
@@ -1936,11 +2583,43 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             sink.push(path.as_ref(), line_num as _, line, matches);
         }
     }
-}
 
-#[allow(clippy::too_many_arguments, reason = "alwaysinline + LICM")]
-impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
     #[inline(always)]
+    fn write_file_header(
+        scratch:            &mut Vec<u8>,
+        cli:                &Cli,
+        path:               &[u8],
+
+        should_print_color: bool,
+        green: &'static str,
+    ) {
+        if cli.jump { return }  // Jump mode writes path per-line, not as a header
+
+        if should_print_color { scratch.extend_from_slice(green.as_bytes()); }
+
+        let root = cli.search_root_path.as_bytes();
+        let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
+
+        // Reserve
+        {
+            let mut len = root.len() + usize::from(!ends_with_slash) + path.len() + 2; // ":\n"
+            if should_print_color {
+                len += green.len() + COLOR_RESET.len();
+            }
+            scratch.reserve(len);
+        }
+
+        scratch.extend_from_slice(root);
+        if !ends_with_slash { scratch.push(MAIN_SEPARATOR as _); }
+        scratch.extend_from_slice(path);
+
+        if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
+
+        scratch.extend_from_slice(b":\n");
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments, reason = "alwaysinline")]
     fn write_match_line(
         output:            &mut OutputSlotWriter,
         scratch:           &mut Vec<u8>,
@@ -2062,7 +2741,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             .unwrap_or(0);
 
         //
-        // Worst-case budget reserves room for both ellipses; if only one
+        // Worst case budget reserves room for both ellipses; if only one
         // side ends up truncated we simply waste up to 3 bytes of width.
         //
         let content_budget = MAX_DISPLAY - ELLIPSIS.len() * 2;
@@ -2076,11 +2755,11 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         //
         // Snap start down to a UTF-8 boundary.
         //
-        while start > 0 && start < line.len() && (line[start] & 0xC0) == 0x80 {
+        while start > 0 && start < line.len() && (*line.get_(start) & 0xC0) == 0x80 {
             start -= 1;
         }
 
-        let mut end = start + truncate_utf8(&line[start..], content_budget).len();
+        let mut end = start + truncate_utf8(line.get_(start..), content_budget).len();
 
         //
         // If we reached EOL with budget to spare, pull `start` further back.
@@ -2092,7 +2771,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
                 while new_start > 0
                 && new_start < line.len()
-                && (line[new_start] & 0xC0) == 0x80
+                && (*line.get_(new_start) & 0xC0) == 0x80
                 {
                     new_start -= 1;
                 }
@@ -2152,65 +2831,6 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         scratch.push(b'\n');
 
         output.write_record(scratch);
-    }
-
-    #[inline(always)]
-    fn write_file_header(
-        scratch:            &mut Vec<u8>,
-        cli:                &Cli,
-        path:               &[u8],
-        should_print_color: bool,
-
-        green: &'static str,
-    ) {
-        if cli.jump { return }  // Jump mode writes path per-line, not as a header
-
-        if should_print_color { scratch.extend_from_slice(green.as_bytes()); }
-
-        let root = cli.search_root_path.as_bytes();
-        let ends_with_slash = root.last() == Some(&(MAIN_SEPARATOR as _));
-
-        // Reserve
-        {
-            let mut len = root.len() + usize::from(!ends_with_slash) + path.len() + 2; // ":\n"
-            if should_print_color {
-                len += green.len() + COLOR_RESET.len();
-            }
-            scratch.reserve(len);
-        }
-
-        scratch.extend_from_slice(root);
-        if !ends_with_slash { scratch.push(MAIN_SEPARATOR as _); }
-        scratch.extend_from_slice(path);
-
-        if should_print_color { scratch.extend_from_slice(COLOR_RESET.as_bytes()); }
-
-        scratch.extend_from_slice(b":\n");
-    }
-}
-
-/// impl block of gitignore helper functions
-impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
-    #[inline]
-    fn try_load_gitignore(&mut self, gi_file_id: FileId) -> Option<Gitignore> {
-        let _span = tracy::span!("WorkerCtx::try_load_gitignore");
-
-        if let Ok(gi_node) = self.fs.parse_node(gi_file_id) {
-            let size = (gi_node.size() as usize).min(self.max_file_byte_size());
-            if likely(self.fs.read_file_content(&mut self.parser, &gi_node, size, BufKind::Gitignore, true).is_ok()) {
-                let matcher = crate::ignore::build_gitignore_from_bytes(
-                    &self.parser.gitignore
-                );
-                return Some(matcher)
-            }
-        }
-
-        None
-    }
-
-    #[inline(always)]
-    fn find_gitignore_file_id_in_buf(&self, kind: BufKind) -> Option<FileId> {
-        self.parser.find_file_id_in_buf(self.fs, b".gitignore", kind)
     }
 }
 
@@ -2317,12 +2937,13 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
         let start = fastrand::usize(..stealers.len());
         for i in 0..stealers.len() {
             let victim_id = (start + i) % stealers.len();
-            if victim_id == self.worker_id as usize || stealers[victim_id].is_empty() {
+            let stealer = stealers.get_(victim_id);
+            if victim_id == self.worker_id as usize || stealer.is_empty() {
                 continue;
             }
 
             loop {
-                match stealers[victim_id].steal_batch_and_pop(local) {
+                match stealer.steal_batch_and_pop(local) {
                     crossbeam_deque::Steal::Success(work) => {
                         *consecutive_steals += 1;
                         return Some(work);

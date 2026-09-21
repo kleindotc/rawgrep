@@ -636,7 +636,7 @@ pub mod windows {
             let trimmed = mountpoint.trim_end_matches('\\');
             let device_path = format!(r"\\.\{trimmed}");
 
-            // Normalize both sides the same way before comparing `device` (from the caller)
+            // Normalize both sides the same way before comparing 'device' (from the caller)
             // may or may not carry a verbatim prefix depending on where it originated.
             let device_normalized = strip_verbatim_prefix(device);
             if !device_normalized.eq_ignore_ascii_case(&device_path) {

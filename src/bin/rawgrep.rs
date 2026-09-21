@@ -13,13 +13,14 @@ use rawgrep::cli::Cli;
 use rawgrep::worker::NoSink;
 use rawgrep::{Error, RawGrepConfig, eprint_blue, eprint_green, eprintln_red};
 
-use std::io;
+fn main() {
+    _ = rawgrep::platform::set_process_priority(-10);
 
-fn main() -> io::Result<()> {
     #[cfg(feature = "dhat")]
     let _profiler = dhat::Profiler::new_heap();
 
-    _ = rawgrep::platform::set_process_priority(-10);
+    #[cfg(feature = "mimalloc")]
+    mi_tuning::apply();
 
     let cli = Cli::parse();
     let show_stats = cli.stats;
@@ -46,13 +47,11 @@ fn main() -> io::Result<()> {
                     eprintln!("{cache_stats}");
                 }
             }
-
-            Ok(())
         }
 
         Err(e) => {
             eprintln_red!("error: {e}");
-            std::process::exit(exit_code(&e));
+            std::process::exit(exit_code(&e))
         }
     }
 }
@@ -60,14 +59,45 @@ fn main() -> io::Result<()> {
 #[inline]
 const fn exit_code(e: &Error) -> i32 {
     match e {
-        Error::PermissionDenied(_)  => 77, // EX_NOPERM
+        Error::PermissionDenied(_)   => 77, // EX_NOPERM
 
         Error::DeviceNotFound(_)
         | Error::PathNotFound { .. }
         | Error::RootNotFound { .. } => 66, // EX_NOINPUT
 
-        Error::InvalidPattern(_)    => 2,  // misuse of shell builtins (grep convention)
+        Error::InvalidPattern(_)     => 2,  // misuse of shell builtins (grep convention)
 
-        _                           => 1,
+        _                            => 1,
     }
+}
+
+#[cfg(feature = "mimalloc")]
+#[allow(non_camel_case_types)]
+mod mi_tuning {
+    use libmimalloc_sys as mi;
+    use std::os::raw::c_long;
+
+    // Not exported by libmimalloc-sys v0.1.44...
+    const MI_OPTION_PURGE_DELAY: mi::mi_option_t = 15;
+
+    struct Option_Setting {
+        id: mi::mi_option_t,
+        value: c_long,
+    }
+
+    const SETTINGS: &[Option_Setting] = &[
+        Option_Setting { id: MI_OPTION_PURGE_DELAY, value: -1 },
+    ];
+
+    pub fn apply() {
+        for s in SETTINGS {
+            unsafe { mi::mi_option_set(s.id, s.value); }
+        }
+    }
+
+    extern "C" fn init() { apply(); }
+
+    #[used]
+    #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+    static INIT: extern "C" fn() = init;
 }

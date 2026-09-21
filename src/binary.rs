@@ -14,19 +14,6 @@ pub const fn is_hidden_entry(name: &[u8]) -> bool {
 
 pub use crate::binary_ext::{is_binary_ext, is_reserved_tool_dir};
 
-const BYTE_CLASS: [bool; 256] = {
-    let mut table = [false; 256];
-    let mut i = 0;
-    while i < 256 {
-        table[i] = matches!(
-            i as u8,
-            0x09 | 0x0A | 0x0D | 0x20..=0x7E | 0x80..=0xFF
-        );
-        i += 1;
-    }
-    table
-};
-
 #[inline(always)]
 pub fn detect_byte_order_leading_mark_len(data: &[u8]) -> Option<Encoding> {
     if data.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) { return Some(Encoding::Utf32LE) }
@@ -43,9 +30,10 @@ pub fn is_binary_chunk(data: &[u8]) -> bool {
         return false;
     }
 
-    // A declared encoding overrides the heuristic entirely -- check this
-    // before anything else, since UTF-16/32 content legitimately contains
-    // nulls that the check below would otherwise misread as binary.
+    //
+    // A declared encoding overrides the heuristic entirely, since UTF-16/32 content
+    // legitimately contains nulls that the check below would otherwise misread as binary.
+    //
     if detect_byte_order_leading_mark_len(data).is_some() {
         return false;
     }
@@ -57,8 +45,8 @@ pub fn is_binary_chunk(data: &[u8]) -> bool {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("sse2") {
-            return unsafe { is_binary_chunk_simd_sse2(data) };
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { is_binary_chunk_avx2(data) };
         }
     }
 
@@ -66,99 +54,130 @@ pub fn is_binary_chunk(data: &[u8]) -> bool {
 }
 
 /// # Safety
-/// Caller's machine supports SSE2
+/// Caller's machine supports AVX2
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-pub unsafe fn is_binary_chunk_simd_sse2(data: &[u8]) -> bool {
+#[target_feature(enable = "avx2")]
+pub unsafe fn is_binary_chunk_avx2(data: &[u8]) -> bool {
     use std::arch::x86_64::*;
 
     let check_len = data.len().min(512);
-    let mut control_count = 0;
+    let full = check_len / 32;
+    let rem  = check_len - full * 32;
+    let ptr  = data.as_ptr();
 
-    let chunks = check_len / 16;
-    let ptr = data.as_ptr();
+    let zero = _mm256_setzero_si256();
+    let c1f  = _mm256_set1_epi8(0x1F);
+    let tab  = _mm256_set1_epi8(0x09);
+    let lf   = _mm256_set1_epi8(0x0A);
+    let cr   = _mm256_set1_epi8(0x0D);
+    let del  = _mm256_set1_epi8(0x7F);
 
-    // Create masks for allowed control chars: \t (0x09), \n (0x0A), \r (0x0D)
-    let tab   = _mm_set1_epi8(0x09);
-    let lf    = _mm_set1_epi8(0x0A);
-    let cr    = _mm_set1_epi8(0x0D);
-    let space = _mm_set1_epi8(0x20);
+    //
+    //   bad_acc: per byte lane counter of rejected bytes. At most 17 iterations
+    //            (16 full + 1 tail), so a u8 lane can never overflow.
+    //
+    //   nul_acc: OR of every 'byte == 0' mask, tested once at the end.
+    //
+    let mut bad_acc = zero;
+    let mut nul_acc = zero;
 
-    // _mm_cmplt_epi8 is a SIGNED compare. Bytes 0x80..=0xFF are negative as
-    // i8, so without biasing they'd always compare "< 0x20" -- miscounting
-    // every high-bit byte (multi-byte UTF-8 continuation bytes, etc.) as a
-    // bad control char, even though BYTE_CLASS explicitly allows 0x80..=0xFF.
-    // XOR-ing both operands with 0x80 turns this into an unsigned compare.
-    let sign_flip = _mm_set1_epi8(-128i8); // 0x80
-    let space_b   = _mm_xor_si128(space, sign_flip);
+    macro_rules! step {
+        ($v:expr) => {{
+            let v = $v;
 
-    for i in 0..chunks {
-        use crate::worker::BINARY_CONTROL_COUNT;
+            // Unsigned 'v <= 0x1F' as min(v, 0x1F) == v
+            let below_space = _mm256_cmpeq_epi8(_mm256_min_epu8(v, c1f), v);
 
-        let chunk = unsafe { _mm_loadu_si128(ptr.add(i * 16) as *const __m128i) };
-        let chunk_b = _mm_xor_si128(chunk, sign_flip);
+            let allowed = _mm256_or_si256(
+                _mm256_or_si256(_mm256_cmpeq_epi8(v, tab), _mm256_cmpeq_epi8(v, lf)),
+                _mm256_cmpeq_epi8(v, cr),
+            );
 
-        // Find bytes < 0x20 (potential control characters)
-        let below_space = _mm_cmplt_epi8(chunk_b, space_b);
+            let bad = _mm256_or_si256(
+                _mm256_andnot_si256(allowed, below_space),
+                _mm256_cmpeq_epi8(v, del),
+            );
 
-        // Exclude allowed control chars: tab, LF, CR
-        let is_tab = _mm_cmpeq_epi8(chunk, tab);
-        let is_lf  = _mm_cmpeq_epi8(chunk, lf);
-        let is_cr  = _mm_cmpeq_epi8(chunk, cr);
-
-        // Combine: allowed = tab | lf | cr
-        let allowed = _mm_or_si128(_mm_or_si128(is_tab, is_lf), is_cr);
-
-        // Bad control chars = below_space AND NOT allowed
-        let bad_controls = _mm_andnot_si128(allowed, below_space);
-
-        let mask = _mm_movemask_epi8(bad_controls) as u32;
-        control_count += mask.count_ones() as usize;
-
-        if control_count > BINARY_CONTROL_COUNT {
-            return true;
-        }
+            // Bad lanes are 0xFF == -1, so subtracting adds 1
+            bad_acc = _mm256_sub_epi8(bad_acc, bad);
+            nul_acc = _mm256_or_si256(nul_acc, _mm256_cmpeq_epi8(v, zero));
+        }};
     }
 
-    // Handle remaining bytes
-    for &byte in &data[chunks * 16..check_len] {
-        if !BYTE_CLASS[byte as usize] {
-            control_count += 1;
-            if control_count > BINARY_CONTROL_COUNT {
-                return true;
-            }
-        }
+    for i in 0..full {
+        step!(unsafe { _mm256_loadu_si256(ptr.add(i * 32) as *const __m256i) });
     }
 
-    false
+    // Tail: pad with spaces
+    if rem != 0 {
+        let mut tail = [0x20u8; 32];
+        tail[..rem].copy_from_slice(&data[full * 32..check_len]);
+        step!(unsafe { _mm256_loadu_si256(tail.as_ptr() as *const __m256i) });
+    }
+
+    if _mm256_testz_si256(nul_acc, nul_acc) == 0 {
+        return true;
+    }
+
+    // Horizontal sum of the 32 byte counters: sad against zero gives four u64 sums.
+    let sums = _mm256_sad_epu8(bad_acc, zero);
+    let mut lanes = [0u64; 4];
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, sums); }
+
+    let control_count = (lanes[0] + lanes[1] + lanes[2] + lanes[3]) as usize;
+
+    control_count > BINARY_CONTROL_COUNT
 }
 
 #[inline]
 fn is_binary_chunk_(data: &[u8]) -> bool {
+    //
+    // Portable fallback, same shape as the AVX2.
+    //
+
+    //
+    // Lane counters: at most 512/16 + 1 = 33 iterations, so a u8 lane can never overflow.
+    //
+    #[inline(always)]
+    fn is_rejected_byte(b: u8) -> u8 {
+        // '&' and '|' on purpose, not '&&' and '||': no short circuit, so it stays branch free.
+        (((b < 0x20) & (b != 0x09) & (b != 0x0A) & (b != 0x0D)) | (b == 0x7F)) as u8
+    }
+
+    const W: usize = 16;
+
     let check_len = data.len().min(512);
-    let mut control_count = 0;
 
-    let mut i = 0;
-    while i + 4 <= check_len {
-        control_count += !BYTE_CLASS[data[i] as usize] as usize;
-        control_count += !BYTE_CLASS[data[i+1] as usize] as usize;
-        control_count += !BYTE_CLASS[data[i+2] as usize] as usize;
-        control_count += !BYTE_CLASS[data[i+3] as usize] as usize;
+    let mut bad = [0u8; W];
+    let mut nul = [0u8; W];
 
-        if control_count > BINARY_CONTROL_COUNT {
-            return true;
+    let mut chunks = data[..check_len].chunks_exact(W);
+    for chunk in &mut chunks {
+        for j in 0..W {
+            bad[j] += is_rejected_byte(chunk[j]);
+            nul[j] |= (chunk[j] == 0) as u8;
         }
-        i += 4;
     }
 
-    // Handle remaining bytes
-    while i < check_len {
-        control_count += !BYTE_CLASS[data[i] as usize] as usize;
-        if control_count > BINARY_CONTROL_COUNT {
-            return true;
+    //
+    // Tail padded with spaces
+    //
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
+        let mut tail = [0x20u8; W];
+        tail[..rem.len()].copy_from_slice(rem);
+        for j in 0..W {
+            bad[j] += is_rejected_byte(tail[j]);
+            nul[j] |= (tail[j] == 0) as u8;
         }
-        i += 1;
     }
 
-    false
+    let mut any_nul = 0u8;
+    let mut control_count = 0usize;
+    for j in 0..W {
+        any_nul |= nul[j];
+        control_count += bad[j] as usize;
+    }
+
+    any_nul != 0 || control_count > BINARY_CONTROL_COUNT
 }

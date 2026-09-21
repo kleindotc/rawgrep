@@ -40,6 +40,53 @@ pub enum FileType {
     Other
 }
 
+/// Uniquely identifies a file across reboots
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileKey {
+    pub device_id: u64,
+    pub inode:     u64,
+}
+
+impl FileKey {
+    #[inline(always)]
+    pub const fn new(device_id: u64, inode: u64) -> Self {
+        Self { device_id, inode }
+    }
+
+    #[inline(always)]
+    pub const fn hash(&self) -> u32 {
+        ((self.device_id ^ self.inode).wrapping_mul(0x9e3779b9)) as u32
+    }
+}
+
+/// Metadata for cache invalidation
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMeta {
+    pub mtime_sec: i64, // @Incomplete: Make this into msec?
+    pub size:      u64,
+}
+
+impl FileMeta {
+    #[inline(always)]
+    pub const fn new(mtime_sec: i64, size: u64) -> Self {
+        Self { mtime_sec, size }
+    }
+
+    #[inline(always)]
+    pub const fn matches(&self, other: FileMeta) -> bool {
+        self.mtime_sec == other.mtime_sec && self.size == other.size
+    }
+}
+
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentifier {
+    pub key:  FileKey,
+    pub meta: FileMeta
+}
+
 pub type FileId = u64;
 
 /// Filesystem-agnostic file node info
@@ -50,7 +97,7 @@ pub trait FileNode: Copy {
 
     fn file_id(&self) -> FileId;
     fn size(&self) -> u64;
-    fn mtime(&self) -> i64;
+    fn mtime_sec(&self) -> i64;
     fn is_dir(&self) -> bool;
 }
 
@@ -66,6 +113,14 @@ pub trait RawFs: Sync + Send {
     fn device_id(&self) -> u64;
 
     fn device_file(&self) -> &File;
+
+    #[inline(always)]
+    fn file_identifier(&self, node: &Self::Node) -> FileIdentifier {
+        FileIdentifier {
+            key: FileKey::new(self.device_id(), node.file_id()),
+            meta: FileMeta::new(node.mtime_sec(), node.size())
+        }
+    }
 
     #[inline]
     fn read_at_offset(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -109,6 +164,12 @@ pub trait RawFs: Sync + Send {
     #[inline]
     fn sort_subdirs_by_offset(&self, _subdirs: &mut [PendingSubdir]) {}
 
+    #[cfg(unix)]
+    fn prefetch_file_head(&self, _node: &Self::Node, _max_size: usize) {}
+
+    #[cfg(unix)]
+    fn head_is_cold(&self, _node: &Self::Node, _max_size: usize) -> Option<bool> { None }
+
     /// Read file content into buffer, returns false if binary detected
     fn read_file_content(
         &self,
@@ -117,6 +178,7 @@ pub trait RawFs: Sync + Send {
         max_size: usize,
         kind: BufKind,
         check_binary: bool,
+        likely_binary: bool,
     ) -> io::Result<bool>;
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)] // @Cleanup
@@ -129,6 +191,7 @@ pub trait RawFs: Sync + Send {
         _node: &Self::Node,
         _max_size: usize,
         _check_binary: bool,
+        _likely_binary: bool,
         _buf: &mut Vec<u8>
     ) -> io::Result<bool> {
         Ok(false)
@@ -158,23 +221,51 @@ pub struct DirScanResult {
 }
 
 /// Filesystem-agnostic parser with reusable buffers
+///
+/// Buffer lifetimes -- what's safe to repurpose and what isn't:
+///
+///  - 'file' / 'dir' / 'gitignore': One destination buffer per BufKind.
+///    A directory's entries can still be live in 'dir' (mid-iteration)
+///    while a file inside it is being read into 'file', with its '.gitignore' simultaneously
+///    live in 'gitignore'. Each owns its content for as long as its own traversal needs it,
+///    independent of the other two.
+///
+///  - 'scratch' / 'scratch3': Transient, used only inside 'collect_file_chunks'
+///    (extent-tree bytes / child-block stack respectively).
+///    Both are guaranteed consumed/truncated back before that call returns --
+///    'scratch' is then reused a second time afterwards, as the wide-encoding decode buffer
+///    during presence scanning (see the correctness note above 'check_fragment_presence_wide').
+///
+///  - 'scratch2': check_binary's probe scratch for the direct-blocks path in
+///    'collect_file_chunks' (consumed before that call returns), and separately the
+///    line/header text-building scratch for 'emit_match'/'write_match_line' during
+///    printing.
+///
+///  - 'stream_chunk': per-chunk read staging for the streaming path
+///    ('process_file_streaming' in worker.rs) -- tail carry + one freshly-read chunk.
+///
+///  - 'scratch_chunks': the chunk list 'collect_file_chunks' builds, consumed by both the
+///    buffered read loop and the streaming loop. Live for the whole read -- not throwaway
+///    scratch like the rest of this list.
+///
 pub struct Parser {
-    pub dont_skip_dot_entries: bool,
-
     pub file:           Vec<u8>,                // 0
 
-    // Filesystem-specific scratch space
     pub scratch:        Vec<u8>,                // 24
     pub scratch2:       Vec<u8>,                // 48
-    pub scratch3:       Vec<u64>,               // 48
 
-    // =============== Cache line ======================
+    // ================ Cache line ===================
 
-    pub dir:            Vec<u8>,                // 72
-    pub gitignore:      Vec<u8>,                // 96
-    pub chunk:          Vec<u8>,
+    pub scratch3:       Vec<u64>,               // 72
+    pub stream_chunk:   Vec<u8>,                // 96
+    pub scratch_chunks: Vec<(u64, u32)>,        // 120
 
-    pub scratch_chunks: Vec<(u64, u32)>,
+    // ================ Cache line ===================
+
+    pub dir:            Vec<u8>,                // 144
+    pub gitignore:      Vec<u8>,                // 168
+
+    pub dont_skip_dot_entries: bool,
 }
 
 impl Parser {
@@ -189,7 +280,7 @@ impl Parser {
             scratch: Vec::new(),
             scratch_chunks: Vec::new(),
             scratch2: Vec::new(),
-            chunk: Vec::new(),
+            stream_chunk: Vec::new(),
         }
     }
 
@@ -199,7 +290,7 @@ impl Parser {
         self.file.reserve(config.file_buf);
         self.gitignore.reserve(config.gitignore_buf);
         self.scratch.reserve(config.extent_buf * 8);  // Extents are ~8 bytes each
-        self.chunk.reserve(2 * STREAMING_CHUNK_SIZE); // Covers tail carry + one full chunk without growing
+        self.stream_chunk.reserve(2 * STREAMING_CHUNK_SIZE); // Covers tail carry + one full chunk without growing
     }
 
     /// Find a file id by name in buf
@@ -328,6 +419,43 @@ pub fn push_chunk(scratch_chunks: &mut Vec<(u64, u32)>, disk_offset: u64, len: u
     }
 
     scratch_chunks.push((disk_offset, len));
+}
+
+//
+// Splits every (disk_offset, len) chunk longer than 'max' into pieces of at most 'max' bytes,
+// in-place and in-order.
+//
+// A no-op scan (no allocation) when nothing is oversized, which is the
+// common case for fragmented files.
+//
+pub fn split_chunks(chunks: &mut Vec<(u64, u32)>, max: usize) {
+    debug_assert!(max > 0 && max <= u32::MAX as usize);
+
+    let max = max as u64;
+
+    let extra: usize = chunks.iter().map(|&(_, len)| (len as u64).div_ceil(max).saturating_sub(1) as usize).sum();
+    if extra == 0 { return; }
+
+    let old_len = chunks.len();
+    chunks.resize(old_len + extra, (0, 0));
+
+    //
+    // Expand from the back so no unread chunk is overwritten: after handling source chunk 'r'
+    // the write cursor is still >= r, because it sits exactly 'extra-not-yet-placed' above it.
+    //
+    let mut w = chunks.len();
+
+    for r in (0..old_len).rev() {
+        let (off, len) = *chunks.get_(r);
+        let len = len as u64;
+
+        for k in (0..len.div_ceil(max)).rev() {
+            w -= 1;
+            chunks[w] = (off + k * max, (len - k * max).min(max) as u32);
+        }
+    }
+
+    debug_assert_eq!(w, 0);
 }
 
 /// Precomputed reciprocal for dividing a u64 by a fixed u32 divisor

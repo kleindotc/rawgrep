@@ -155,6 +155,10 @@ pub struct Cli {
     #[bpaf(long("no-cache"))]
     pub no_cache: bool,
 
+    /// Disable binary verdicts cache
+    #[bpaf(long("no-binary-cache"))]
+    pub no_binary_cache: bool,
+
     /// Don't write/update cache
     #[bpaf(long("no-cache-write"))]
     pub no_cache_write: bool,
@@ -231,7 +235,7 @@ impl Cli {
         if self.should_ignore_all_filters() || self.should_search_binary() {
             // Unfiltered search: processing MANY more LARGE files
             BufferConfig {
-                dir_buf: 1 * 1024 * 1024,     // 1 MB
+                dir_buf:  1 * 1024 * 1024,    // 1 MB
                 file_buf: 2 * 1024 * 1024,    // 2 MB
                 output_buf: 1 * 1024 * 1024,  // 1 MB
                 gitignore_buf: 0,             // 0 KB - not using .gitignore

@@ -57,7 +57,7 @@ impl FileNode for ApfsInode {
 
     #[inline(always)] fn file_id(&self) -> FileId { self.inode_num }
     #[inline(always)] fn size(&self)    -> u64    { self.size }
-    #[inline(always)] fn mtime(&self)   -> i64    { self.mtime_sec }
+    #[inline(always)] fn mtime_sec(&self)   -> i64    { self.mtime_sec }
     #[inline(always)] fn is_dir(&self)  -> bool   { (self.mode & S_IFMT) == S_IFDIR }
 }
 
@@ -97,6 +97,7 @@ impl RawFs for ApfsFs {
         max_size:     usize,
         kind:         BufKind,
         check_binary: bool,
+        _likely_binary: bool,
     ) -> io::Result<bool> {
         let _span = tracy::span!("ApfsFs::read_file_content");
 
@@ -216,7 +217,7 @@ impl RawFs for ApfsFs {
 impl ApfsFs {
     /// Parse the NX (container) superblock from the first block of the device.
     ///
-    /// `data` must be at least `block_size` bytes (the caller reads block 0
+    /// 'data' must be at least 'block_size' bytes (the caller reads block 0
     /// before knowing the block size, so it should read at least 4096 bytes).
     pub fn parse_container_superblock(data: &[u8]) -> io::Result<ApfsSuperBlock> {
         let _span = tracy::span!("ApfsFs::parse_container_superblock");

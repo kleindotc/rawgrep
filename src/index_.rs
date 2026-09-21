@@ -75,13 +75,13 @@ mod tests {
 
     #[test]
     fn index_by_usize() {
-        let v = vec![1, 2, 3];
+        let v = [1, 2, 3];
         assert_eq!(*v.get_(1), 2);
     }
 
     #[test]
     fn index_by_range() {
-        let v = vec![1, 2, 3, 4];
+        let v = [1, 2, 3, 4];
         assert_eq!(v.get_(1..3), &[2, 3]);
         assert_eq!(v.get_(..2), &[1, 2]);
         assert_eq!(v.get_(2..), &[3, 4]);
@@ -118,7 +118,7 @@ mod tests {
     #[should_panic]
     fn debug_still_panics_on_oob() {
         // In a debug build this must panic, same as `v[10]` would.
-        let v = vec![1, 2, 3];
+        let v = [1, 2, 3];
         let _ = v.get_(10);
     }
 }

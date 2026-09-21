@@ -3,6 +3,7 @@ set -e
 
 fast=0
 install=0
+no_default_features=""
 features=""
 
 while [ "$#" -gt 0 ]; do
@@ -16,6 +17,9 @@ while [ "$#" -gt 0 ]; do
         --features)
             shift
             features="$1"
+            ;;
+        --no-default-features)
+            no_default_features="--no-default-features"
             ;;
         --features=*)
             features="${1#--features=}"
@@ -34,6 +38,7 @@ if [ "$fast" = 1 ]; then
     RUSTFLAGS="-C debug-assertions=off -C target-cpu=native" \
     cargo b -Z build-std=core,alloc,std,panic_abort \
         --profile=release-fast \
+        $no_default_features \
         --features "use_nightly${features:+,$features}"
 else
     if [ -n "$features" ]; then

@@ -77,8 +77,7 @@ impl OutputSlab {
 
         // SAFETY: UnsafeCell<u8> is #[repr(transparent)] over u8, so this
         // reinterpret is layout-valid. `ptr` came from alloc_zeroed with
-        // exactly this layout and length, and -- same leak philosophy as
-        // before -- is never freed: the OutputSlab this becomes part of is
+        // exactly this layout and length, the OutputSlab this becomes part of is
         // Box::leak'd below for the process lifetime, so no mismatched
         // dealloc (global allocator vs. this Layout) ever happens because
         // no dealloc happens at all.

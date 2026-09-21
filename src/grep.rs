@@ -9,6 +9,7 @@ use crate::{Result, Error, tracy};
 use crate::platform::device_id;
 use crate::cache::{CacheConfig, FragmentCache};
 use crate::parser::{BufKind, FileId, FileNode, Parser, RawFs};
+use crate::binary_verdicts::BinaryVerdicts;
 use crate::worker::{MatchSink, NoSink};
 use crate::ext4::parser::InodeBlockCache;
 use crate::ext4::{
@@ -26,6 +27,7 @@ pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
     fs: F,
     matcher: Matcher,
     cache: Option<FragmentCache>,
+    pub binary_verdicts: BinaryVerdicts,
 
     fragment_hashes: Vec<u32>,
     fragment_indexes: Vec<u32>,
@@ -33,6 +35,8 @@ pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
     selected_fragment_hash_len: FragmentLen,
 
     pub ignore_case: bool,
+    pub single_literal_fragments: bool,
+
     pub sink: S
 }
 
@@ -42,20 +46,24 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
         let matcher = Matcher::new(cli)?;
 
         // `None` means the pattern is too short for any window to be useful -- treat that the same as "no fragments".
-        let (fragment_hashes, selected_fragment_hash_len, ignore_case) = match matcher.extract_fragment_hashes() {
-            Some((hashes, fragment_len, ignore_case)) => (hashes, FragmentLen::from_fragment_len(fragment_len), ignore_case),
-            None => (Vec::new(), FragmentLen::Four, cli.ignore_case),
+        let (fragment_hashes, selected_fragment_hash_len, ignore_case, single_literal_fragments) = match matcher.extract_fragment_hashes() {
+            Some((hashes, fragment_len, ignore_case, single_literal)) => (
+                hashes, FragmentLen::from_fragment_len(fragment_len),
+                ignore_case, single_literal
+            ),
+
+            None => (Vec::new(), FragmentLen::Four, cli.ignore_case, true), // moot: fragment_hashes empty, cache stays None below
         };
 
         let fragment_index = fragment_hashes.iter().copied().collect();
 
         let mut fragment_indexes = Vec::new();
 
-        let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
-            let mut config = CacheConfig::from_memory_mb(cli.cache_size_mb);
-            config.cache_dir = cli.cache_dir.clone().map(Into::into);
-            config.ignore_cache = cli.rebuild_cache;
+        let mut config = CacheConfig::from_memory_mb(cli.cache_size_mb);
+        config.cache_dir = cli.cache_dir.clone().map(Into::into);
+        config.ignore_cache = cli.rebuild_cache;
 
+        let cache = if !cli.no_cache && !fragment_hashes.is_empty() {
             match FragmentCache::new(&config) {
                 Ok(cache) => {
                     cache.resolve_fragment_indexes(&fragment_hashes, &mut fragment_indexes);
@@ -71,11 +79,23 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             None
         };
 
+        let binary_verdicts = if !cli.should_search_binary() &&
+            let Ok(binary_verdicts_path) = crate::cache::get_cache_path(
+                config.cache_dir.as_deref(), "binary-verdicts.bin"
+            )
+        {
+            BinaryVerdicts::load(&binary_verdicts_path)
+        } else {
+            BinaryVerdicts::empty()
+        };
+
         Ok(RawGrepper {
             cli: cli.clone(),
             fs,
             matcher,
+            single_literal_fragments,
             ignore_case,
+            binary_verdicts,
             cache,
             fragment_hashes,
             fragment_indexes,
@@ -108,7 +128,7 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
             }
 
             let dir_size = node.size() as usize;
-            self.fs.read_file_content(&mut parser, &node, dir_size, BufKind::Dir, false)?;
+            self.fs.read_file_content(&mut parser, &node, dir_size, BufKind::Dir, false, false)?;
 
             file_id = parser.find_file_id_in_buf(
                 &self.fs,
@@ -243,7 +263,14 @@ pub fn open_device_impl(path: &str) -> io::Result<File> {
 #[cfg(unix)]
 #[inline]
 pub fn open_device_impl(path: &str) -> io::Result<File> {
-    OpenOptions::new().read(true).write(false).open(path)
+    use std::os::fd::AsRawFd;
+
+    let file = OpenOptions::new().read(true).write(false).open(path)?;
+    let fd = file.as_raw_fd();
+
+    unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM); }
+
+    Ok(file)
 }
 
 #[inline]
@@ -274,7 +301,7 @@ pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FsType)> {
                 //
                 // A read-only handle has nothing to flush -- FlushFileBuffers
                 // requires GENERIC_WRITE, so ERROR_ACCESS_DENIED here just means
-                // "this handle can't flush," not a real failure.
+                // 'this handle can't flush' ...
                 //
                 if err.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
                     return Err(err);
@@ -299,9 +326,6 @@ pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FsType)> {
     //
     // And it turns out that `syncfs()` is not realiable for our case...
     //
-    // Although, while calling `ioctl` with `BLKFLSBUF` is,
-    // it slows down our reads to oblivion, meaning there's no point..
-    //
     // #[cfg(target_os = "linux")]
     // {
     //     use std::os::unix::io::AsRawFd;
@@ -318,26 +342,6 @@ pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FsType)> {
     //     use std::os::unix::io::AsRawFd;
     //     unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC); }
     // }
-    //
-    //
-    // And by the way, having a separate handle for the device but with O_DIRECT,
-    // and doing aligned inode reads from there using `POSIX_FADV_DONTNEED`
-    // did not work as well. But maybe its because I misdiagnosed that the inodes
-    // parsing was the problem..
-    //
-    //
-    // In any way, `sync()` seems to work just fine for us, adding just
-    // few tens of milliseconds to the walltime...
-    //
-    // But even though this seems to be correct 100% of the time,
-    // fixing all the bugs we had regarding VFS staleness,
-    // I'm kinda disappointed with this approach.
-    //
-    // I truly want this program to decimate all other grep-like tools
-    // in walltime, proving that it's actually THE fastest one,
-    // but when there's still short-lived spilling allocations
-    // in medium to hot paths in this program, it doesn't really make sense
-    // to focus on that `sync()` stuff....
     //
 
     // Read enough to cover both magic locations:
@@ -373,11 +377,11 @@ pub enum FsProbe {
 
 /// Peek at raw bytes to identify the filesystem type.
 ///
-/// `block0` should be at least 2048 bytes -- enough to cover ext4's
+/// 'block0' should be at least 2048 bytes -- enough to cover ext4's
 /// superblock (offset 1024), HFS+'s magic (also 1024), the FAT/exFAT
 /// boot-sector fields, and XFS's magic at offset 0. Btrfs' magic sits
-/// much further in, so if nothing in `block0` matches, this does one
-/// extra small read via `file` before giving up.
+/// much further in, so if nothing in 'block0' matches, this does one
+/// extra small read via 'file' before giving up.
 pub fn detect_fs_type(file: &File, block0: &[u8]) -> FsProbe {
     const XFS_MAGIC: [u8; 4]      = *b"XFSB";
     const EXFAT_OEM_ID: [u8; 8]   = *b"EXFAT   ";
@@ -516,6 +520,11 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
     }
 
     #[inline]
+    pub fn single_literal_fragments(&self) -> bool {
+        self.single_literal_fragments
+    }
+
+    #[inline]
     pub fn fragment_index(&self) -> &IntSet<u32> {
         &self.fragment_index
     }
@@ -603,6 +612,15 @@ impl<S: MatchSink> AnyGrepper<S> {
     }
 
     #[inline]
+    pub fn binary_verdicts(&self) -> &BinaryVerdicts {
+        match self {
+            AnyGrepper::Ext4(g) => &g.binary_verdicts,
+            AnyGrepper::Apfs(g) => &g.binary_verdicts,
+            AnyGrepper::Ntfs(g) => &g.binary_verdicts,
+        }
+    }
+
+    #[inline]
     pub fn cache(&self) -> Option<&FragmentCache> {
         match self {
             AnyGrepper::Ext4(g) => g.cache(),
@@ -635,6 +653,15 @@ impl<S: MatchSink> AnyGrepper<S> {
             AnyGrepper::Ext4(g) => g.ignore_case(),
             AnyGrepper::Apfs(g) => g.ignore_case(),
             AnyGrepper::Ntfs(g) => g.ignore_case(),
+        }
+    }
+
+    #[inline]
+    pub fn single_literal_fragments(&self) -> bool {
+        match self {
+            AnyGrepper::Ext4(g) => g.single_literal_fragments(),
+            AnyGrepper::Apfs(g) => g.single_literal_fragments(),
+            AnyGrepper::Ntfs(g) => g.single_literal_fragments(),
         }
     }
 

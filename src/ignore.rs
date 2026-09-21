@@ -5,7 +5,7 @@ use crate::index_::{Index_, IndexMut_};
 use std::{path::MAIN_SEPARATOR, sync::Arc};
 
 use memchr::{memchr, memrchr};
-use smallvec::SmallVec;
+use crate::smallvec::SmallVec;
 
 /// A chain of gitignore matchers from root to current directory
 #[derive(Clone)]
@@ -290,7 +290,7 @@ pub struct Gitignore {
 
     /// Same as `unanchored_lookup`, but keyed on a hash of the anchored
     /// pattern's own bytes (relative-to-this-gitignore path), so lookup is
-    /// a hash probe instead of `anchored_literal_indices.len()` sequential `==` comparisons.
+    /// a hash probe instead of `anchored_literal_indexes.len()` sequential `==` comparisons.
     ///
     /// Only used when has_negations is false; empty (never probed) otherwise.
     anchored_lookup: LiteralLookup,

@@ -14,20 +14,25 @@ exclude = ["benchmark_results.tar.gz"]
 default-run = "rawgrep"
 
 [features]
-default = ["mimalloc"]
+default = ["mimalloc", "runtime-dispatch-simd"]
 use_nightly = []
+
+dont_vendor = ["dep:bytecount", "dep:smallvec"]
 
 hyperscan = ["dep:hyperscan"]
 hyperscan-static = ["hyperscan", "hyperscan/static"]
 
 enable-bytemuck-checks = ["dep:bytemuck"]
 
-# profiling
-tracy = ["dep:tracy-client", "tracy-client/enable"]
+# Profiling
+tracy = ["tracy-client?/enable"]
 
-# allocators
-mimalloc = ["dep:mimalloc"]
+# Allocators
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 dhat = ["dep:dhat"]
+
+runtime-dispatch-simd = ["bytecount?/runtime-dispatch-simd"]
+generic-simd = ["bytecount?/generic-simd", "use_nightly"]
 
 ignore-oracle-check = ["dep:ignore"]
 profile-sort-lens = []
@@ -36,7 +41,7 @@ no-logs = []
 no-cache-stats = []
 
 [dependencies]
-hyperscan         = { version = "0.3",     default-features = true,  features = [],         optional = true }
+hyperscan         = { version = "0.3",     default-features = true,  features = [],                 optional = true }
 regex-automata    = { version = "0.4.18", default-features = false,  features = ["std", "meta", "hybrid", "dfa-onepass", "perf-literal", "unicode"] }
 regex-syntax      = { version = "0.8.11",  default-features = true,  features = [] }
 aho-corasick      = { version = "1.1.4",   default-features = false, features = [] }
@@ -44,8 +49,6 @@ memchr            = { version = "2.7.6",   default-features = false, features = 
 
 libc              = { version = "0.2.177", default-features = false, features = [] }
 memmap2           = { version = "0.9.11",  default-features = false, features = [] }
-
-smallvec          = { version = "1.15.1",                            features = ["const_generics"] }
 
 crossbeam-channel = { version = "0.5.15",  default-features = false, features = ["std"] }
 crossbeam-deque   = { version = "0.8.7",   default-features = false, features = ["std"] }
@@ -55,11 +58,15 @@ fastrand          = { version = "2.3.0",   default-features = false, features = 
 bpaf              = { version = "0.9.27",  default-features = false, features = ["derive"] }
 nohash-hasher     = { version = "0.2.0",   default-features = false, features = ["std"] }
 
-dhat              = { version = "0.3.3",   default-features = false, features = [],         optional = true }
-mimalloc          = { version = "=0.1.47", default-features = true,  features = [],         optional = true }
+dhat              = { version = "0.3.3",   default-features = false, features = [],                 optional = true }
+mimalloc          = { version = "=0.1.47", default-features = true,  features = [],                 optional = true }
+libmimalloc-sys   = { version = "=0.1.44", default-features = false, features = ["extended"],       optional = true }
 
-bytemuck          = { version = "1.24",                              features = ["derive"], optional = true }
-tracy-client      = { version = "0.17.3",  default-features = false, features = [],         optional = true }
+bytemuck          = { version = "1.24",                              features = ["derive"],         optional = true }
+tracy-client      = { version = "0.17.3",  default-features = false, features = [],                 optional = true }
+
+bytecount         = { version = "0.6.9",   default-features = false,                                optional = true }
+smallvec          = { version = "1.15.1",                            features = ["const_generics"], optional = true }
 
 paste             = "1"
 
@@ -67,7 +74,7 @@ paste             = "1"
 # Dependencies only used by src/bin/gitignore_oracle_check.rs
 # =======================================================================================================
 
-ignore            = { version = "0.4.30",  default-features = false,                        optional = true }
+ignore            = { version = "0.4.30",  default-features = false,                                optional = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 gdt-cpus = { version = "0.2606.1", default-features = false }

@@ -89,10 +89,9 @@ pub fn pin_thread_to_core_deprioritized(core_id: usize) {
     {
         _ = gdt_cpus::set_thread_priority(gdt_cpus::ThreadPriority::BelowNormal);
     }
+
     #[cfg(target_os = "macos")]
     {
-        // No affinity on Apple Silicon anyway; QoS is the only lever, and
-        // gdt-cpus is excluded here per your existing cfg. If you want this
-        // on macOS too, call your own qos_class_self bias here instead.
+        // No affinity on Apple Silicon anyway...
     }
 }

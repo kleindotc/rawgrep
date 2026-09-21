@@ -171,7 +171,7 @@ impl Matcher {
             // ignore case + non-ascii literal: ... ascii_case_insensitive can't fold it
             // correctly, so fall back to the regex engine for full unicode case folding.
             //
-            // `pattern` is raw literal text here (force_literal means we
+            // 'pattern' is raw literal text here (force_literal means we
             // never ran it through regex_syntax), so it must be escaped before
             // reaching a regex engine, or its own characters would be reinterpreted
             // as regex syntax instead of literal bytes.
@@ -469,7 +469,7 @@ impl Matcher {
     /// because some literal (or, for alternations/regex, the shortest literal) is under
     /// `MIN_FRAGMENT_LEN`. Callers must not fall back to a smaller fragment in that case;
     /// see `select_fragment_len`'s docs for why.
-    pub fn extract_fragment_hashes(&self) -> Option<(Vec<u32>, usize, bool)> {
+    pub fn extract_fragment_hashes(&self) -> Option<(Vec<u32>, usize, bool, bool)> {
         use nohash_hasher::IntSet;
 
         match self {
@@ -477,7 +477,7 @@ impl Matcher {
                 let needle = finder.needle();
                 let fragment_len = crate::fragments::select_fragment_len(std::iter::once(needle))?;
                 let hashes = crate::fragments::extract_pattern_fragments_with_len(needle, fragment_len);
-                Some((hashes, fragment_len, false))
+                Some((hashes, fragment_len, false, true))
             }
 
             Matcher::MultiLiteral { patterns, case_insensitive, .. } => {
@@ -509,7 +509,8 @@ impl Matcher {
                     let frags = crate::fragments::extract_pattern_fragments_with_len(pattern, fragment_len);
                     all_fragments.extend(frags);
                 }
-                Some((all_fragments.into_iter().collect(), fragment_len, *case_insensitive))
+
+                Some((all_fragments.into_iter().collect(), fragment_len, *case_insensitive, false))
             }
 
             Matcher::Regex { pattern, case_insensitive, .. } => {

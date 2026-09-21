@@ -15,12 +15,14 @@ pub struct Stats {
     pub node_cache_hits: u32,
     pub node_cache_misses: u32,
 
-    pub time_fragment_presence_checking_took_in_millis: u32,
+    pub time_spent_fragment_presence_checking_in_nanos: u64,
+    pub time_spent_finding_and_printing_matches_in_nanos: u64,
 
     // Colder
     pub files_contained_matches: u32,
     pub files_skipped_large: u32,
     pub files_skipped_as_binary_due_to_ext: u32,
+    pub files_skipped_as_binary_cached: u32,
     pub files_skipped_as_binary_due_to_probe: u32,
     pub files_skipped_gitignore: u32,
     pub files_skipped_unreadable: u32,
@@ -56,6 +58,7 @@ impl Display for Stats {
         file_row!("Skipped (large)", self.files_skipped_large);
         file_row!("Skipped (binary ext)", self.files_skipped_as_binary_due_to_ext);
         file_row!("Skipped (binary probe)", self.files_skipped_as_binary_due_to_probe);
+        file_row!("Skipped (binary cached)", self.files_skipped_as_binary_cached);
         file_row!("Skipped (unreadable)", self.files_skipped_unreadable);
         file_row!("Skipped (gitignore)", self.files_skipped_gitignore);
         file_row!("Skipped (cache)", self.files_skipped_by_cache);
@@ -97,12 +100,39 @@ impl Display for Stats {
             dir_row!("Skipped (path too long)", self.dirs_skipped_path_too_long);
         }
 
-        writeln_blue!(f, "\nTimings:")?;
-        writeln!(f, "  Fragment Presence Checks: {}ms", self.time_fragment_presence_checking_took_in_millis)?;
-
         writeln_blue!(f, "\nNode Cache:")?;
         writeln!(f, "  Node Cache Hits:   {}", self.node_cache_hits)?;
         writeln!(f, "  Node Cache Misses: {}", self.node_cache_misses)?;
+
+        {
+            writeln_blue!(f, "\nTimings:")?;
+
+            macro_rules! timing_row {
+                ($label:expr, $nanos:expr) => {
+                    let nanos = $nanos;
+                    let (time, unit) = if nanos < 1_000 {
+                        (nanos as f64, "ns")
+                    } else if nanos < 1_000_000 {
+                        (nanos as f64 / 1_000.0, "us")
+                    } else if nanos < 1_000_000_000 {
+                        (nanos as f64 / 1_000_000.0, "ms")
+                    } else {
+                        (nanos as f64 / 1_000_000_000.0, "s")
+                    };
+
+                    writeln!(f, "  {:<25} {time:.3}{unit}", $label)?;
+                };
+            }
+
+            timing_row!(
+                "Fragment Presence Checks",
+                self.time_spent_fragment_presence_checking_in_nanos
+            );
+            timing_row!(
+                "Find and Print Matches",
+                self.time_spent_finding_and_printing_matches_in_nanos
+            );
+        }
 
         Ok(())
     }
@@ -116,8 +146,10 @@ impl Stats {
         shared.bytes_searched.fetch_add(self.bytes_searched as _, Ordering::Relaxed);
         shared.files_skipped_large.fetch_add(self.files_skipped_large as _, Ordering::Relaxed);
         shared.node_cache_hits.fetch_add(self.node_cache_hits as _, Ordering::Relaxed);
+        shared.time_spent_finding_and_printing_matches_in_nanos.fetch_add(self.time_spent_finding_and_printing_matches_in_nanos as _, Ordering::Relaxed);
         shared.node_cache_misses.fetch_add(self.node_cache_misses as _, Ordering::Relaxed);
         shared.files_skipped_as_binary_due_to_ext.fetch_add(self.files_skipped_as_binary_due_to_ext as _, Ordering::Relaxed);
+        shared.files_skipped_as_binary_cached.fetch_add(self.files_skipped_as_binary_cached as _, Ordering::Relaxed);
         shared.files_skipped_as_binary_due_to_probe.fetch_add(self.files_skipped_as_binary_due_to_probe as _, Ordering::Relaxed);
         shared.files_skipped_gitignore.fetch_add(self.files_skipped_gitignore as _, Ordering::Relaxed);
         shared.files_skipped_by_cache.fetch_add(self.files_skipped_by_cache as _, Ordering::Relaxed);
@@ -125,7 +157,7 @@ impl Stats {
         shared.dirs_encountered.fetch_add(self.dirs_encountered as _, Ordering::Relaxed);
         shared.dirs_skipped_common.fetch_add(self.dirs_skipped_common as _, Ordering::Relaxed);
         shared.dirs_skipped_path_too_long.fetch_add(self.dirs_skipped_path_too_long as _, Ordering::Relaxed);
-        shared.time_fragment_presence_checking_took_in_millis.fetch_add(self.time_fragment_presence_checking_took_in_millis as _, Ordering::Relaxed);
+        shared.time_spent_fragment_presence_checking_in_nanos.fetch_add(self.time_spent_fragment_presence_checking_in_nanos as _, Ordering::Relaxed);
         shared.dirs_skipped_gitignore.fetch_add(self.dirs_skipped_gitignore as _, Ordering::Relaxed);
         shared.symlinks_followed.fetch_add(self.symlinks_followed as _, Ordering::Relaxed);
         shared.symlinks_broken.fetch_add(self.symlinks_broken as _, Ordering::Relaxed);
@@ -142,10 +174,12 @@ pub struct AtomicStats {
     pub dirs_encountered: AtomicU64,
     pub dirs_skipped_common: AtomicU64,
     pub dirs_skipped_gitignore: AtomicU64,
-    pub time_fragment_presence_checking_took_in_millis: AtomicU64,
+    pub time_spent_fragment_presence_checking_in_nanos: AtomicU64,
     pub dirs_skipped_path_too_long: AtomicU64,
     pub files_skipped_large: AtomicU64,
     pub files_skipped_as_binary_due_to_ext: AtomicU64,
+    pub files_skipped_as_binary_cached: AtomicU64,
+    pub time_spent_finding_and_printing_matches_in_nanos: AtomicU64,
     pub files_skipped_as_binary_due_to_probe: AtomicU64,
     pub files_skipped_gitignore: AtomicU64,
     pub files_skipped_by_cache: AtomicU64,
@@ -166,9 +200,11 @@ impl AtomicStats {
             files_searched: AtomicU64::new(0),
             files_contained_matches: AtomicU64::new(0),
             bytes_searched: AtomicU64::new(0),
+            files_skipped_as_binary_cached: AtomicU64::new(0),
             dirs_encountered: AtomicU64::new(0),
             dirs_skipped_common: AtomicU64::new(0),
-            time_fragment_presence_checking_took_in_millis: AtomicU64::new(0),
+            time_spent_finding_and_printing_matches_in_nanos: AtomicU64::new(0),
+            time_spent_fragment_presence_checking_in_nanos: AtomicU64::new(0),
             dirs_skipped_gitignore: AtomicU64::new(0),
             dirs_skipped_path_too_long: AtomicU64::new(0),
             files_skipped_large: AtomicU64::new(0),
@@ -186,7 +222,8 @@ impl AtomicStats {
     pub fn to_stats(&self) -> Stats {
         Stats {
             files_skipped_unreadable: 0,
-            time_fragment_presence_checking_took_in_millis: self.time_fragment_presence_checking_took_in_millis.load(Ordering::Relaxed) as _,
+            time_spent_fragment_presence_checking_in_nanos: self.time_spent_fragment_presence_checking_in_nanos.load(Ordering::Relaxed) as _,
+            time_spent_finding_and_printing_matches_in_nanos: self.time_spent_finding_and_printing_matches_in_nanos.load(Ordering::Relaxed) as _,
             dirs_skipped_path_too_long: self.dirs_skipped_path_too_long.load(Ordering::Relaxed) as _,
             files_encountered: self.files_encountered.load(Ordering::Relaxed) as _,
             node_cache_hits: self.node_cache_hits.load(Ordering::Relaxed) as _,
@@ -198,6 +235,7 @@ impl AtomicStats {
             dirs_skipped_common: self.dirs_skipped_common.load(Ordering::Relaxed) as _,
             dirs_skipped_gitignore: self.dirs_skipped_gitignore.load(Ordering::Relaxed) as _,
             files_skipped_large: self.files_skipped_large.load(Ordering::Relaxed) as _,
+            files_skipped_as_binary_cached: self.files_skipped_as_binary_cached.load(Ordering::Relaxed) as _,
             files_skipped_as_binary_due_to_ext: self.files_skipped_as_binary_due_to_ext.load(Ordering::Relaxed) as _,
             files_skipped_as_binary_due_to_probe: self.files_skipped_as_binary_due_to_probe.load(Ordering::Relaxed) as _,
             files_skipped_gitignore: self.files_skipped_gitignore.load(Ordering::Relaxed) as _,

@@ -2,10 +2,13 @@
 
 use crate::{tracy, util};
 use crate::index_::{Index_, IndexMut_};
-use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u64_unaligned_le};
+use crate::binary_verdicts;
+use crate::util::{likely, unlikely, read_u16_unaligned_le, read_u32_unaligned_le, read_u64_unaligned_le, read_u64_as_u32_and_u16_unaligned_le};
 use crate::grep::{AnyNodeScratch, AnyNodeCache, NodeCacheStats};
 use crate::parser::{BufFatPtr, BufKind, FileId, FileNode, FileType, Parser, RawFs, binary_probe, FastDivU32};
 use crate::worker::{STREAMING_CHUNK_SIZE, PendingSubdir};
+#[cfg(unix)]
+use crate::run_temperature;
 
 use super::*;
 
@@ -14,6 +17,38 @@ use std::os::fd::AsRawFd;
 use std::fs::File;
 use std::{io, mem};
 use std::ops::ControlFlow;
+
+//
+// Cross-file prefetch (see RawFs::prefetch_file_head): how much of the head of a file to hint a few
+// files before it is processed. Files up to this size are hinted whole, so both the probe read and
+// the read of the rest hit the page cache; bigger ones get their first PREFETCH_HEAD_BYTES
+// (the probe plus the start of chunk 0). Bounds the waste on files that then turn out to be binary.
+//
+#[cfg(unix)]
+const PREFETCH_HEAD_BYTES: u64 = 64 * 1024;
+
+//
+// Every file in a directory needs its inode decoded before any data is read
+// (parse_nodes_batch), and each distinct inode-table block is a synchronous 4K read: queue depth 1
+// per thread on a cold cache. The ids are known up front, so hint all the blocks at once.
+//
+// Every block hinted is one the caller is about to read anyway, so nothing is wasted. The only cost
+// is the syscall itself (one per run of adjacent blocks), which is why small batches are skipped.
+//
+#[cfg(unix)]
+const HINT_BATCH_INODES: bool = true;
+
+#[cfg(unix)]
+const HINT_SUBDIR_INODES: bool = true;
+
+#[cfg(unix)]
+const INODE_HINT_MIN_ENTRIES: usize = 16;
+
+const MAX_EXTENT_DEPTH: usize = 5;
+
+const   EXTENT_SIZE: usize = mem::size_of::<raw::Ext4Extent>();
+const    INDEX_SIZE: usize = mem::size_of::<raw::Ext4ExtentIdx>();
+const EXTENTS_START: usize = mem::size_of::<raw::Ext4ExtentHeader>();
 
 pub struct InodeBlockCache {
     pub buf: Box<[u8; 8192]>,
@@ -55,7 +90,7 @@ impl FileNode for Ext4Inode {
     }
 
     #[inline(always)]
-    fn mtime(&self) -> i64 {
+    fn mtime_sec(&self) -> i64 {
         self.mtime_sec
     }
 
@@ -139,6 +174,11 @@ impl RawFs for Ext4Fs {
     ) -> NodeCacheStats {
         let mut total = NodeCacheStats::default();
 
+        #[cfg(unix)]
+        if HINT_BATCH_INODES && entries.len() >= INODE_HINT_MIN_ENTRIES {
+            self.hint_inode_blocks(entries.iter().map(|&(file_id, _)| file_id));
+        }
+
         for &(file_id, _) in entries {
             let (node_result, stats) = self.parse_node_cached(file_id, cache);
 
@@ -179,6 +219,63 @@ impl RawFs for Ext4Fs {
     #[inline(always)]
     fn sort_subdirs_by_offset(&self, subdirs: &mut [PendingSubdir]) {
         subdirs.sort_unstable_by_key(|subdir| self.inode_disk_offset(subdir.file_id));
+
+        //
+        // These get their inode read later, when they're popped (possibly by another worker), so
+        // there's time for the hint to land. The page cache is shared between threads.
+        //
+        #[cfg(unix)]
+        if HINT_SUBDIR_INODES {
+            self.hint_inode_blocks(subdirs.iter().map(|subdir| subdir.file_id));
+        }
+    }
+
+    // Is the head of this file already in the page cache? None: can't tell yet, so callers assume cold.
+    #[cfg(unix)]
+    #[inline]
+    fn head_is_cold(&self, node: &Ext4Inode, max_size: usize) -> Option<bool> {
+        use run_temperature::{DATA, HEAD_SAMPLE_BYTES};
+
+        if DATA.want_sample() {
+            // ASSUMED: head_hint_range() gives (device byte offset of the head, _)
+            let sampled = match self.head_hint_range(node, max_size) {
+                Some((offset, _)) => {
+                    let len = HEAD_SAMPLE_BYTES.min(max_size as u64).max(1);
+                    self.sample_temperature(&DATA, offset, len, false).is_some()
+                }
+                None => false,
+            };
+
+            // Nothing to go on yet: the batch asks again on its next file
+            if !sampled && DATA.is_unknown() { return None; }
+        }
+
+        Some(!DATA.is_warm())
+    }
+
+    //
+    // Called by the worker a few files ahead of the one being processed, for files it is going
+    // to read. The inode is already decoded, and for a depth-0 extent tree the first extent
+    // lives in it, so finding the disk location costs no I/O. Deeper trees are skipped: locating
+    // their first extent needs a read, which would defeat the point.
+    //
+    #[cfg(unix)]
+    #[inline]
+    fn prefetch_file_head(&self, node: &Ext4Inode, max_size: usize) {
+        let Some((offset, len)) = self.head_hint_range(node, max_size) else {
+            return;
+        };
+
+        debug_assert!(offset + len <= self.max_block * self.sb.block_size as u64);
+
+        unsafe {
+            libc::posix_fadvise(
+                self.file.as_raw_fd(),
+                offset as libc::off_t,
+                len    as libc::off_t,
+                libc::POSIX_FADV_WILLNEED
+            );
+        }
     }
 
     #[inline]
@@ -190,6 +287,7 @@ impl RawFs for Ext4Fs {
         max_size: usize,
         kind: BufKind,
         check_binary: bool,
+        likely_binary: bool,
     ) -> io::Result<bool> {
         let _span = tracy::span!("Ext4Fs::read_file_content");
 
@@ -212,6 +310,7 @@ impl RawFs for Ext4Fs {
             node,
             size_to_read,
             check_binary,
+            likely_binary,
             buf
         )? {
             parser.get_buf_mut(kind).clear();
@@ -226,9 +325,25 @@ impl RawFs for Ext4Fs {
         #[cfg(unix)]
         const PREFETCH_AHEAD: usize = 4;
 
+        //
+        // A file read from process_files had the head of its data hinted a few files earlier
+        // or deliberately not, if that batch looked warm. Either way a chunk that lies entirely
+        // inside that range needs no second hint. Directories and other reads (kind != File) never got one,
+        // so they're hinted here.
+        //
+        #[cfg(unix)]
+        let covered = if matches!(kind, BufKind::File) { self.head_hint_range(node, size_to_read) } else { None };
+
+        #[cfg(unix)]
+        let already_hinted = |offset: u64, len: u32| {
+            covered.is_some_and(|(start, covered_len)| offset >= start && offset + len as u64 <= start + covered_len)
+        };
+
         #[cfg(unix)]
         {
             for &(offset, len) in parser.scratch_chunks.iter().take(PREFETCH_AHEAD) {
+                if already_hinted(offset, len) { continue; }
+
                 unsafe {
                     libc::posix_fadvise(
                         fd, offset as i64, len as i64,
@@ -251,11 +366,13 @@ impl RawFs for Ext4Fs {
                 let want = i + 1;
                 if want >= hinted_up_to {
                     if let Some(&(next_offset, next_len)) = parser.scratch_chunks.get(want) {
-                        unsafe {
-                            libc::posix_fadvise(
-                                fd, next_offset as i64, next_len as i64,
-                                libc::POSIX_FADV_WILLNEED
-                            );
+                        if !already_hinted(next_offset, next_len) {
+                            unsafe {
+                                libc::posix_fadvise(
+                                    fd, next_offset as i64, next_len as i64,
+                                    libc::POSIX_FADV_WILLNEED
+                                );
+                            }
                         }
                     }
 
@@ -291,8 +408,15 @@ impl RawFs for Ext4Fs {
         node: &Ext4Inode,
         max_size: usize,
         check_binary: bool,
+        likely_binary: bool,
         buf: &mut Vec<u8>,       // Destination buffer -- probed bytes get written straight in here
     ) -> io::Result<bool> {
+        #[inline]
+        fn first_read_len(block_size: usize, max_size: usize, likely_binary: bool) -> usize {
+            let cap = if likely_binary { binary_verdicts::PROBE_BYTES } else { block_size };
+            max_size.min(cap)
+        }
+
         let _span = tracy::span!("Ext4Fs::collect_file_chunks");
 
         let file_size = node.size as usize;
@@ -307,28 +431,42 @@ impl RawFs for Ext4Fs {
         scratch_chunks.clear();
 
         if node.flags & EXT4_EXTENTS_FL != 0 {
-            //
-            // Parse extents into scratch
-            //
             let block_bytes = util::cast_slice(&node.blocks);
-            self.parse_extent_node_into(scratch, scratch3, block_bytes, 0)?;
 
-            let extents = Self::scratch_as_extents(scratch);
+            //
+            // Probe before walking the whole extent tree. A depth-0 tree lives in the inode, so
+            // finding the first extent is free; a deeper one costs one block read per level down
+            // the leftmost path, instead of reading (and hinting) every index and leaf block.
+            //
+            // If the first extent can't be found cheaply we fall back and parse and then probe it
+            //
+            let mut parsed = false;
+
+            let mut first_start = if check_binary { self.first_extent_start(block_bytes) } else { None };
+
+            if check_binary && first_start.is_none() {
+                self.parse_extent_node_into(scratch, scratch3, block_bytes, 0)?;
+                parsed = true;
+
+                first_start = Self::scratch_as_extents(scratch).first().map(|e| e.start);
+            }
 
             //
             // Bytes of the very first extent already pulled into 'buf' by the probe below,
-            // still owed to the chunk-building loop as a "skip" so it doesn't re-read them.
+            // still owed to the chunk-building loop as a 'skip' so it doesn't re-read them.
             //
             let mut skip_first = 0usize;
 
-            if check_binary && let Some(first) = extents.first() {
-                // Binary check
+            if let Some(first_start) = first_start {
+                //
+                // Binary probe
+                //
 
-                let probe_len = (block_size as usize).min(max_size);
+                let probe_len = first_read_len(block_size as usize, max_size, likely_binary);
                 buf.reserve(probe_len);
                 unsafe { buf.set_len(probe_len); }  // @ProbablySafe...
 
-                let offset = first.start * block_size;
+                let offset = first_start * block_size;
                 match self.read_at_offset(buf.get_mut_(..probe_len), offset) {
                     Ok(n) => {
                         buf.truncate(n);
@@ -344,6 +482,12 @@ impl RawFs for Ext4Fs {
                     Err(_) => { buf.clear(); return Ok(true); }  // unreachable
                 }
             }
+
+            if !parsed {
+                self.parse_extent_node_into(scratch, scratch3, block_bytes, 0)?;
+            }
+
+            let extents = Self::scratch_as_extents(scratch);
 
             let mut total = 0usize;
 
@@ -373,8 +517,18 @@ impl RawFs for Ext4Fs {
 
                     if to_read == 0 { continue; }
 
+                    //
+                    // Merge disk-contiguous pieces into one chunk (fewer preads for the buffered path),
+                    // but never past what the u32 length can hold ... a contiguous file over 4 gigs
+                    // used to wrap silently here.
+                    //
+                    // The streaming path additionally splits chunks down to STREAMING_CHUNK_SIZE,
+                    // see split_chunks in worker. Most likely that should be done here for @Speed...
+                    //
                     if let Some(last) = scratch_chunks.last_mut() {
-                        if last.0 + last.1 as u64 == disk_offset {
+                        if last.0 + last.1 as u64 == disk_offset
+                        && last.1 as u64 + to_read as u64 <= u32::MAX as u64
+                        {
                             last.1 += to_read as u32;
 
                             total += to_read;
@@ -391,77 +545,83 @@ impl RawFs for Ext4Fs {
                 }
             }
 
-            Ok(true)
-        } else {
-            //
-            // Direct blocks
-            //
-
-            let blocks = node.blocks.get_(..EXT4_BLOCK_POINTERS_COUNT);
-
-            if blocks.iter().all(|&b| b == 0 || b as u64 >= self.max_block) {
-                return Ok(true);
-            }
-
-            let mut skip_first = 0usize;
-
-            if check_binary && let Some(&first) = blocks.iter().find(|&&b| b != 0 && (b as u64) < self.max_block) {
-                // Binary probe
-
-                let probe_len = (block_size as usize).min(max_size);
-                scratch2.clear();
-                scratch2.reserve(probe_len);
-                unsafe { scratch2.set_len(probe_len); }  // @ProbablySafe...
-
-                //
-                // A failed probe read here is treated as "read nothing",
-                // not as "bail out", unlike the extents branch.
-                //
-                let n = self.read_at_offset(scratch2, first as u64 * block_size).unwrap_or(0);
-
-                let probe = scratch2.get_(..n);
-
-                if binary_probe(probe, file_size) {
-                    return Ok(false); // binary
-                }
-
-                buf.extend_from_slice(probe);
-                skip_first = n;
-            }
-
-            let mut total = 0usize;
-
-            for &block_num in blocks.iter() {
-                if block_num == 0 || block_num as u64 >= self.max_block { continue; }
-                if total >= max_size { break; }
-
-                let remaining = max_size - total;
-                let mut to_read = (block_size as usize).min(remaining);
-                let mut disk_offset = block_num as u64 * block_size;
-
-                if skip_first > 0 {
-                    let skip = skip_first.min(to_read);
-                    disk_offset += skip as u64;
-                    to_read     -= skip;
-                    total       += skip;
-                    skip_first  -= skip;
-                    if to_read == 0 { continue; }
-                }
-
-                if let Some(last) = scratch_chunks.last_mut() {
-                    if last.0 + last.1 as u64 == disk_offset {
-                        last.1 += to_read as u32;
-                        total += to_read;
-                        continue;
-                    }
-                }
-
-                crate::parser::push_chunk(scratch_chunks, disk_offset, to_read as _);
-                total += to_read;
-            }
-
-            Ok(true)
+            return Ok(true)
         }
+
+        //
+        //
+        // Direct blocks
+        //
+        //
+
+        let blocks = node.blocks.get_(..EXT4_BLOCK_POINTERS_COUNT);
+
+        if blocks.iter().all(|&b| b == 0 || b as u64 >= self.max_block) {
+            return Ok(true);
+        }
+
+        let mut skip_first = 0usize;
+
+        if check_binary && let Some(&first) = blocks.iter().find(|&&b| b != 0 && (b as u64) < self.max_block) {
+            //
+            // Binary probe
+            //
+
+            let probe_len = first_read_len(block_size as usize, max_size, likely_binary);
+            scratch2.clear();
+            scratch2.reserve(probe_len);
+            unsafe { scratch2.set_len(probe_len); }  // @ProbablySafe...
+
+            //
+            // A failed probe read here is treated as 'read nothing', not as 'bail out',
+            // unlike the extents branch above.
+            //
+            let n = self.read_at_offset(scratch2, first as u64 * block_size).unwrap_or(0);
+
+            let probe = scratch2.get_(..n);
+
+            if binary_probe(probe, file_size) {
+                return Ok(false); // binary
+            }
+
+            buf.extend_from_slice(probe);
+            skip_first = n;
+        }
+
+        let mut total = 0usize;
+
+        for &block_num in blocks.iter() {
+            if block_num == 0 || block_num as u64 >= self.max_block { continue; }
+            if total >= max_size { break; }
+
+            let remaining = max_size - total;
+            let mut to_read = (block_size as usize).min(remaining);
+            let mut disk_offset = block_num as u64 * block_size;
+
+            if skip_first > 0 {
+                let skip = skip_first.min(to_read);
+                disk_offset += skip as u64;
+                to_read     -= skip;
+                total       += skip;
+                skip_first  -= skip;
+                if to_read == 0 { continue; }
+            }
+
+            if let Some(last) = scratch_chunks.last_mut() {
+                if last.0 + last.1 as u64 == disk_offset
+                    && last.1 as u64 + to_read as u64 <= u32::MAX as u64
+                {
+                    last.1 += to_read as u32;
+                    total += to_read;
+                    continue;
+                }
+            }
+
+            crate::parser::push_chunk(scratch_chunks, disk_offset, to_read as _);
+            total += to_read;
+        }
+
+        Ok(true)
     }
 
     fn with_directory_entries<R>(
@@ -627,117 +787,152 @@ impl Ext4Fs {
     ) -> io::Result<()> {
         let _span = tracy::span!("Ext4Fs::parse_extent_node");
 
-        if unlikely(data.len() < mem::size_of::<raw::Ext4ExtentHeader>()) {
+        if unlikely(data.len() < EXTENTS_START) {
             return Ok(());
         }
 
-        const EXT4_MAX_EXTENT_DEPTH: usize = 5;
-        if unlikely(level > EXT4_MAX_EXTENT_DEPTH) {
+        if unlikely(level > MAX_EXTENT_DEPTH) {
             return Ok(());
         }
 
-        //
-        // SAFETY: bounds checked above. read_unaligned makes the alignment
-        // of `data` irrelevant, so a stack allocated `probe` array
-        // (1 byte aligned) is fine here.
-        //
-        let word       = read_u64_unaligned_le(data, 0);
-        let eh_magic   = word as u16;
-        let eh_entries = (word >> 16) as u16;
-        let eh_depth   = (word >> 48) as u16;
-
-        if unlikely(u16::from_le(eh_magic) != EXT4_EXTENT_MAGIC) {
+        let Some((eh_entries, eh_depth)) = parse_extent_header(data) else {
             return Ok(());
-        }
+        };
 
-        scratch.reserve(eh_entries as usize * mem::size_of::<raw::Ext4Extent>());
+        scratch.reserve(eh_entries as usize * EXTENT_SIZE);
 
         if eh_depth == 0 {
-            let extent_size   = mem::size_of::<raw::Ext4Extent>();
-            let extents_start = mem::size_of::<raw::Ext4ExtentHeader>();
+            for_each_valid_leaf_extent(data, eh_entries, |start, len| {
+                let extent = Ext4Extent { start, len, _pad: [0; 6] };
+                let bytes  = util::cast_slice(core::slice::from_ref(&extent));
+                scratch.extend_from_slice(bytes);
+                false  // Keep collecting
+            });
 
-            for i in 0..eh_entries as usize {
-                let offset = extents_start + i * extent_size;
-                if unlikely(offset + extent_size > data.len()) {
-                    break;
-                }
-
-                let word = read_u64_unaligned_le(data, offset + 4);
-
-                let ee_len      = word as u16;
-                let ee_start_hi = ((word >> 16) & 0xFFFF)      as u16;
-                let ee_start_lo = ((word >> 32) & 0xFFFF_FFFF) as u32;
-
-                let start_block = ((ee_start_hi as u64) << 32) | (ee_start_lo as u64);
-
-                if likely(ee_len > 0 && ee_len <= 32768) {
-                    let extent = Ext4Extent {
-                        start: start_block,
-                        len: ee_len,
-                        _pad: [0; 6],
-                    };
-
-                    let bytes = util::cast_slice(core::slice::from_ref(&extent));
-                    scratch.extend_from_slice(bytes);
-                }
-            }
-        } else {
-            const INDEX_SIZE:    usize = mem::size_of::<raw::Ext4ExtentIdx>();
-            const INDICES_START: usize = mem::size_of::<raw::Ext4ExtentHeader>();
-
-            let mark = child_blocks.len();
-
-            for i in 0..eh_entries as usize {
-                let offset = INDICES_START + i * INDEX_SIZE;
-                if unlikely(offset + INDEX_SIZE > data.len()) {
-                    break;
-                }
-
-                let ei_leaf_lo = read_u32_unaligned_le(data, offset + 4);
-                let ei_leaf_hi = read_u16_unaligned_le(data, offset + 8);
-
-                let leaf_block = ((ei_leaf_hi as u64) << 32) | (ei_leaf_lo as u64);
-                child_blocks.push(leaf_block);
-            }
-
-            let block_size = self.sb.block_size as u64;
-
-            #[cfg(unix)]
-            {
-                let fd = self.device_file().as_raw_fd();
-                for &cb in &child_blocks[mark..] {
-                    unsafe {
-                        libc::posix_fadvise(
-                            fd,
-                            (cb * block_size) as libc::off_t,
-                            block_size as libc::off_t,
-                            libc::POSIX_FADV_WILLNEED,
-                        );
-                    }
-                }
-            }
-
-            let count = child_blocks.len() - mark;
-
-            let mut probe = std::mem::MaybeUninit::<[u8; 8192]>::uninit();  // ext4 block size is at most 8192 bytes  // @Memory @Speed
-
-            for child in 0..count {
-                let child_block = child_blocks[mark + child];
-
-                let probe = unsafe {
-                    std::slice::from_raw_parts_mut(probe.as_mut_ptr() as *mut u8, block_size as usize)
-                };
-
-                let offset = child_block * block_size;
-                if self.read_at_offset(probe, offset).is_ok() {
-                    self.parse_extent_node_into(scratch, child_blocks, probe, level + 1)?;
-                }
-            }
-
-            child_blocks.truncate(mark);
+            return Ok(());
         }
 
+        let mark = child_blocks.len();
+
+        for i in 0..eh_entries as usize {
+            match extent_index_child_block(data, i) {
+                Some(leaf_block) => child_blocks.push(leaf_block),
+                None => break,
+            }
+        }
+
+        let block_size = self.sb.block_size as u64;
+
+        //
+        // Queue every child index block up front so they load concurrently while we work
+        // through them in order below.
+        //
+        #[cfg(unix)]
+        {
+            let fd = self.device_file().as_raw_fd();
+            for &cb in &child_blocks[mark..] {
+                unsafe {
+                    libc::posix_fadvise(
+                        fd,
+                        (cb * block_size) as libc::off_t,
+                        block_size as libc::off_t,
+                        libc::POSIX_FADV_WILLNEED,
+                    );
+                }
+            }
+        }
+
+        let count = child_blocks.len() - mark;
+
+        let mut probe = std::mem::MaybeUninit::<[u8; 8192]>::uninit();  // ext4 block size is at most 8192 bytes  // @Memory @Speed
+
+        for child in 0..count {
+            let child_block = child_blocks[mark + child];
+
+            let probe = unsafe {
+                std::slice::from_raw_parts_mut(probe.as_mut_ptr() as *mut u8, block_size as usize)
+            };
+
+            let offset = child_block * block_size;
+            if self.read_at_offset(probe, offset).is_ok() {
+                self.parse_extent_node_into(scratch, child_blocks, probe, level + 1)?;
+            }
+        }
+
+        child_blocks.truncate(mark);
+
         Ok(())
+    }
+
+    /// (start block, length in blocks) of the first valid extent of a depth-0 extent tree,
+    /// i.e. one that lives entirely in the inode's block array.
+    //
+    /// Never does I/O; None for deeper trees or when there is no valid extent.
+    /// Same validity rules as parse_extent_node_into.
+    #[cfg(unix)]
+    #[inline]
+    fn first_inline_extent(data: &[u8]) -> Option<(u64, u16)> {
+        if unlikely(data.len() < EXTENTS_START) { return None; }
+
+        let (eh_entries, eh_depth) = parse_extent_header(data)?;
+        if unlikely(eh_depth != 0) { return None; }
+
+        let mut result = None;
+        for_each_valid_leaf_extent(data, eh_entries, |start, len| {
+            result = Some((start, len));
+            true
+        });
+        result
+    }
+
+    /// Start block of the leftmost valid extent, found by walking only the leftmost path of the
+    /// extent tree: no I/O for a depth-0 tree (it lives in the inode), one block read per level otherwise.
+    ///
+    /// Returns None whenever it can't decide cheaply, because of a corrupt header, unreadable block, or a
+    /// leftmost leaf with no valid extent -- and the caller falls back to parsing the whole tree.
+    fn first_extent_start(&self, block_bytes: &[u8]) -> Option<u64> {
+        let _span = tracy::span!("Ext4Fs::first_extent_start");
+
+        let block_size = self.sb.block_size as usize;
+        if unlikely(block_size > 8192) { return None; }
+
+        let mut block = std::mem::MaybeUninit::<[u8; 8192]>::uninit();  // ext4 block size is at most 8192 bytes
+
+        let block = unsafe {
+            std::slice::from_raw_parts_mut(block.as_mut_ptr() as *mut u8, block_size)
+        };
+
+        let mut data: &[u8] = block_bytes;
+
+        for level in 0..=MAX_EXTENT_DEPTH {
+            if unlikely(data.len() < EXTENTS_START) { return None; }
+
+            let (eh_entries, eh_depth) = parse_extent_header(data)?;
+            if unlikely(eh_entries == 0) { return None; }
+
+            if eh_depth == 0 {
+                let mut result = None;
+                for_each_valid_leaf_extent(data, eh_entries, |start, _len| {
+                    result = Some(start);
+                    true
+                });
+                return result;
+            }
+
+            if level == MAX_EXTENT_DEPTH { return None; }
+
+            let leaf_block = extent_index_child_block(data, 0)?;
+
+            // 'data' is done with here, so the buffer can be reused for the next level
+            match self.read_at_offset(block, leaf_block * block_size as u64) {
+                Ok(n) if n == block_size => {}
+                _ => return None,
+            }
+
+            data = &*block;
+        }
+
+        None
     }
 
     /// Decode one inode from a byte slice already containing its raw record.
@@ -788,4 +983,227 @@ impl Ext4Fs {
 
         Ext4Inode { inode_num, mode, size, flags, mtime_sec, blocks }
     }
+}
+
+impl Ext4Fs {
+    /// Disk range (byte offset, length) worth hinting for the first read of this file: the whole file
+    /// if it is at most PREFETCH_HEAD_BYTES, else its first PREFETCH_HEAD_BYTES, clipped to the first extent.
+    ///
+    /// The inode is already decoded and a depth-0 extent tree lives in it, so this costs no I/O.
+    ///
+    /// None when there's nothing to hint or the location can't be known without a read
+    /// (deeper trees / inline data / empty files / etc).
+    #[cfg(unix)]
+    #[inline]
+    fn head_hint_range(&self, node: &Ext4Inode, max_size: usize) -> Option<(u64, u64)> {
+        if PREFETCH_HEAD_BYTES == 0 || max_size == 0 || node.flags & EXT4_INLINE_DATA_FL != 0 {
+            return None;
+        }
+
+        let block_size = self.sb.block_size as u64;
+
+        let (start_block, extent_bytes) = if node.flags & EXT4_EXTENTS_FL != 0 {
+            let (start, len) = Self::first_inline_extent(util::cast_slice(&node.blocks))?;
+            (start, len as u64 * block_size)
+
+        } else {
+            //
+            // Block-mapped file: the probe reads the first mapped direct block
+            //
+
+            let first = *node.blocks.iter()
+                .take(EXT4_BLOCK_POINTERS_COUNT)
+                .find(|&&b| b != 0 && (b as u64) < self.max_block)?;
+
+            (first as u64, block_size)
+        };
+
+        let len = (max_size as u64).min(PREFETCH_HEAD_BYTES).min(extent_bytes);
+
+        Some((start_block * block_size, len))
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn is_page_cached(&self, _offset: u64) -> Option<bool> { None }
+
+    /// Answers the question 'is the page at this device offset in the page cache?' without any I/O,
+    /// via a one-byte preadv2(RWF_NOWAIT), which fails with EAGAIN instead of waiting for the disk.
+    ///
+    /// None if can't tell
+    #[cfg(target_os = "linux")]
+    fn is_page_cached(&self, offset: u64) -> Option<bool> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static NOWAIT_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+        if NOWAIT_UNSUPPORTED.load(Ordering::Relaxed) { return None; }
+
+        let mut byte = 0u8;
+        let iov = libc::iovec { iov_base: &mut byte as *mut u8 as *mut libc::c_void, iov_len: 1 };
+
+        let n = unsafe {
+            libc::preadv2(self.file.as_raw_fd(), &iov, 1, offset as libc::off_t, libc::RWF_NOWAIT)
+        };
+
+        if n >= 0 { return Some(true); }
+
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) => Some(false),
+            Some(libc::EINTR)  => None,
+            _ => {
+                NOWAIT_UNSUPPORTED.store(true, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// WILLNEED for the disk blocks holding these inodes, as few fadvise calls as possible: blocks
+    /// that are equal or adjacent (the common case once ids are sorted by inode_disk_offset)
+    /// collapse into one range. Unsorted input is still correct, just coalesces less.
+    #[cfg(unix)]
+    fn hint_inode_blocks(&self, file_ids: impl Iterator<Item = FileId>) {
+        use run_temperature::INODES;
+
+        let mut want_sample = INODES.want_sample();
+
+        if INODES.is_warm() && !want_sample { return; }
+
+        let fd         = self.file.as_raw_fd();
+        let block_size = self.sb.block_size as u64;
+
+        let flush = |start: u64, end: u64| {
+            if end > start {
+                run_temperature::note_inode_hint(start, end - start);
+
+                unsafe {
+                    libc::posix_fadvise(
+                        fd, start as libc::off_t, (end - start) as libc::off_t,
+                        libc::POSIX_FADV_WILLNEED
+                    );
+                }
+            }
+        };
+
+        let mut start = 0u64;  // Current run is [start, end), empty while start == end
+        let mut end   = 0u64;
+        let mut tries = 0u32;
+
+        for file_id in file_ids {
+            if unlikely(file_id == 0) { continue; }  // Poisoned...
+
+            let offset      = self.inode_disk_offset(file_id);
+            let block_start = offset - offset % block_size;
+
+            //
+            // One look at the first usable block decides the batch: if it's cached and we're warm,
+            // hinting would be pure syscall overhead. A block we hinted ourselves says nothing, so
+            // that sample is skipped and the next block is tried (a few times at most).
+            //
+            if want_sample {
+                tries += 1;
+
+                match self.sample_temperature(&INODES, block_start, block_size, true) {
+                    Some(hit) => {
+                        want_sample = false;
+                        if hit && INODES.is_warm() { return; }
+                    }
+                    None if tries >= 4 => {
+                        want_sample = false;
+                        if INODES.is_warm() { return; }  // Warm and can't check: don't hint
+                    }
+                    None => {}
+                }
+            }
+
+            if block_start >= start && block_start < end   { continue; }                     // Already covered
+            if block_start == end   && end         > start { end += block_size; continue; }  // Adjacent, extend
+
+            flush(start, end);
+
+            start = block_start;
+            end   = block_start + block_size;
+        }
+
+        flush(start, end);
+    }
+
+    #[cfg(unix)]
+    fn cache_residency(&self, offset: u64, len: u64) -> Option<(u32, u32)> {
+        if let Some(r) = run_temperature::cachestat::residency(self.file.as_raw_fd(), offset, len) {
+            return Some(r);
+        }
+
+        #[cfg(target_os = "linux")] {
+            self.is_page_cached(offset).map(|cached| (cached as u32, 1))
+        }
+
+        #[cfg(not(target_os = "linux"))] { None }
+    }
+
+    #[cfg(unix)]
+    fn sample_temperature(
+        &self,
+        temp: &run_temperature::Temperature,
+        offset: u64, len: u64,
+        avoid_own_hints: bool,
+    ) -> Option<bool> {
+        if avoid_own_hints && run_temperature::recently_hinted(offset, len) {
+            return None;
+        }
+
+        let (cached, total) = self.cache_residency(offset, len)?;
+        let hit = run_temperature::is_hit(cached, total);
+
+        temp.observe(hit);
+        Some(hit)
+    }
+}
+
+#[inline(always)]
+fn parse_extent_header(data: &[u8]) -> Option<(u16, u16)> {
+    let word     = read_u64_unaligned_le(data, 0);
+    let eh_magic = word as u16;
+
+    if unlikely(u16::from_le(eh_magic) != EXT4_EXTENT_MAGIC) {
+        return None;
+    }
+
+    Some(((word >> 16) as u16, (word >> 48) as u16))
+}
+
+/// Walks up to 'eh_entries' leaf extent records starting at EXTENTS_START in 'data',
+/// calling 'f(start, len)' for each one with a valid ee_len (0 < ee_len <= 32768).
+///
+/// Stops as soon as 'f' returns true.
+#[inline(always)]
+fn for_each_valid_leaf_extent(data: &[u8], eh_entries: u16, mut f: impl FnMut(u64, u16) -> bool) {
+    for i in 0..eh_entries as usize {
+        let offset = EXTENTS_START + i * EXTENT_SIZE;
+        if unlikely(offset + EXTENT_SIZE > data.len()) {
+            break;
+        }
+
+        let word   = read_u64_unaligned_le(data, offset + 4);
+        let ee_len = word as u16;
+
+        if likely(ee_len > 0 && ee_len <= 32768) {
+            let ee_start_hi = (word >> 16) & 0xFFFF;
+            let ee_start_lo = (word >> 32) & 0xFFFF_FFFF;
+
+            if f((ee_start_hi << 32) | ee_start_lo, ee_len) {
+                break;
+            }
+        }
+    }
+}
+
+/// The child block referenced by index entry 'i' in 'data', or None if out of bounds.
+#[inline(always)]
+fn extent_index_child_block(data: &[u8], i: usize) -> Option<u64> {
+    let offset = EXTENTS_START + i * INDEX_SIZE;
+    if unlikely(offset + INDEX_SIZE > data.len()) {
+        return None;
+    }
+
+    let (ei_leaf_lo, ei_leaf_hi) = read_u64_as_u32_and_u16_unaligned_le(data, offset + 4);
+    Some(((ei_leaf_hi as u64) << 32) | (ei_leaf_lo as u64))
 }
