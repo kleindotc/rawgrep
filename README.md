@@ -52,12 +52,12 @@ The following searches are performed against a full clone of the [Chromium sourc
 
 **Pattern: `(?i)\bTODO\((?:crbug\.com/\d+|[a-zA-Z][\w.-]*)\)`**
 
-| Scenario                  | rawgrep      | ripgrep          | hypergrep        |
-| ------------------------- | ------------ | ---------------- | ---------------- |
-| warm, with fragment cache | **122.7 ms** | 385.6 ms (3.14x) | 362.7 ms (2.95x) |
-| warm, no fragment cache   | **309.1 ms** | 385.4 ms (1.25x) | 364.0 ms (1.18x) |
-| cold, no fragment cache   | **8.629 s**  | 11.911 s (1.38x) | 10.243 s (1.19x) |
-| cold, with fragment cache | **2.495 s**  | 11.930 s (4.78x) | 10.241 s (4.11x) |
+| Scenario                   | rawgrep           | ripgrep           | hypergrep          |
+|:---------------------------|------------------:|------------------:|-------------------:|
+| warm, with fragment cache  | **106.7 ms**      | 367.9 ms (3.45×)  | 358.5 ms (3.36×)  |
+| warm, no fragment cache    | **303.6 ms**      | 368.4 ms (1.21×)  | 360.6 ms (1.19×)  |
+| cold, no fragment cache    | **8.700 s**       | 11.928 s (1.37×) | 10.252 s (1.18×) |
+| cold, with fragment cache  | **1.961 s**       | 11.927 s (6.08×) | 10.261 s (5.23×) |
 
 ### Codebase Search: `Linux 7.3.0-rc1` (~95K files)
 
@@ -65,21 +65,21 @@ The following searches are performed against a full clone of the [Linux kernel s
 
 **Pattern: `TODO`**
 
-| Scenario                        | rawgrep          | ripgrep          | hypergrep        |
-|:--------------------------------|-----------------:|-----------------:|-----------------:|
-| warm, with fragment cache       | **53.4 ms**      | 101.4 ms (1.90×) | 127.5 ms (2.39×) |
-| warm, no fragment cache         | 152.0 ms (1.50×) | **101.7 ms**     | 129.8 ms (1.28×) |
-| cold, no fragment cache         | **3.172 s**      | 3.519 s (1.11×)  | 3.366 s (1.06×)  |
-| cold, with fragment cache       | **447.1 ms**     | 3.533 s (7.90×)  | 3.353 s (7.50×)  |
+| Scenario                    | rawgrep           | ripgrep           | hypergrep          |
+|:---------------------------|------------------:|------------------:|-------------------:|
+| warm, with fragment cache  | **53.2 ms**       | 102.1 ms (1.92×)  | 129.4 ms (2.43×)  |
+| warm, no fragment cache    | 152.4 ms (1.49×)  | **102.0 ms**      | 127.7 ms (1.25×)  |
+| cold, no fragment cache    | **3.145 s**       | 3.510 s (1.12×)  | 3.390 s (1.08×)  |
+| cold, with fragment cache  | **434.4 ms**      | 3.524 s (8.11×)  | 3.360 s (7.73×)  |
 
 **Pattern: `[A-Z]+_SUSPEND`**
 
-| Scenario                        | rawgrep          | ripgrep          | hypergrep        |
-|:--------------------------------|-----------------:|-----------------:|-----------------:|
-| warm, with fragment cache       | **60.0 ms**      | 108.1 ms (1.80×) | 137.0 ms (2.28×) |
-| warm, no fragment cache         | 159.2 ms (1.47×) | **108.3 ms**     | 138.7 ms (1.28×) |
-| cold, no fragment cache         | **3.196 s**      | 3.524 s (1.10×)  | 3.364 s (1.05×)  |
-| cold, with fragment cache       | **471.3 ms**     | 3.549 s (7.53×)  | 3.378 s (7.17×)  |
+| Scenario                    | rawgrep           | ripgrep           | hypergrep          |
+|:---------------------------|------------------:|------------------:|-------------------:|
+| warm, with fragment cache  | **59.6 ms**       | 107.4 ms (1.80×)  | 137.2 ms (2.30×)  |
+| warm, no fragment cache    | 160.0 ms (1.49×)  | **107.4 ms**      | 138.1 ms (1.29×)  |
+| cold, no fragment cache    | **3.167 s**       | 3.523 s (1.11×)  | 3.381 s (1.07×)  |
+| cold, with fragment cache  | **458.4 ms**      | 3.538 s (7.72×)  | 3.385 s (7.38×)  |
 
 ### Codebase Search: `Chromium` `rawgrep` (rev `74def34`) **against FFF (fff-cli 0.1.0 rev `8b9930e`) Comparison**
 
