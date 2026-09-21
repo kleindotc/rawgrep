@@ -784,14 +784,12 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         if likely(path_end > path_start) {
             let bytes = self.path_arena.slice(path_start, path_end);
-            let last_segment = bytes
-                .iter()
-                .rposition(|&b| b == MAIN_SEPARATOR as _)
+            let last_segment = memchr::memrchr(MAIN_SEPARATOR as _, bytes)
                 .map(|pos| bytes.get_(pos + 1..))
                 .unwrap_or(bytes);
 
             if !self.cli.should_ignore_reserved_tool_dir_filter() && is_reserved_tool_dir(last_segment) {
-                self.stats.dirs_skipped_common += 1;
+                self.stats.dirs_skipped_reserved += 1;
                 return Ok(());
             }
         }
@@ -867,7 +865,12 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
             match ft {
                 FileType::Dir => {
-                    if skip_reserved && is_reserved_tool_dir(name_bytes) {
+                    let last_segment = memchr::memrchr(MAIN_SEPARATOR as _, name_bytes)
+                        .and_then(|pos| name_bytes.get(pos + 1..))
+                        .unwrap_or(name_bytes);
+
+                    if skip_reserved && is_reserved_tool_dir(last_segment) {
+                        self.stats.dirs_skipped_reserved += 1;
                         continue;
                     }
 
@@ -1115,20 +1118,14 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         Ok(())
     }
 
-    /// (known-binary-from-an-earlier-run, likely-binary)
     #[inline]
-    fn binary_hints(&self, file_identifier: FileIdentifier, name: &[u8]) -> (bool, bool) {
+    fn binary_hints(&self, file_identifier: FileIdentifier, file_ext_or_name: &[u8]) -> (bool, bool) {
         let known = !self.binary_verdicts.is_empty() &&
             self.binary_verdicts.is_binary(binary_verdicts::fingerprint(
                 file_identifier
             ));
 
-        use binary_worker_table::Verdict;
-        let likely = known || match binary_worker_table::verdict(name) {
-            Verdict::Binary  => true,
-            Verdict::Text    => false,
-            Verdict::Unknown => self.dir_tally.likely_binary(),
-        };
+        let likely = known || binary_worker_table::likely_binary(file_ext_or_name, &self.dir_tally);
 
         (known, likely)
     }
@@ -1218,8 +1215,12 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             return Ok(());
         }
 
-        let file_name       = self.parser.buf_ptr(file_name_ptr);
-        let file_identifier = self.fs.file_identifier(node);
+        let file_name        = self.parser.buf_ptr(file_name_ptr);
+        let file_identifier  = self.fs.file_identifier(node);
+        let file_ext_pos     = memchr::memrchr(b'.', file_name);
+        let file_ext_or_name = file_ext_pos
+            .and_then(|p| if p + 1 < file_name.len() { Some(file_name.get_(p + 1..)) } else { None })
+            .unwrap_or(file_name);
 
         if let Some(cache) = self.cache {
             let skip = match pre.cache_skip {
@@ -1235,7 +1236,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
 
         let check_binary = !self.cli.should_search_binary();
 
-        if check_binary && is_binary_ext(file_name) {
+        if check_binary && is_binary_ext(file_ext_or_name) {
             self.stats.files_skipped_as_binary_due_to_ext += 1;
             return Ok(());
         }
@@ -1291,8 +1292,13 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
         if check_binary {
             let rejected = self.stats.files_skipped_as_binary_due_to_probe != rejected_before;
 
-            let name = self.parser.buf_ptr(file_name_ptr);
-            binary_worker_table::record(name, node.file_id(), rejected);
+            let file_name = self.parser.buf_ptr(file_name_ptr);
+            let file_ext_or_name = file_ext_pos
+                .and_then(|p| if p + 1 < file_name.len() { Some(file_name.get_(p + 1..)) } else { None })
+                .unwrap_or(file_name);
+
+            binary_worker_table::record(file_ext_or_name, node.file_id(), rejected);
+
             self.dir_tally.record(rejected);
 
             if rejected {

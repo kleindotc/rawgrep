@@ -26,8 +26,8 @@ pub struct Stats {
     pub files_skipped_as_binary_due_to_probe: u32,
     pub files_skipped_gitignore: u32,
     pub files_skipped_unreadable: u32,
-    pub dirs_skipped_common: u32,
     pub dirs_skipped_gitignore: u32,
+    pub dirs_skipped_reserved: u32,
     pub symlinks_followed: u32,
     pub symlinks_broken: u32,
 }
@@ -36,9 +36,7 @@ impl Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let total_files = self.files_encountered;
 
-        let total_dirs = self.dirs_encountered
-            + self.dirs_skipped_common
-            + self.dirs_skipped_gitignore;
+        let total_dirs = self.dirs_encountered;
 
         let total_symlinks = self.symlinks_followed + self.symlinks_broken;
 
@@ -94,8 +92,8 @@ impl Display for Stats {
         }
 
         dir_row!("Dirs encountered", self.dirs_encountered);
-        dir_row!("Skipped (common)", self.dirs_skipped_common);
         dir_row!("Skipped (gitignore)", self.dirs_skipped_gitignore);
+        dir_row!("Skipped (reserved)", self.dirs_skipped_reserved);
         if self.dirs_skipped_path_too_long > 0 {
             dir_row!("Skipped (path too long)", self.dirs_skipped_path_too_long);
         }
@@ -155,10 +153,10 @@ impl Stats {
         shared.files_skipped_by_cache.fetch_add(self.files_skipped_by_cache as _, Ordering::Relaxed);
         shared.files_contained_matches.fetch_add(self.files_contained_matches as _, Ordering::Relaxed);
         shared.dirs_encountered.fetch_add(self.dirs_encountered as _, Ordering::Relaxed);
-        shared.dirs_skipped_common.fetch_add(self.dirs_skipped_common as _, Ordering::Relaxed);
         shared.dirs_skipped_path_too_long.fetch_add(self.dirs_skipped_path_too_long as _, Ordering::Relaxed);
         shared.time_spent_fragment_presence_checking_in_nanos.fetch_add(self.time_spent_fragment_presence_checking_in_nanos as _, Ordering::Relaxed);
         shared.dirs_skipped_gitignore.fetch_add(self.dirs_skipped_gitignore as _, Ordering::Relaxed);
+        shared.dirs_skipped_reserved.fetch_add(self.dirs_skipped_reserved as _, Ordering::Relaxed);
         shared.symlinks_followed.fetch_add(self.symlinks_followed as _, Ordering::Relaxed);
         shared.symlinks_broken.fetch_add(self.symlinks_broken as _, Ordering::Relaxed);
     }
@@ -172,8 +170,8 @@ pub struct AtomicStats {
     pub node_cache_misses: AtomicU64,
     pub node_cache_hits: AtomicU64,
     pub dirs_encountered: AtomicU64,
-    pub dirs_skipped_common: AtomicU64,
     pub dirs_skipped_gitignore: AtomicU64,
+    pub dirs_skipped_reserved: AtomicU64,
     pub time_spent_fragment_presence_checking_in_nanos: AtomicU64,
     pub dirs_skipped_path_too_long: AtomicU64,
     pub files_skipped_large: AtomicU64,
@@ -202,10 +200,10 @@ impl AtomicStats {
             bytes_searched: AtomicU64::new(0),
             files_skipped_as_binary_cached: AtomicU64::new(0),
             dirs_encountered: AtomicU64::new(0),
-            dirs_skipped_common: AtomicU64::new(0),
             time_spent_finding_and_printing_matches_in_nanos: AtomicU64::new(0),
             time_spent_fragment_presence_checking_in_nanos: AtomicU64::new(0),
             dirs_skipped_gitignore: AtomicU64::new(0),
+            dirs_skipped_reserved: AtomicU64::new(0),
             dirs_skipped_path_too_long: AtomicU64::new(0),
             files_skipped_large: AtomicU64::new(0),
             files_skipped_as_binary_due_to_ext: AtomicU64::new(0),
@@ -232,8 +230,8 @@ impl AtomicStats {
             files_contained_matches: self.files_contained_matches.load(Ordering::Relaxed) as _,
             bytes_searched: self.bytes_searched.load(Ordering::Relaxed) as _,
             dirs_encountered: self.dirs_encountered.load(Ordering::Relaxed) as _,
-            dirs_skipped_common: self.dirs_skipped_common.load(Ordering::Relaxed) as _,
             dirs_skipped_gitignore: self.dirs_skipped_gitignore.load(Ordering::Relaxed) as _,
+            dirs_skipped_reserved: self.dirs_skipped_reserved.load(Ordering::Relaxed) as _,
             files_skipped_large: self.files_skipped_large.load(Ordering::Relaxed) as _,
             files_skipped_as_binary_cached: self.files_skipped_as_binary_cached.load(Ordering::Relaxed) as _,
             files_skipped_as_binary_due_to_ext: self.files_skipped_as_binary_due_to_ext.load(Ordering::Relaxed) as _,

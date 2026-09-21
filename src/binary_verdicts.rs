@@ -45,13 +45,13 @@ impl<T> std::ops::Deref for CachePad<T> {
 
 // What the binary probe looks at. For a file we expect to be rejected, this is all we want to
 // fetch upfront, both as a prefetch hint and as the first read.
-pub const PROBE_BYTES: usize = 4096;
+pub const PROBE_BYTES: usize = 2 * 1024;
 
-pub const SLOTS: usize = 512;
+pub const SLOT_COUNT: usize = 512;
 
 // Per-slot: high 16 bits = files rejected by the probe, low 16 = files accepted.
 // Collisions between extensions only blur a heuristic, therefore nothing depends on this being exact.
-static TABLE: [CachePad<AtomicU32>; SLOTS] = [const { CachePad(AtomicU32::new(0)) }; SLOTS];
+static WORKER_TABLE: [CachePad<AtomicU32>; SLOT_COUNT] = [const { CachePad(AtomicU32::new(0)) }; SLOT_COUNT];
 
 use binary_worker_table::*;
 
@@ -74,27 +74,22 @@ pub mod binary_worker_table {
     pub enum Verdict { Unknown, Text, Binary }
 
     #[inline]
-    fn slot(name: &[u8]) -> &'static AtomicU32 {
-        let ext = match name.iter().rposition(|&b| b == b'.') {
-            Some(p) if p + 1 < name.len() => &name[p + 1..],
-            _ => &name[..0],
-        };
-
+    fn slot(file_ext_or_name: &[u8]) -> &'static AtomicU32 {
         // fnv1a over at most 8 lowercase bytes
         let mut h = 0x811c_9dc5u32;
-        for &b in ext.iter().take(8) {
+        for &b in file_ext_or_name.iter().take(8) {
             h = (h ^ b.to_ascii_lowercase() as u32).wrapping_mul(0x0100_0193);
         }
 
-        &TABLE[(h as usize) & (SLOTS - 1)]
+        &WORKER_TABLE[(h as usize) & (SLOT_COUNT - 1)]
     }
 
     /// What this file's extension says: rejected by the probe often enough to be probably binary,
     /// accepted often enough to be probably text, or not enough to tell
     /// (this includes extensionless files, which all share one slot and are usually a mix...?).
     #[inline]
-    pub fn verdict(name: &[u8]) -> Verdict {
-        let v = slot(name).load(Relaxed);
+    pub fn verdict(file_ext_or_name: &[u8]) -> Verdict {
+        let v = slot(file_ext_or_name).load(Relaxed);
         let (binary, text) = (v >> 16, v & 0xFFFF);
 
         if      binary >= 4 && binary >= 8 * text   { Verdict::Binary }
@@ -111,8 +106,8 @@ pub mod binary_worker_table {
     /// A clear 'text' verdict is never overridden, so a stray .c file in a directory full of objects
     /// is still being fully read.
     #[inline]
-    pub fn likely_binary(name: &[u8], dir: &DirTally) -> bool {
-        match verdict(name) {
+    pub fn likely_binary(file_ext_or_name: &[u8], dir: &DirTally) -> bool {
+        match verdict(file_ext_or_name) {
             Verdict::Binary  => true,
             Verdict::Text    => false,
             Verdict::Unknown => dir.likely_binary(),
@@ -121,8 +116,8 @@ pub mod binary_worker_table {
 
     /// Record one probe outcome (binary = the probe rejected the file).
     #[inline]
-    pub fn record(name: &[u8], file_id: u64, binary: bool) {
-        let s = slot(name);
+    pub fn record(file_ext_or_name: &[u8], file_id: u64, binary: bool) {
+        let s = slot(file_ext_or_name);
         let v = s.load(Relaxed);
         let (bin, text) = (v >> 16, v & 0xFFFF);
 
@@ -246,15 +241,15 @@ impl BinaryVerdicts {
         let u64_at = |o: usize| buf.get(o..o.checked_add(8)?).map(|b| read_u64_unaligned_le(b, 0));
 
         if u32_at(0)? != MAGIC || u32_at(4)? != VERSION { return None; }
-        if u32_at(8)? as usize != SLOTS                 { return None; }
+        if u32_at(8)? as usize != SLOT_COUNT            { return None; }
 
         let mut off = 12;
 
-        let mut table = [0u32; SLOTS];
+        let mut table = [0u32; SLOT_COUNT];
         for (i, t) in table.iter_mut().enumerate() {
             *t = u32_at(off + i * 4)?;
         }
-        off += SLOTS * 4;
+        off += SLOT_COUNT * 4;
 
         let count = u64_at(off)? as usize;
         off += 8;
@@ -278,13 +273,11 @@ impl BinaryVerdicts {
         {
             let saved = &table;
 
-            if saved.len() == SLOTS {
-                for (s, &v) in TABLE.iter().zip(saved) {
-                    let (bin, text) = (v >> 16, v & 0xFFFF);
-                    let scale = ((bin + text) / (2 * SETTLED_AT)).max(1);
+            for (s, &v) in WORKER_TABLE.iter().zip(saved) {
+                let (bin, text) = (v >> 16, v & 0xFFFF);
+                let scale = ((bin + text) / (2 * SETTLED_AT)).max(1);
 
-                    s.store(((bin / scale) << 16) | (text / scale), Relaxed);
-                }
+                s.store(((bin / scale) << 16) | (text / scale), Relaxed);
             }
         }
 
@@ -359,14 +352,14 @@ impl BinaryVerdicts {
         let table = {
             use std::mem::MaybeUninit;
 
-            let mut out: [MaybeUninit<_>; SLOTS] = unsafe { MaybeUninit::uninit().assume_init() };
+            let mut out: [MaybeUninit<_>; SLOT_COUNT] = unsafe { MaybeUninit::uninit().assume_init() };
 
-            for (o, s) in out.iter_mut().zip(TABLE.iter()) {
+            for (o, s) in out.iter_mut().zip(WORKER_TABLE.iter()) {
                 o.write(s.load(Relaxed));
             }
 
-            const _: () = assert!(TABLE.len() == SLOTS);
-            unsafe { std::mem::transmute::<[std::mem::MaybeUninit<u32>; 512], [u32; SLOTS]>(out) }
+            const _: () = assert!(WORKER_TABLE.len() == SLOT_COUNT);
+            unsafe { std::mem::transmute::<[std::mem::MaybeUninit<u32>; SLOT_COUNT], [u32; SLOT_COUNT]>(out) }
         };
 
         let mut out = Vec::with_capacity(24 + table.len() * 4 + merged.len() * 8);
