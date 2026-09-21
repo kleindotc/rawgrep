@@ -7,7 +7,7 @@
 
 benchmark script: [`bench.sh`](https://github.com/rakivo/rawgrep/blob/master/bench.sh)
 
-The following benchmarks compare `rawgrep` `0.2.0` (rev `3941952`, with `Hyperscan`)  against:
+The following benchmarks compare `rawgrep` `0.2.0` (rev `b3aa41c`, with `Hyperscan`)  against:
 
 - [ripgrep](https://github.com/BurntSushi/ripgrep) `15.2.0` (rev `3fce3b5bb0`)
 - [hypergrep](https://github.com/p-ranav/hypergrep) `0.1.1` (rev `ee85b71`)
@@ -29,8 +29,8 @@ All benchmarks were run with [hyperfine](https://github.com/sharkdp/hyperfine) `
 
 Each search is run under four conditions to separate raw match-finding speed from the effect of `rawgrep`'s on-disk fragment cache:
 
-| Scenario                       | Page cache | Fragment cache |
-| ------------------------------- | :--------: | :-------------: |
+| Scenario                        | Page cache | Fragment cache   |
+| ------------------------------- | :--------: | :--------------: |
 | `warm, with fragment cache`     | warm       | enabled          |
 | `warm, no fragment cache`       | warm       | disabled         |
 | `cold, no fragment cache`       | cold       | disabled         |
@@ -43,12 +43,12 @@ The following searches are performed against a full clone of the [Chromium sourc
 
 **Pattern: `TODO`**
 
-| Scenario                  | rawgrep      | ripgrep          | hypergrep        |
-| ------------------------- | ------------ | ---------------- | ---------------- |
-| warm, with fragment cache | **122.9 ms** | 361.8 ms (2.94x) | 351.5 ms (2.86x) |
-| warm, no fragment cache   | **303.5 ms** | 363.8 ms (1.20x) | 352.6 ms (1.16x) |
-| cold, no fragment cache   | **8.604 s**  | 11.898 s (1.38x) | 10.199 s (1.19x) |
-| cold, with fragment cache | **2.741 s**  | 11.888 s (4.34x) | 10.223 s (3.73x) |
+| Scenario                        | rawgrep          | ripgrep           | hypergrep        |
+|:--------------------------------|-----------------:|------------------:|-----------------:|
+| warm, with fragment cache       | **105.7 ms**     | 369.1 ms (3.49×)  | 359.4 ms (3.40×) |
+| warm, no fragment cache         | **303.6 ms**     | 368.9 ms (1.22×)  | 360.4 ms (1.19×) |
+| cold, no fragment cache         | **8.703 s**      | 11.880 s (1.36×)  | 10.256 s (1.18×) |
+| cold, with fragment cache       | **1.954 s**      | 11.974 s (6.13×)  | 10.261 s (5.25×) |
 
 **Pattern: `(?i)\bTODO\((?:crbug\.com/\d+|[a-zA-Z][\w.-]*)\)`**
 
@@ -65,23 +65,23 @@ The following searches are performed against a full clone of the [Linux kernel s
 
 **Pattern: `TODO`**
 
-| Scenario                  | rawgrep          | ripgrep           | hypergrep         |
-| ------------------------- | ---------------- | ----------------- | ----------------- |
-| warm, with fragment cache | **47.8 ms**      | 110.0 ms (2.30x)  | 130.3 ms (2.72x)  |
-| warm, no fragment cache   | 172.6 ms (1.57x) | **110.2 ms**      | 129.5 ms (1.18x)  |
-| cold, no fragment cache   | **3.327 s**      | 3.630 s (1.09x)   | 3.371 s (1.01x)   |
-| cold, with fragment cache | **481.4 ms**     | 3508.1 ms (7.29x) | 3369.3 ms (7.00x) |
+| Scenario                        | rawgrep          | ripgrep          | hypergrep        |
+|:--------------------------------|-----------------:|-----------------:|-----------------:|
+| warm, with fragment cache       | **53.4 ms**      | 101.4 ms (1.90×) | 127.5 ms (2.39×) |
+| warm, no fragment cache         | 152.0 ms (1.50×) | **101.7 ms**     | 129.8 ms (1.28×) |
+| cold, no fragment cache         | **3.172 s**      | 3.519 s (1.11×)  | 3.366 s (1.06×)  |
+| cold, with fragment cache       | **447.1 ms**     | 3.533 s (7.90×)  | 3.353 s (7.50×)  |
 
 **Pattern: `[A-Z]+_SUSPEND`**
 
-| Scenario                  | rawgrep          | ripgrep           | hypergrep         |
-| ------------------------- | ---------------- | ----------------- | ----------------- |
-| warm, with fragment cache | **53.1 ms**      | 115.3 ms (2.17x)  | 138.7 ms (2.61x)  |
-| warm, no fragment cache   | 179.6 ms (1.56x) | **115.5 ms**      | 136.7 ms (1.18x)  |
-| cold, no fragment cache   | **3.352 s**      | 3.572 s (1.07x)   | 3.366 s (1.00x)   |
-| cold, with fragment cache | **493.6 ms**     | 3582.9 ms (7.26x) | 3360.2 ms (6.81x) |
+| Scenario                        | rawgrep          | ripgrep          | hypergrep        |
+|:--------------------------------|-----------------:|-----------------:|-----------------:|
+| warm, with fragment cache       | **60.0 ms**      | 108.1 ms (1.80×) | 137.0 ms (2.28×) |
+| warm, no fragment cache         | 159.2 ms (1.47×) | **108.3 ms**     | 138.7 ms (1.28×) |
+| cold, no fragment cache         | **3.196 s**      | 3.524 s (1.10×)  | 3.364 s (1.05×)  |
+| cold, with fragment cache       | **471.3 ms**     | 3.549 s (7.53×)  | 3.378 s (7.17×)  |
 
-### Codebase Search: `Chromium` **against FFF (fff-cli 0.1.0 rev `8b9930e`) Comparison**
+### Codebase Search: `Chromium` `rawgrep` (rev `74def34`) **against FFF (fff-cli 0.1.0 rev `8b9930e`) Comparison**
 
 The following searches are performed against a full clone of the [Chromium source tree](https://github.com/chromium/chromium).
 
@@ -98,10 +98,12 @@ The following searches are performed against a full clone of the [Chromium sourc
 
 Peak RSS as measured by hyperfine, taken from the `chromium_todo` runs (representative of the other cases):
 
-| Scenario                  | rawgrep | ripgrep | hypergrep |
-| -------------------------- | ------- | ------- | --------- |
-| warm, with fragment cache  | 210 MiB | 210 MiB | 210 MiB   |
-| warm, no fragment cache    | 295 MiB | 306 MiB | 306 MiB   |
+| Scenario                  | rawgrep     | ripgrep     | hypergrep   |
+|:--------------------------|------------:|------------:|------------:|
+| Chromium, cached          | 208 MiB     | 208 MiB     | 208 MiB     |
+| Chromium, no cache        | 325–336 MiB | 328–337 MiB | 328–337 MiB |
+| Linux, cached             | 177–211 MiB | 179–212 MiB | 179–212 MiB |
+| Linux, no cache           | 221–230 MiB | 222–230 MiB | 222–230 MiB |
 
 **These RSS numbers aren't reliable yet** -- all three land within a few MiB of each other, which is, I'm pretty sure, just the leftover page cache from whatever ran before it. In actuality, `ripgrep` plateaus around ~70 MiB on the aforementioned benchmark, I'd imagine `hypergrep` using roughly the same amount of memory... `rawgrep`'s RAM usage hasn't been the main focus yet; the work so far has gone almost entirely into wall-time, though, there are for sure some known ideas to bring RSS down without affecting the performance much, or even at all.
 
@@ -109,7 +111,7 @@ Peak RSS as measured by hyperfine, taken from the `chromium_todo` runs (represen
 
 - `rawgrep`'s advantage is largest when its fragment cache is warm, particularly on cold page cache (4-7x over ripgrep/hypergrep). Without the fragment cache, the margin narrows substantially, and on the smaller Linux tree specifically, plain ripgrep is faster than `rawgrep (no cache)` in the warm/no-fragment-cache case (1.4-1.5x). This number, of course, isn't final, and `rawgrep` is gonna get much faster in the future.
 
-- The *Fragment Cache* `rawgrep` uses doesn't require a separate, precomputed index the way approaches like n-gram/bigram indexing do -- rawgrep builds and updates it automatically as needed, therefore there isn't even a subcommand like `index`. It's also very lean: searching the full Chromium tree only keeps a 18.66 MB cache, and the Linux tree just 3.63 MB -- versus the hundreds of megabytes that n-gram/bigram-indexing tools like fff or tgrep require for the same corpora.
+- The *Fragment Cache* `rawgrep` uses doesn't require a separate, precomputed index the way approaches like n-gram/bigram indexing do -- rawgrep builds and updates it automatically as needed, therefore there isn't even a subcommand like `index`. It's also very lean: searching the full Chromium tree only keeps a 16.98 MB cache, and the Linux tree just 3.63 MB -- versus the hundreds of megabytes that n-gram/bigram-indexing tools like fff or tgrep require for the same corpora.
 
 - Correctness was cross-checked against `rg` on every corpus/pattern pair: the set of *files* matched was identical in all cases.
 
