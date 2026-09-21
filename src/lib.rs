@@ -1,6 +1,5 @@
 #![cfg_attr(all(nightly, feature = "use_nightly"), allow(internal_features))]
-#![cfg_attr(all(nightly, feature = "use_nightly"), feature(core_intrinsics))]
-#![cfg_attr(all(nightly, feature = "use_nightly"), feature(portable_simd))]
+#![cfg_attr(all(nightly, feature = "use_nightly"), feature(core_intrinsics, portable_simd))]
 
 #![allow(
     clippy::identity_op,
@@ -11,6 +10,14 @@
     clippy::only_used_in_recursion,
     clippy::doc_overindented_list_items,
 )]
+
+#[cfg(all(feature = "dont_vendor", feature = "generic-simd"))]
+compile_error!(
+    "'dont_vendor' + 'generic-simd' pulls in upstream 'bytecount's SIMD code, which \
+     still calls portable_simd APIs (e.g. 'Mask::to_int') removed on recent nightlies. \
+     The vendored fork in 'src/bytecount_vendor' has already been patched for this, drop \
+     'dont_vendor' to use it, or wait for upstream bytecount to catch up to current nightly."
+);
 
 pub mod ctx;
 pub mod cli;
@@ -56,6 +63,11 @@ pub use smallvec_vendor as smallvec;
 pub mod bytecount_vendor;
 #[cfg(not(feature = "dont_vendor"))]
 pub use bytecount_vendor as bytecount;
+
+#[cfg(feature = "dont_vendor")]
+pub use bytecount;
+#[cfg(feature = "dont_vendor")]
+pub use smallvec;
 
 pub use crossbeam_channel;
 

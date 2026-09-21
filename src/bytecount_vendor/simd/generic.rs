@@ -2,13 +2,11 @@
 
 #[cfg(not(feature = "runtime-dispatch-simd"))]
 use core::{mem, simd};
-#[cfg(not(feature = "runtime-dispatch-simd"))]
-use simd::{Simd, Select};
 
 #[cfg(feature = "runtime-dispatch-simd")]
 use std::{mem, simd};
 
-use simd::{u8x32, u8x64, cmp::SimdPartialEq, num::SimdInt};
+use simd::{u8x32, u8x64, cmp::SimdPartialEq, num::SimdInt, Simd, Select};
 
 const MASK: [u8; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
