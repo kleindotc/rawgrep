@@ -1055,7 +1055,6 @@ impl<S: CacheStorage> FragmentCache<S> {
     }
 
     /// Add fragment to ring buffer (returns index)
-    /// NOTE: Caller must call ensure_owned() first!
     fn add_fragment(&mut self, frag_hash: u32) -> u32 {
         let num_fragments = self.num_fragments as usize;
 
@@ -1126,8 +1125,6 @@ impl<S: CacheStorage> FragmentCache<S> {
     /// both branches of `add_fragment()` above -- growing the ring and
     /// evicting into it both need every prior file re-checked against
     /// whatever fragment now lives at `index`.
-    ///
-    /// Caller must have called `ensure_owned()` already (same precondition as `add_fragment`).
     fn clear_fragment_bit_for_all_files(&mut self, index: usize, bits_per_file_u64: usize, num_files: usize) {
         let u64_offset = index / 64;
         let bit_index  = index % 64;
@@ -1286,10 +1283,9 @@ pub struct BatchPlan {
 }
 
 impl<S: CacheStorage> FragmentCache<S> {
-    /// Read-only resolution pass. Never touches owned_* buffers, safe to
-    /// call before ensure_owned(). Shared by merge_updates() and
-    /// merge_updates_if_changed() so the lookups only happen once no matter
-    /// which caller ends up applying the result.
+    /// Read-only resolution pass. Never touches owned_* buffers.
+    /// Shared by merge_updates() and merge_updates_if_changed() so the lookups only
+    /// happen once no matter which caller ends up applying the result.
     #[inline(never)]
     fn plan_batch(
         &self,
@@ -1428,14 +1424,9 @@ impl<S: CacheStorage> FragmentCache<S> {
 
     /// Decide, for every fragment in the batch, which cache column it uses.
     ///
-    /// Pure: mutates nothing in `self`; all output goes into `scratch` (zeroed on entry).
-    ///
-    ///   * existing fragments keep their slot
-    ///   * new fragments are appended while there is room
-    ///   * once the ring is full they evict FIFO, but never a slot this batch depends on
-    ///     (the old code could overwrite a slot that another fragment of the same batch was
-    ///     already resolved to, leaving two fragments on one column)
-    ///   * a fragment that finds no free slot is dropped; its bits are simply never recorded
+    /// Existing fragments keep their slots, new fragments are appended while there is room.
+    /// Once the ring is full they evict FIFO, but never a slot this batch depends on
+    /// A fragment that finds no free slot is dropped; its bits are simply never recorded.
     ///
     /// Outputs: scratch.slot_of, scratch.clear (columns to zero in pre-existing rows) and
     /// scratch.hashes[..num_fragments].

@@ -64,7 +64,7 @@ impl FileKey {
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileMeta {
-    pub mtime_sec: i64, // @Incomplete: Make this into msec?
+    pub mtime_sec: i64, // @Incomplete: Make this into msec (millis)?
     pub size:      u64,
 }
 
