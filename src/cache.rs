@@ -968,7 +968,7 @@ impl<S: CacheStorage> FragmentCache<S> {
 
         // ------- Validate metadata
         let stored_meta = self.file_metas.get(file_id as usize);
-        if unlikely(!stored_meta.matches(file_meta)) {
+        if unlikely(stored_meta != file_meta) {
             #[cfg(not(feature = "no-cache-stats"))] {
                 self.stats.invalidations.fetch_add(1, Ordering::Relaxed);
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
@@ -1302,7 +1302,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         //
         let mut frags = Vec::with_capacity(fragment_hashes.len().min(100));
         let mut has_new_fragment = false;
-        for &hash in fragment_hashes.iter().take(100) {
+        for &hash in fragment_hashes.iter() {
             let existing_index = self.find_fragment_index(hash, num_fragments).map(|index| index as u32);
             if existing_index.is_none() {
                 has_new_fragment = true;
@@ -1342,7 +1342,7 @@ impl<S: CacheStorage> FragmentCache<S> {
                 None => true,  // Brand-new file is always a change
                 Some(id) => {
                     let stored_meta = self.file_metas.get(id as usize);
-                    !stored_meta.matches(file_id.meta)
+                    stored_meta != file_id.meta
                 }
             };
 

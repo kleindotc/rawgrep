@@ -2189,7 +2189,7 @@ impl<S: MatchSink> WorkerPrintCtx<'_, S> {
                 // if it's ever actually read -- same guard as the non-chunk path.
                 //
                 if should_print_line_numbers || S::STDOUT_NOP {
-                    carry.line_num += memchr::memchr_iter(b'\n', region).count() as u32;
+                    carry.line_num += crate::bytecount::count(region, b'\n') as u32;
                 }
 
                 carry.tail.clear();
@@ -2485,9 +2485,7 @@ impl<S: MatchSink> WorkerPrintCtx<'_, S> {
         // for newlines it never reports.
         //
         if should_print_line_numbers || S::STDOUT_NOP {
-            *line_num += memchr::memchr_iter(
-                b'\n', buf.get_(scan_pos..line_start)
-            ).count() as u32;
+            *line_num += crate::bytecount::count(buf.get_(scan_pos..line_start), b'\n') as u32;
         }
 
         (m_start, line_start)

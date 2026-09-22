@@ -73,11 +73,6 @@ impl FileMeta {
     pub const fn new(mtime_sec: i64, size: u64) -> Self {
         Self { mtime_sec, size }
     }
-
-    #[inline(always)]
-    pub const fn matches(&self, other: FileMeta) -> bool {
-        self.mtime_sec == other.mtime_sec && self.size == other.size
-    }
 }
 
 #[repr(C, align(16))]
