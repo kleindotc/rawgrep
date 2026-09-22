@@ -4,16 +4,36 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
     nixpkgs,
     crane,
+    rust-overlay,
     ...
   }: let
-    mkRawgrep = system: let
-      pkgs = nixpkgs.legacyPackages.${system};
-      craneLib = crane.mkLib pkgs;
+    forAllSystems = f:
+      nixpkgs.lib.genAttrs nixpkgs.lib.systems.flakeExposed (system: let
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [(import rust-overlay)];
+        };
+        rustToolchain = pkgs.rust-bin.stable.latest.default;
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+      in
+        f {
+          inherit system pkgs rustToolchain craneLib;
+        });
+
+    mkRawgrep = {
+      pkgs,
+      craneLib,
+      ...
+    }: let
       src = craneLib.cleanCargoSource ./.;
 
       commonArgs = {
@@ -35,34 +55,21 @@
           };
         });
   in {
-    packages.x86_64-linux.default = mkRawgrep "x86_64-linux";
-    packages.aarch64-linux.default = mkRawgrep "aarch64-linux";
-
-    devShells.x86_64-linux.default = let
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
-    in
-      pkgs.mkShell {
-        inputsFrom = [(mkRawgrep "x86_64-linux")];
-        buildInputs = with pkgs; [
-          rustc
-          cargo
-          rust-analyzer
-          rustfmt
-          clippy
-        ];
-      };
-    devShells.aarch64-linux.default = let
-      pkgs = nixpkgs.legacyPackages.aarch64-linux;
-    in
-      pkgs.mkShell {
-        inputsFrom = [(mkRawgrep "aarch64-linux")];
-        buildInputs = with pkgs; [
-          rustc
-          cargo
-          rust-analyzer
-          rustfmt
-          clippy
-        ];
-      };
+    packages = forAllSystems (args: {default = mkRawgrep args;});
+    devShells = forAllSystems ({
+        pkgs,
+        rustToolchain,
+        ...
+      } @ args: {
+        default = pkgs.mkShell {
+          inputsFrom = [(mkRawgrep args)];
+          packages = with pkgs; [
+            rustToolchain
+            rust-analyzer
+            rustfmt
+            clippy
+          ];
+        };
+      });
   };
 }
