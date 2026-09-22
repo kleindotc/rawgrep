@@ -47,6 +47,7 @@
       craneLib.buildPackage (commonArgs
         // {
           inherit cargoArtifacts;
+          doCheck = false;
           meta = with pkgs.lib; {
             description = "Grep at the speed of raw disk";
             homepage = "https://github.com/rakivo/rawgrep";
@@ -66,8 +67,6 @@
           packages = with pkgs; [
             rustToolchain
             rust-analyzer
-            rustfmt
-            clippy
           ];
         };
       });
