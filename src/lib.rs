@@ -44,7 +44,6 @@ pub mod pacer;
 pub mod fragments;
 pub mod platform;
 pub mod output;
-pub mod fork_exit;
 pub mod topology;
 pub mod thin_path_arc;
 pub mod binary_ext;
