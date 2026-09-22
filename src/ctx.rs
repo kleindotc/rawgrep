@@ -8,13 +8,14 @@ use crate::unwrap_::Unwrap_;
 use crate::path_buf::SmallPathBuf;
 use crate::stdout::{RawStdout, OutputKind};
 use crate::{cli, ignore, platform, CursorHide};
-use crate::parser::{Parser, FileKey, FileMeta};
+use crate::parser::{Parser, FileIdentifier};
 use crate::cache::CacheStats;
 use crate::stats::{AtomicStats, Stats};
 use crate::grep::{AnyGrepper, FsType, RawGrepper, open_device_and_detect_fs, AnyNodeScratch, AnyNodeCache};
 use crate::worker::{DirWork, FileWork, MatchSink, OutputWorker, WorkItem, WorkerCtx, PathArena, FileEntryArena, SubdirsArena, FragmentPresenceBits, OutputMessage, EntriesArena};
 
 use std::fs;
+use std::time::Instant;
 use std::path::Path;
 use std::path::PathBuf;
 use std::io::IsTerminal;
@@ -26,8 +27,7 @@ use crossbeam_deque::{Injector, Stealer, Worker as DequeWorker};
 
 #[derive(Default)]
 struct CacheAccumulator {
-    file_keys:            Vec<FileKey>,
-    file_metas:           Vec<FileMeta>,
+    file_ids:             Vec<FileIdentifier>,
     fragment_presence:    Vec<u64>,
     verdict_fingerprints: Vec<u64>,
 }
@@ -146,6 +146,8 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
     ) -> Result<Self, Error> {
         _ = cli::SHOULD_ENABLE_ANSI_COLORING.set(config.enable_color(std::io::stdout().is_terminal()));
 
+        let t0 = Instant::now();
+
         let (job, work) = build_job_and_initial_work(config, sink, inspect_before_search)?;
         let plumbing = setup_output_plumbing(worker_count);
 
@@ -159,12 +161,14 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             _cursor_hide_for_tty: plumbing.cursor_hide,
             current_job: Arc::new(RwLock::new(Some(Arc::new(job)))),
             output_tx: plumbing.output_tx,
-            stdout_is_being_redirected_to_dev_null: plumbing.stdout_is_being_redirected_to_dev_null,
+            stdout_is_being_redirected_to_dev_null: plumbing.stdout_is_being_redirected_to_dev_null || config.force_stdout_redirect_to_dev_null,
             flush_ack_rx: plumbing.flush_ack_rx,
         };
 
         ctx.injector.push(work);
         ctx.running.store(true, Ordering::SeqCst);
+
+        eprintln!("kicked-off work in {}ms", t0.elapsed().as_millis() as f64);
 
         ctx.spawn_workers(
             worker_count,
@@ -240,14 +244,13 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
 
         let mut acc = job.cache_acc.lock().unwrap_();
         let verdict_fingerprints = core::mem::take(&mut acc.verdict_fingerprints);
-        let file_keys            = &acc.file_keys;
-        let file_metas           = &acc.file_metas;
+        let file_ids             = &acc.file_ids;
         let fragment_presence    = &acc.fragment_presence;
 
         let (fragment_hashes, cache) = job.grepper.fragment_hashes_and_cache_mut();
 
         if let Some(cache) = cache {
-            match cache.merge_updates_if_changed(file_keys, file_metas, fragment_hashes, fragment_presence) {
+            match cache.merge_updates_if_changed(file_ids, fragment_hashes, fragment_presence) {
                 Ok(true) => {
                     _ = cache.save_to_disk();
                     debug!("[ctx] successfully saved cache");
@@ -366,8 +369,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
     let mut matcher_cache             = None;
 
     let mut verdict_fingerprints      = Vec::new();
-    let mut file_keys                 = Vec::new();
-    let mut file_metas                = Vec::new();
+    let mut file_ids                  = Vec::new();
     let mut fragment_presence         = FragmentPresenceBits::default();
 
     let mut search_count = 0u32;
@@ -477,8 +479,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
                     cyan:  $crate::color::cyan::code(),
 
                     pending_verdict_fingerprints: verdict_fingerprints,
-                    pending_file_keys: file_keys,
-                    pending_file_metas: file_metas,
+                    pending_file_ids: file_ids,
                     pending_fragment_presence: fragment_presence,
                 }.start_worker_loop(
                     &ctx.running,
@@ -525,8 +526,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
             let mut acc = job.cache_acc.lock().unwrap_();
 
             if !cli.no_cache_write && !cli.no_cache {
-                acc.file_keys.append(&mut result.file_keys);
-                acc.file_metas.append(&mut result.file_metas);
+                acc.file_ids.append(&mut result.file_ids);
                 acc.fragment_presence.append(&mut result.fragment_presence.words);
             }
             if !cli.no_binary_cache {
@@ -534,8 +534,7 @@ fn worker_thread_main<S: MatchSink + 'static>(
             }
         }
 
-        file_keys            = result.file_keys;
-        file_metas           = result.file_metas;
+        file_ids             = result.file_ids;
         verdict_fingerprints = result.verdict_fingerprints;
         fragment_presence    = result.fragment_presence;
 

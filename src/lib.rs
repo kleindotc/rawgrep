@@ -44,6 +44,7 @@ pub mod pacer;
 pub mod fragments;
 pub mod platform;
 pub mod output;
+pub mod fork_exit;
 pub mod topology;
 pub mod thin_path_arc;
 pub mod binary_ext;
@@ -132,6 +133,8 @@ pub struct RawGrepConfig {
     pub cache_size_mb: usize,
     pub cache_dir:     Option<Box<Path>>,
     pub rebuild_cache: bool,
+
+    pub force_stdout_redirect_to_dev_null: bool,
 }
 
 impl RawGrepConfig {
@@ -144,6 +147,7 @@ impl RawGrepConfig {
             device:           None,
             hidden:           false,
             no_ignore:        false,
+            force_stdout_redirect_to_dev_null: false,
             binary:           false,
             large:            false,
             no_cache_write:   false,
@@ -214,6 +218,7 @@ impl RawGrepConfig {
             stats:            c.stats,
             force_literal:    c.force_literal,
             ignore_case:      c.ignore_case,
+            force_stdout_redirect_to_dev_null: c.force_stdout_redirect_to_dev_null,
             threads:          c.threads,
             no_cache:         c.no_cache,
             cache_size_mb:    c.cache_size_mb,
@@ -228,6 +233,7 @@ impl RawGrepConfig {
             no_binary_cache:  self.no_binary_cache,
             hidden:           self.hidden,
             no_cache_write:   self.no_cache_write,
+            force_stdout_redirect_to_dev_null: self.force_stdout_redirect_to_dev_null,
             reserved_tool_dirs: self.should_ignore_reserved_tool_dir_filter,
             pattern:          self.pattern.clone().into_string(),
             search_root_path: self.search_root_path.clone().into_string(),
@@ -304,7 +310,8 @@ pub fn run_with_inspect_for_single_search<S: MatchSink + 'static>(
         config.threads.get(), running, &config,
         sink, inspect_before_search
     )?;
-    Ok(ctx.wait_and_save_cache(&config))
+    let (stats, cstats) = ctx.wait_and_save_cache(&config);
+    Ok((stats, cstats))
 }
 
 pub use ctrl_c::setup_signal_handler;

@@ -412,32 +412,27 @@ impl CacheStorage for DiskStorage {
 
             ensure_memlock_capacity(256 * 1024 * 1024); // @Constant @Tune
 
-            let t0 = Instant::now();
-
             // SAFETY: the file is only ever replaced via tmp+rename,
             // never truncated/modified in place, so this mapping stays valid for
             // as long as we hold it. External processes touching the cache path
             // directly would violate this, but that's outside our control anyway.
-            let mmap = unsafe {
-                memmap2::MmapOptions::new().populate().map(&file)?
-            };
-
-            eprintln!("mmap populated cache pages in {}ms", t0.elapsed().as_millis() as f64);
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
             //
-            // With the pages populated and mlock'd there is nothing left to advise about,
-            // so madvise would be a no-op (WillNeed would even re-walk the whole mapping's
-            // page cache to rediscover what MAP_POPULATE just loaded).
+            // With the pages mlock'd there is nothing left to advise about,
+            // so madvise would be a no-op.
             //
-            // The exception is mlock failing (RLIMIT_MEMLOCK): the pages are still resident
-            // but reclaimable. Lookups are point accesses, so if reclaim takes some and they
-            // fault back in, don't let the kernel read ahead around each fault.
+            // The exception is mlock failing (RLIMIT_MEMLOCK), in this case
+            // populate-read the mmap
             //
             let t0 = Instant::now();
             if try_mlock_cache(&mmap[..]) {
                 eprintln!("mlock-cached cache pages in {}ms", t0.elapsed().as_millis() as f64);
             } else {
+                _ = mmap.advise(memmap2::Advice::PopulateRead);
                 _ = mmap.advise(memmap2::Advice::Random);
+
+                eprintln!("mmap-populated cache pages in {}ms", t0.elapsed().as_millis() as f64);
             }
 
             Ok(Some(CacheBytes::Mapped(mmap)))
@@ -575,11 +570,13 @@ impl FragmentCache<DiskStorage> {
     /// Create new or load existing cache
     #[inline]
     pub fn new(config: &CacheConfig) -> io::Result<Self> {
+        let t0 = Instant::now();
+
         let path = get_cache_path(config.cache_dir.as_deref(), "fragment-cache.bin")?;
         let storage = DiskStorage::new(path);
 
         if !config.ignore_cache {
-            if let Ok(cache) = Self::load_from_disk(storage.clone(), config) {
+            if let Ok(cache) = Self::load_from_disk(storage.clone(), config, t0) {
                 return Ok(cache);
             }
         }
@@ -761,9 +758,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         self.file_bitsets = FatPtr::from_box(self.owned_file_bitsets.as_ref().unwrap_());
     }
 
-    fn load_from_disk(storage: S, config: &CacheConfig) -> io::Result<Self> {
-        let start = Instant::now();
-
+    fn load_from_disk(storage: S, config: &CacheConfig, t0: Instant) -> io::Result<Self> {
         let Some(bytes) = storage.load_mapped()? else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no cache data"));
         };
@@ -823,13 +818,6 @@ impl<S: CacheStorage> FragmentCache<S> {
         let mut file_lookup = new_empty_lookup(lookup_size);
         rebuild_lookup(&mut file_lookup, num_files, |id| file_keys.get(id));
 
-        eprintln!(
-            "Cache loaded: {} files, {} fragments, {:.2}MB in {:.2}ms",
-            num_files, num_fragments,
-            bytes.len() as f64 / (1024.0 * 1024.0),
-            start.elapsed().as_millis() as f64
-        );
-
         let file_capacity = num_files;
 
         eprintln!(
@@ -842,6 +830,13 @@ impl<S: CacheStorage> FragmentCache<S> {
             bytes.len() / 1024,
             file_capacity,
             bits_per_file_u64,
+        );
+
+        eprintln!(
+            "Cache loaded: {} files, {} fragments, {:.2}MB in {}ms",
+            num_files, num_fragments,
+            bytes.len() as f64 / (1024.0 * 1024.0),
+            t0.elapsed().as_millis() as f64
         );
 
         Ok(Self {
@@ -1298,9 +1293,8 @@ impl<S: CacheStorage> FragmentCache<S> {
     #[inline(never)]
     fn plan_batch(
         &self,
-        file_keys: &[FileKey],
-        file_metas: &[FileMeta],
-        fragment_hashes: &[u32],
+        file_ids:          &[FileIdentifier],
+        fragment_hashes:   &[u32],
         fragment_presence: &[u64],
     ) -> BatchPlan {
         let num_fragments     = self.num_fragments as usize;
@@ -1322,7 +1316,9 @@ impl<S: CacheStorage> FragmentCache<S> {
             frags.push(FragPlan { hash, existing_index });
         }
 
-        let mut files = Vec::with_capacity(file_keys.len());
+        let n = file_ids.len();
+
+        let mut files = Vec::with_capacity(n);
 
         //
         // A new fragment always dirties the batch: add_fragment() clears
@@ -1338,20 +1334,19 @@ impl<S: CacheStorage> FragmentCache<S> {
             0
         };
 
-        for file_index in 0..file_keys.len() {
-            if let Some(&next_key) = file_keys.get(file_index + 1) {
-                self.prefetch_lookup(next_key);
+        for file_index in 0..n {
+            if let Some(&next_id) = file_ids.get(file_index + 1) {
+                self.prefetch_lookup(next_id.key);
             }
 
-            let file_key  = *file_keys .get_(file_index);
-            let file_meta = *file_metas.get_(file_index);
+            let file_id = *file_ids.get_(file_index);
 
-            let existing_id = self.lookup_file_id(file_key);
+            let existing_id = self.lookup_file_id(file_id.key);
             let meta_changed = match existing_id {
                 None => true,  // Brand-new file is always a change
                 Some(id) => {
                     let stored_meta = self.file_metas.get(id as usize);
-                    !stored_meta.matches(file_meta)
+                    !stored_meta.matches(file_id.meta)
                 }
             };
 
@@ -1539,8 +1534,7 @@ impl<S: CacheStorage> FragmentCache<S> {
     pub fn apply_batch(
         &mut self,
         plan: &BatchPlan,
-        file_keys: &[FileKey],
-        file_metas: &[FileMeta],
+        file_ids:          &[FileIdentifier],
         fragment_presence: &[u64],
     ) -> io::Result<()> {
         let mut laps = Laps::new();
@@ -1578,8 +1572,7 @@ impl<S: CacheStorage> FragmentCache<S> {
         for (out, file_plan) in scratch.slots.iter_mut().zip(&plan.files) {
             let file_index = file_plan.file_index as usize;
 
-            if file_index >= file_keys.len()
-            || file_index >= file_metas.len()
+            if file_index >= file_ids.len()
             || (!plan.frags.is_empty() && (file_index + 1) * plan_words_per_file > fragment_presence.len())
             {
                 return Err(bad("plan references a file outside the input slices"));
@@ -1675,9 +1668,9 @@ impl<S: CacheStorage> FragmentCache<S> {
         //
         // SAFETY: base is 16-byte aligned (u128). The four regions (keys | metas | bits | hashes)
         // are laid out back-to-back at the offsets computed above, each sized exactly to the
-        // FatPtr length it's given -- no aliasing.
+        // FatPtr length it's given, no aliasing.
         //
-        // `arena` is not touched again (no push/reserve) until into_boxed_slice() at the very end,
+        // 'arena' is not touched again until into_boxed_slice() at the very end,
         // so these pointers stay valid for the rest of the function.
         //
 
@@ -1687,9 +1680,9 @@ impl<S: CacheStorage> FragmentCache<S> {
         let   bits_ptr              = unsafe { base.add(keys_bytes + metas_bytes) } as *mut u64;
         let hashes_ptr              = unsafe { base.add(keys_bytes + metas_bytes + bits_bytes) } as *mut u32;
 
-        let keys:   &mut [FileKey]  = unsafe { std::slice::from_raw_parts_mut(keys_ptr,   final_files) };
-        let metas:  &mut [FileMeta] = unsafe { std::slice::from_raw_parts_mut(metas_ptr,  final_files) };
-        let bits:   &mut [u64]      = unsafe { std::slice::from_raw_parts_mut(bits_ptr,   total_u64s) };
+        let keys:   &mut [FileKey]  = unsafe { std::slice::from_raw_parts_mut(keys_ptr,   final_files)   };
+        let metas:  &mut [FileMeta] = unsafe { std::slice::from_raw_parts_mut(metas_ptr,  final_files)   };
+        let bits:   &mut [u64]      = unsafe { std::slice::from_raw_parts_mut(bits_ptr,   total_u64s)    };
         let hashes: &mut [u32]      = unsafe { std::slice::from_raw_parts_mut(hashes_ptr, max_fragments) };
 
         keys  .get_mut_(..old_num_files)    .copy_from_slice(old_keys);
@@ -1704,10 +1697,10 @@ impl<S: CacheStorage> FragmentCache<S> {
         //
 
         //
-        // Fused old->new bitset copy. `dst` is freshly zeroed, so stride growth needs no
+        // Fused old->new bitset copy. 'dst' is freshly zeroed, so stride growth needs no
         // explicit padding.
         //
-        // Columns in `clear` are zeroed on the way through, which replaces every per-fragment
+        // Columns in 'clear' are zeroed on the way through, which replaces every per-fragment
         // 'clear this bit for all existing files' strided loop with one sequential pass
         // (or a plain memcpy when nothing needs clearing).
         //
@@ -1772,8 +1765,9 @@ impl<S: CacheStorage> FragmentCache<S> {
             // final_files-sized regions are already fully allocated,
             // so every id -- new or existing -- is just a direct write.
             //
-            *keys .get_mut_(id) = *file_keys .get_(file_index);
-            *metas.get_mut_(id) = *file_metas.get_(file_index);
+            let file_id = *file_ids.get_(file_index);
+            *keys .get_mut_(id) = file_id.key;
+            *metas.get_mut_(id) = file_id.meta;
 
             let row = bits.get_mut_(id * new_words_per_file..).get_mut_(..new_words_per_file);
             if slot & RESET != 0 { row.fill(0); }
@@ -1870,44 +1864,26 @@ impl<S: CacheStorage> FragmentCache<S> {
         self.file_lookup = table;
     }
 
-    /// Unconditional merge, same behavior as before. Used by tests and any
-    /// caller that already knows it wants to write.
-    pub fn merge_updates(
-        &mut self,
-        file_keys:         &[FileKey],
-        file_metas:        &[FileMeta],
-        fragment_hashes:   &[u32],
-        fragment_presence: &[u64],
-    ) -> io::Result<()> {
-        if file_keys.is_empty() {
-            return Ok(());
-        }
-
-        let plan = self.plan_batch(file_keys, file_metas, fragment_hashes, fragment_presence);
-        self.apply_batch(&plan, file_keys, file_metas, fragment_presence)
-    }
-
     /// Same as merge_updates(), but skips ensure_owned() and every mutation
     /// entirely if the batch would not change anything already on disk.
     /// Returns whether it actually wrote anything, so the caller knows
     /// whether save_to_disk() is worth calling.
     pub fn merge_updates_if_changed(
         &mut self,
-        file_keys:         &[FileKey],
-        file_metas:        &[FileMeta],
+        file_ids:          &[FileIdentifier],
         fragment_hashes:   &[u32],
         fragment_presence: &[u64],
     ) -> io::Result<bool> {
-        if file_keys.is_empty() {
+        if file_ids.is_empty() {
             return Ok(false);
         }
 
-        let plan = self.plan_batch(file_keys, file_metas, fragment_hashes, fragment_presence);
+        let plan = self.plan_batch(file_ids, fragment_hashes, fragment_presence);
         if !plan.changed {
             return Ok(false);
         }
 
-        self.apply_batch(&plan, file_keys, file_metas, fragment_presence)?;
+        self.apply_batch(&plan, file_ids, fragment_presence)?;
 
         Ok(true)
     }
@@ -1927,6 +1903,28 @@ impl<S: CacheStorage> FragmentCache<S> {
         self.resolve_fragment_indexes(fragment_hashes, &mut fragment_indexes);
 
         self.can_skip_file(FileIdentifier { key, meta }, &fragment_indexes)
+    }
+
+    /// Unconditional merge, same behavior as before. Used by tests and any
+    /// caller that already knows it wants to write.
+    pub fn merge_updates(
+        &mut self,
+        file_keys:         &[FileKey],
+        file_metas:        &[FileMeta],
+        fragment_hashes:   &[u32],
+        fragment_presence: &[u64],
+    ) -> io::Result<()> {
+        if file_keys.is_empty() {
+            return Ok(());
+        }
+
+        let file_ids = file_keys.iter()
+            .zip(file_metas.iter())
+            .map(|(&key, &meta)| FileIdentifier { key, meta })
+            .collect::<Vec<_>>();
+
+        let plan = self.plan_batch(&file_ids, fragment_hashes, fragment_presence);
+        self.apply_batch(&plan, &file_ids, fragment_presence)
     }
 
     /// Adapter for `merge_updates` that accepts presence as a flat `Vec<bool>`

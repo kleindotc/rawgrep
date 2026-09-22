@@ -22,7 +22,7 @@ use crate::fragments::FragmentLen;
 use crate::stats::Stats;
 use crate::stdout::{RawStdout, IOV_MAX};
 use crate::thin_path_arc::ThinPathArc;
-use crate::parser::{BufFatPtr, FileIdentifier, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs, FileKey, FileMeta};
+use crate::parser::{BufFatPtr, FileIdentifier, BufKind, FileId, FileNode, FileType, ParsedEntry, Parser, RawFs};
 use crate::util::{likely, truncate_utf8, unlikely, prefetch_read};
 use crate::tracy;
 
@@ -524,8 +524,7 @@ pub struct WorkerResult {
     pub parser: Parser,
     pub output: OutputSlotWriter,
 
-    pub file_keys:            Vec<FileKey>,
-    pub file_metas:           Vec<FileMeta>,
+    pub file_ids:             Vec<FileIdentifier>,
     pub verdict_fingerprints: Vec<u64>,
 
     pub path_buf:      Box<SmallPathBuf>,
@@ -600,8 +599,7 @@ pub struct WorkerCtx<'a, F: RawFs, S: MatchSink> {
     pub num_workers:               u16,
 
     pub pending_verdict_fingerprints: Vec<u64>,
-    pub pending_file_keys:            Vec<FileKey>,
-    pub pending_file_metas:           Vec<FileMeta>,
+    pub pending_file_ids:             Vec<FileIdentifier>,
     pub pending_fragment_presence:    FragmentPresenceBits,
 
     // ----- Cold / output plumbing ----
@@ -638,8 +636,7 @@ impl<'a, F: RawFs, S: MatchSink> WorkerCtx<'a, F, S> {
             ranges_scratch: self.ranges_scratch,
             line_ranges_scratch: self.line_ranges_scratch,
             newlines_scratch: self.newlines_scratch,
-            file_keys: self.pending_file_keys,
-            file_metas: self.pending_file_metas,
+            file_ids: self.pending_file_ids,
             fragment_presence_scratch: self.fragment_presence_scratch,
             fragment_presence: self.pending_fragment_presence
         }
@@ -1346,8 +1343,7 @@ impl<F: RawFs, S: MatchSink> WorkerCtx<'_, F, S> {
             };
 
             if let Some(all_present) = record {
-                self.pending_file_keys .push(file_identifier.key);
-                self.pending_file_metas.push(file_identifier.meta);
+                self.pending_file_ids.push(file_identifier);
 
                 if all_present {
                     self.pending_fragment_presence.push_all_fragments_present();

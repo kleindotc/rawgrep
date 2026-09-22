@@ -16,6 +16,7 @@ use crate::ext4::{
     EXT4_INODE_TABLE_OFFSET, EXT4_MAGIC_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, Ext4Fs, Ext4Inode
 };
 
+use std::time::Instant;
 use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 use std::io::{self, Seek};
 use std::fs::{File, OpenOptions};
@@ -43,6 +44,8 @@ pub struct RawGrepper<F: RawFs, S: MatchSink = NoSink> {
 /// impl block for generic RawFs
 impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
     pub fn new_with_fs(cli: &Cli, fs: F, sink: S) -> Result<Self> {
+        let t0 = Instant::now();
+
         let matcher = Matcher::new(cli)?;
 
         // `None` means the pattern is too short for any window to be useful -- treat that the same as "no fragments".
@@ -88,6 +91,8 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
         } else {
             BinaryVerdicts::empty()
         };
+
+        eprintln!("prepared RawGrepper in {}ms", t0.elapsed().as_millis() as f64);
 
         Ok(RawGrepper {
             cli: cli.clone(),
@@ -148,6 +153,8 @@ impl<F: RawFs, S: MatchSink> RawGrepper<F, S> {
 impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
     #[inline]
     pub fn new_ext4(cli: &Cli, _device_path: &str, mut file: File, sink: S) -> Result<AnyGrepper<S>> {
+        let t0 = Instant::now();
+
         let mut sb_bytes = [0u8; EXT4_SUPERBLOCK_SIZE];
         read_at_offset(&file, &mut sb_bytes, EXT4_SUPERBLOCK_OFFSET)?;
 
@@ -199,6 +206,8 @@ impl<S: MatchSink> RawGrepper<Ext4Fs, S> {
             ]);
             inode_table_blocks.push(inode_table_block as u64);
         }
+
+        eprintln!("read ext4 block groups in {}ms", t0.elapsed().as_millis() as f64);
 
         let fs = Ext4Fs { sb, device_id, max_block, file, inode_table_blocks };
         Self::new_with_fs(cli, fs, sink).map(AnyGrepper::Ext4)
@@ -281,6 +290,14 @@ pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FsType)> {
         _                               => Error::Io(e),
     })?;
 
+    //
+    // @Volatile
+    //
+    // We need to flush all the stale stuff from the VFS.
+    //
+    // And it turns out that `syncfs()` is not realiable for our case...
+    //
+
     {
         let t = std::time::Instant::now();
 
@@ -317,32 +334,6 @@ pub fn open_device_and_detect_fs(device_path: &str) -> Result<(File, FsType)> {
 
         eprintln!("sync: {:.2}ms", t.elapsed().as_millis() as f64);
     }
-
-    //
-    // @Volatile
-    //
-    // We need to flush all the stale stuff from the VFS.
-    //
-    //
-    // And it turns out that `syncfs()` is not realiable for our case...
-    //
-    // #[cfg(target_os = "linux")]
-    // {
-    //     use std::os::unix::io::AsRawFd;
-    //     const BLKFLSBUF: libc::c_ulong = 0x1261;
-    //     let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKFLSBUF, 0) };
-    //     if ret != 0 {
-    //         eprintln!("BLKFLSBUF failed: {}", io::Error::last_os_error());
-    //     }
-    // }
-    // #[cfg(target_os = "macos")] {
-    //     // macOS has no syncfs() or BLKFLSBUF.
-    //     // F_FULLFSYNC flushes the volume containing the fd to physical storage,
-    //     // which is the closest equivalent for ensuring we read committed data.
-    //     use std::os::unix::io::AsRawFd;
-    //     unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC); }
-    // }
-    //
 
     // Read enough to cover both magic locations:
     // APFS at offset 32, ext4 superblock at offset 1024+56=1080 -> 2048 bytes is sufficient
