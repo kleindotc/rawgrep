@@ -114,17 +114,19 @@ impl<S: MatchSink + 'static> RawGrepCtx<S> {
             let slot_pool = slot_pools.pop().unwrap_();
             let core      = worker_cores[worker_id];
 
-            std::thread::spawn(move || {
-                crate::util::pin_thread_to_core(core);
+            _ = std::thread::Builder::new()
+                .name("rawgrep-worker".into())
+                .spawn(move || {
+                    crate::util::pin_thread_to_core(core);
 
-                worker_thread_main(
-                    worker_id as _,
-                    stealers.len() as u16 + 1,
-                    ctx,
-                    &stealers, local,
-                    &pacer, slot_pool, print_line_numbers
-                );
-            });
+                    worker_thread_main(
+                        worker_id as _,
+                        stealers.len() as u16 + 1,
+                        ctx,
+                        &stealers, local,
+                        &pacer, slot_pool, print_line_numbers
+                    );
+                });
         }
     }
 
@@ -679,18 +681,20 @@ fn setup_output_plumbing(worker_count: usize) -> OutputPlumbing {
     if let Some((raw_stdout, _raw_fd)) = raw_stdout {
         let topology = crate::topology::detect();
 
-        _ = std::thread::spawn(move || {
-            place_output_worker(topology, worker_count);
+        _ = std::thread::Builder::new()
+            .name("rawgrep-output-worker".into())
+            .spawn(move || {
+                place_output_worker(topology, worker_count);
 
-            OutputWorker {
-                rx: output_rx,
-                flush_ack_tx,
-                batch_bytes: 0,
-                writer: raw_stdout,
-                batch: Vec::with_capacity(256),
-                iov_scratch: Vec::with_capacity(256),
-            }.run();
-        });
+                OutputWorker {
+                    rx: output_rx,
+                    flush_ack_tx,
+                    batch_bytes: 0,
+                    writer: raw_stdout,
+                    batch: Vec::with_capacity(256),
+                    iov_scratch: Vec::with_capacity(256),
+                }.run();
+            });
     }
 
     OutputPlumbing {
